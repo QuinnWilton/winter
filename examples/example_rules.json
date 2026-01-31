@@ -1,0 +1,44 @@
+{
+  "rules": [
+    {
+      "name": "mutual_follow",
+      "description": "Derives mutual follows from individual follow relationships",
+      "head": "mutual_follow(X, Y)",
+      "body": ["follows(X, Y)", "follows(Y, X)"],
+      "constraints": ["X < Y"],
+      "enabled": true,
+      "priority": 10
+    },
+    {
+      "name": "shared_interest",
+      "description": "Finds people who share interests with each other",
+      "head": "shared_interest(X, Y, Topic)",
+      "body": ["interested_in(X, Topic)", "interested_in(Y, Topic)"],
+      "constraints": ["X != Y"],
+      "enabled": true,
+      "priority": 20
+    },
+    {
+      "name": "potential_conversation",
+      "description": "Identifies people worth starting conversations with",
+      "head": "potential_conversation(Person, Topic)",
+      "body": [
+        "mutual_follow(Self, Person)",
+        "interested_in(Person, Topic)",
+        "interested_in(Self, Topic)"
+      ],
+      "constraints": [],
+      "enabled": true,
+      "priority": 30
+    },
+    {
+      "name": "active_recently",
+      "description": "Marks accounts that have been active in recent conversations",
+      "head": "active_recently(Person)",
+      "body": ["mentioned(Person, _, Date)", "recent_date(Date)"],
+      "constraints": [],
+      "enabled": true,
+      "priority": 10
+    }
+  ]
+}
