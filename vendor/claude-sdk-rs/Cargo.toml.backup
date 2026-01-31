@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "claude-sdk-rs",
+    "claude-sdk-rs-core",
+    "claude-sdk-rs-runtime",
+    "claude-sdk-rs-mcp",
+    "claude-sdk-rs-interactive",
+    "examples",
+]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/frgmt0/claude-sdk-rs"
+homepage = "https://github.com/frgmt0/claude-sdk-rs"
+documentation = "https://docs.rs/claude-sdk-rs"
+authors = ["claude-sdk-rs contributors"]
+
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+futures = "0.3"
+tracing = "0.1"
+bytes = "1.7"
+async-trait = "0.1"
+
+# Dev dependencies
+proptest = "1.5"
+insta = "1.40"
+wiremock = "0.6"
+dotenv = "0.15"
