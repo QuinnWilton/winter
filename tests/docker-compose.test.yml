@@ -1,0 +1,30 @@
+version: "3.8"
+
+# Test PDS for integration tests
+# Not federated, just for local testing
+
+services:
+  pds:
+    image: ghcr.io/bluesky-social/pds:latest
+    ports:
+      - "3000:3000"
+    environment:
+      PDS_HOSTNAME: localhost
+      PDS_DATA_DIRECTORY: /pds
+      PDS_BLOBSTORE_DISK_LOCATION: /pds/blocks
+      PDS_JWT_SECRET: test-jwt-secret-do-not-use-in-production
+      PDS_ADMIN_PASSWORD: test-admin-password
+      PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+      # Disable federation for testing
+      PDS_CRAWLERS: ""
+      PDS_REPORT_SERVICE: ""
+    volumes:
+      - pds-data:/pds
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/xrpc/_health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pds-data:
