@@ -1,0 +1,54 @@
+services:
+  # One-time bootstrap to initialize identity (run manually)
+  bootstrap:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.bootstrap
+    container_name: winter-bootstrap
+    environment:
+      - WINTER_PDS_URL=${WINTER_PDS_URL}
+      - WINTER_HANDLE=${WINTER_HANDLE}
+      - WINTER_APP_PASSWORD=${WINTER_APP_PASSWORD}
+      - WINTER_OPERATOR_DID=${WINTER_OPERATOR_DID}
+      - RUST_LOG=winter=info
+    command:
+      - --values
+      - "${WINTER_VALUES:-intellectual honesty,genuine curiosity,thoughtful engagement}"
+      - --interests
+      - "${WINTER_INTERESTS:-distributed systems,philosophy of mind,creative writing}"
+      - --self-description
+      - "${WINTER_SELF_DESCRIPTION:-I am Winter, an autonomous agent exploring the fediverse.}"
+    profiles:
+      - bootstrap
+
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: winter-web
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - WINTER_PDS_URL=${WINTER_PDS_URL}
+      - WINTER_HANDLE=${WINTER_HANDLE}
+      - WINTER_APP_PASSWORD=${WINTER_APP_PASSWORD}
+      - WINTER_FIREHOSE_URL=${WINTER_FIREHOSE_URL:-wss://bsky.network}
+      - RUST_LOG=winter=info,winter_web=debug
+    command: ["winter", "web", "--port", "8080"]
+
+  winter:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: winter-daemon
+    restart: unless-stopped
+    environment:
+      - WINTER_PDS_URL=${WINTER_PDS_URL}
+      - WINTER_HANDLE=${WINTER_HANDLE}
+      - WINTER_APP_PASSWORD=${WINTER_APP_PASSWORD}
+      - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - RUST_LOG=winter=info
+    command: ["winter", "daemon"]
+    depends_on:
+      - web

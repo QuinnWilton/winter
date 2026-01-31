@@ -1,0 +1,29 @@
+[Unit]
+Description=Winter - Autonomous Bluesky Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=winter
+Group=winter
+WorkingDirectory=/opt/winter
+ExecStart=/usr/local/bin/winter daemon
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment
+Environment=RUST_LOG=winter=info
+EnvironmentFile=/opt/winter/.env
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/winter
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+[Unit]
+Description=Winter Web UI - Observation Interface
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=winter
+Group=winter
+WorkingDirectory=/opt/winter
+ExecStart=/usr/local/bin/winter web --port 8080
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Environment
+Environment=RUST_LOG=winter=info
+EnvironmentFile=/opt/winter/.env
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
