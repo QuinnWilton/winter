@@ -3,20 +3,24 @@
 use std::sync::Arc;
 
 use axum::{
-    Router,
-    extract::State,
-    response::{Html, IntoResponse, Json},
-    routing::get,
+    Form, Router,
+    extract::{Path, State},
+    response::{Html, IntoResponse, Json, Redirect},
+    routing::{get, post},
 };
+use chrono::Utc;
+use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::broadcast;
+use tokio::sync::{RwLock, broadcast};
 use tower_http::services::ServeDir;
 use tracing::warn;
 
 use winter_atproto::{
-    AtprotoClient, FACT_COLLECTION, Fact, IDENTITY_COLLECTION, IDENTITY_KEY, Identity,
-    JOB_COLLECTION, Job, THOUGHT_COLLECTION, Thought,
+    AtprotoClient, CustomTool, FACT_COLLECTION, Fact, IDENTITY_COLLECTION, IDENTITY_KEY, Identity,
+    JOB_COLLECTION, Job, SECRET_META_COLLECTION, SECRET_META_KEY, SecretMeta, THOUGHT_COLLECTION,
+    TOOL_APPROVAL_COLLECTION, TOOL_COLLECTION, Thought, ToolApproval, ToolApprovalStatus,
 };
+use winter_mcp::SecretManager;
 
 use crate::sse::create_sse_stream;
 use crate::thought_stream::subscribe_thoughts;
@@ -25,6 +29,8 @@ use crate::thought_stream::subscribe_thoughts;
 pub struct AppState {
     pub client: AtprotoClient,
     pub thought_tx: broadcast::Sender<String>,
+    /// Secret manager for custom tools (optional).
+    pub secrets: Option<Arc<RwLock<SecretManager>>>,
 }
 
 /// Create the web router.
@@ -36,11 +42,23 @@ pub fn create_router(
     firehose_url: Option<String>,
     did: Option<String>,
 ) -> Router {
+    create_router_with_secrets(client, static_dir, firehose_url, did, None)
+}
+
+/// Create the web router with optional secret manager.
+pub fn create_router_with_secrets(
+    client: AtprotoClient,
+    static_dir: Option<&str>,
+    firehose_url: Option<String>,
+    did: Option<String>,
+    secrets: Option<SecretManager>,
+) -> Router {
     let (thought_tx, _) = broadcast::channel(100);
 
     let state = Arc::new(AppState {
         client,
         thought_tx: thought_tx.clone(),
+        secrets: secrets.map(|s| Arc::new(RwLock::new(s))),
     });
 
     // Subscribe to firehose for real-time thought updates
@@ -57,6 +75,15 @@ pub fn create_router(
         .route("/identity", get(identity_page))
         .route("/jobs", get(jobs_page))
         .route("/notes", get(notes_page))
+        .route("/tools", get(tools_page))
+        .route("/tools/:rkey", get(tool_detail))
+        .route("/api/tools/:rkey/approve", post(approve_tool))
+        .route("/api/tools/:rkey/deny", post(deny_tool))
+        .route("/api/tools/:rkey/revoke", post(revoke_tool))
+        .route("/secrets", get(secrets_page))
+        .route("/api/secrets", post(create_secret))
+        .route("/api/secrets/:name", post(update_secret))
+        .route("/api/secrets/:name/delete", post(delete_secret))
         .route("/health", get(health))
         .route("/api/thoughts/sse", get(thoughts_sse))
         .with_state(state);
@@ -471,6 +498,8 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <a href="/notes">Notes</a>
         <a href="/identity">Identity</a>
         <a href="/jobs">Jobs</a>
+        <a href="/tools">Tools</a>
+        <a href="/secrets">Secrets</a>
     </nav>
 </body>
 </html>"#;
@@ -973,5 +1002,681 @@ const NOTES_HTML: &str = r#"<!DOCTYPE html>
     <h1><a href="/">Winter</a> / Notes</h1>
     <p class="count"><!-- COUNT --> notes</p>
     <div id="notes"><!-- NOTES --></div>
+</body>
+</html>"#;
+
+// ============================================================================
+// Tools and Secrets Routes
+// ============================================================================
+
+async fn tools_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let tools = match state
+        .client
+        .list_all_records::<CustomTool>(TOOL_COLLECTION)
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, "failed to load tools for tools page");
+            Vec::new()
+        }
+    };
+
+    let mut tools_html = String::new();
+    for item in &tools {
+        let rkey = item.uri.split('/').next_back().unwrap_or("");
+
+        // Get approval status
+        let approval = state
+            .client
+            .get_record::<ToolApproval>(TOOL_APPROVAL_COLLECTION, rkey)
+            .await
+            .ok();
+
+        let (status, status_class) = match &approval {
+            Some(r)
+                if r.value.status == ToolApprovalStatus::Approved
+                    && r.value.tool_version == item.value.version =>
+            {
+                ("approved", "approved")
+            }
+            Some(r) if r.value.status == ToolApprovalStatus::Denied => ("denied", "denied"),
+            Some(r) if r.value.status == ToolApprovalStatus::Revoked => ("revoked", "denied"),
+            Some(_) => ("outdated", "pending"),
+            None => ("pending", "pending"),
+        };
+
+        tools_html.push_str(&format!(
+            r#"<tr>
+                <td><a href="/tools/{rkey}">{}</a></td>
+                <td>{}</td>
+                <td>{}</td>
+                <td><span class="status {status_class}">{status}</span></td>
+                <td>{}</td>
+            </tr>"#,
+            html_escape(&item.value.name),
+            html_escape(&truncate_chars(&item.value.description, 60)),
+            item.value.version,
+            item.value.required_secrets.join(", ")
+        ));
+    }
+
+    Html(
+        TOOLS_HTML
+            .replace("<!-- TOOLS -->", &tools_html)
+            .replace("<!-- COUNT -->", &tools.len().to_string()),
+    )
+}
+
+async fn tool_detail(
+    State(state): State<Arc<AppState>>,
+    Path(rkey): Path<String>,
+) -> impl IntoResponse {
+    let tool = match state
+        .client
+        .get_record::<CustomTool>(TOOL_COLLECTION, &rkey)
+        .await
+    {
+        Ok(t) => t.value,
+        Err(_) => return Html(TOOL_NOT_FOUND_HTML.to_string()),
+    };
+
+    let approval = state
+        .client
+        .get_record::<ToolApproval>(TOOL_APPROVAL_COLLECTION, &rkey)
+        .await
+        .ok()
+        .map(|r| r.value);
+
+    let (status, status_class) = match &approval {
+        Some(a) if a.status == ToolApprovalStatus::Approved && a.tool_version == tool.version => {
+            ("approved", "approved")
+        }
+        Some(a) if a.status == ToolApprovalStatus::Denied => ("denied", "denied"),
+        Some(a) if a.status == ToolApprovalStatus::Revoked => ("revoked", "denied"),
+        Some(_) => ("outdated approval", "pending"),
+        None => ("pending approval", "pending"),
+    };
+
+    let secrets_checkboxes: String = tool
+        .required_secrets
+        .iter()
+        .map(|s| {
+            let checked = approval
+                .as_ref()
+                .map(|a| a.allowed_secrets.contains(s))
+                .unwrap_or(false);
+            let checked_attr = if checked { " checked" } else { "" };
+            format!(
+                r#"<label><input type="checkbox" name="secrets" value="{s}"{checked_attr}> {s}</label><br>"#
+            )
+        })
+        .collect();
+
+    let network_checked = approval
+        .as_ref()
+        .and_then(|a| a.allow_network)
+        .unwrap_or(false);
+    let network_attr = if network_checked { " checked" } else { "" };
+
+    Html(
+        TOOL_DETAIL_HTML
+            .replace("<!-- RKEY -->", &rkey)
+            .replace("<!-- NAME -->", &html_escape(&tool.name))
+            .replace("<!-- DESCRIPTION -->", &html_escape(&tool.description))
+            .replace("<!-- CODE -->", &html_escape(&tool.code))
+            .replace("<!-- VERSION -->", &tool.version.to_string())
+            .replace("<!-- STATUS -->", status)
+            .replace("<!-- STATUS_CLASS -->", status_class)
+            .replace("<!-- SECRETS_CHECKBOXES -->", &secrets_checkboxes)
+            .replace("<!-- NETWORK_CHECKED -->", network_attr)
+            .replace(
+                "<!-- INPUT_SCHEMA -->",
+                &html_escape(&serde_json::to_string_pretty(&tool.input_schema).unwrap_or_default()),
+            ),
+    )
+}
+
+#[derive(Deserialize)]
+struct ApprovalForm {
+    #[serde(default)]
+    secrets: Vec<String>,
+    #[serde(default)]
+    allow_network: Option<String>,
+    reason: Option<String>,
+}
+
+async fn approve_tool(
+    State(state): State<Arc<AppState>>,
+    Path(rkey): Path<String>,
+    Form(form): Form<ApprovalForm>,
+) -> impl IntoResponse {
+    // Get the tool to verify it exists and get version
+    let tool = match state
+        .client
+        .get_record::<CustomTool>(TOOL_COLLECTION, &rkey)
+        .await
+    {
+        Ok(t) => t.value,
+        Err(_) => return Redirect::to(&format!("/tools/{}", rkey)),
+    };
+
+    let approval = ToolApproval {
+        tool_rkey: rkey.clone(),
+        tool_version: tool.version,
+        status: ToolApprovalStatus::Approved,
+        allow_network: Some(form.allow_network.is_some()),
+        allowed_secrets: form.secrets,
+        approved_by: None, // TODO: get from session
+        reason: form.reason,
+        created_at: Utc::now(),
+    };
+
+    let _ = state
+        .client
+        .put_record(TOOL_APPROVAL_COLLECTION, &rkey, &approval)
+        .await;
+
+    Redirect::to(&format!("/tools/{}", rkey))
+}
+
+async fn deny_tool(
+    State(state): State<Arc<AppState>>,
+    Path(rkey): Path<String>,
+    Form(form): Form<ApprovalForm>,
+) -> impl IntoResponse {
+    let tool = match state
+        .client
+        .get_record::<CustomTool>(TOOL_COLLECTION, &rkey)
+        .await
+    {
+        Ok(t) => t.value,
+        Err(_) => return Redirect::to(&format!("/tools/{}", rkey)),
+    };
+
+    let approval = ToolApproval {
+        tool_rkey: rkey.clone(),
+        tool_version: tool.version,
+        status: ToolApprovalStatus::Denied,
+        allow_network: None,
+        allowed_secrets: Vec::new(),
+        approved_by: None,
+        reason: form.reason,
+        created_at: Utc::now(),
+    };
+
+    let _ = state
+        .client
+        .put_record(TOOL_APPROVAL_COLLECTION, &rkey, &approval)
+        .await;
+
+    Redirect::to(&format!("/tools/{}", rkey))
+}
+
+async fn revoke_tool(
+    State(state): State<Arc<AppState>>,
+    Path(rkey): Path<String>,
+) -> impl IntoResponse {
+    let tool = match state
+        .client
+        .get_record::<CustomTool>(TOOL_COLLECTION, &rkey)
+        .await
+    {
+        Ok(t) => t.value,
+        Err(_) => return Redirect::to(&format!("/tools/{}", rkey)),
+    };
+
+    let approval = ToolApproval {
+        tool_rkey: rkey.clone(),
+        tool_version: tool.version,
+        status: ToolApprovalStatus::Revoked,
+        allow_network: None,
+        allowed_secrets: Vec::new(),
+        approved_by: None,
+        reason: Some("Revoked by operator".to_string()),
+        created_at: Utc::now(),
+    };
+
+    let _ = state
+        .client
+        .put_record(TOOL_APPROVAL_COLLECTION, &rkey, &approval)
+        .await;
+
+    Redirect::to(&format!("/tools/{}", rkey))
+}
+
+async fn secrets_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    // Get metadata from ATProto
+    let meta = state
+        .client
+        .get_record::<SecretMeta>(SECRET_META_COLLECTION, SECRET_META_KEY)
+        .await
+        .ok()
+        .map(|r| r.value);
+
+    // Check which have values
+    let has_value: std::collections::HashSet<String> = if let Some(ref secrets) = state.secrets {
+        let mgr = secrets.read().await;
+        mgr.list_names().into_iter().collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    let mut secrets_html = String::new();
+    if let Some(meta) = meta {
+        for secret in &meta.secrets {
+            let has = has_value.contains(&secret.name);
+            let status = if has { "configured" } else { "missing" };
+            let status_class = if has { "approved" } else { "pending" };
+
+            secrets_html.push_str(&format!(
+                r#"<tr>
+                    <td>{}</td>
+                    <td>{}</td>
+                    <td><span class="status {status_class}">{status}</span></td>
+                    <td>
+                        <form action="/api/secrets/{}" method="post" class="inline-form">
+                            <input type="password" name="value" placeholder="New value" required>
+                            <button type="submit" class="btn">Set</button>
+                        </form>
+                        <form action="/api/secrets/{}/delete" method="post" class="inline-form">
+                            <button type="submit" class="btn btn-danger">Delete</button>
+                        </form>
+                    </td>
+                </tr>"#,
+                html_escape(&secret.name),
+                html_escape(secret.description.as_deref().unwrap_or("")),
+                html_escape(&secret.name),
+                html_escape(&secret.name),
+            ));
+        }
+    }
+
+    Html(SECRETS_HTML.replace("<!-- SECRETS -->", &secrets_html))
+}
+
+#[derive(Deserialize)]
+struct SecretForm {
+    name: Option<String>,
+    value: String,
+    description: Option<String>,
+}
+
+async fn create_secret(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<SecretForm>,
+) -> impl IntoResponse {
+    let name = match form.name {
+        Some(n) if !n.is_empty() => n,
+        _ => return Redirect::to("/secrets"),
+    };
+
+    // Update metadata in ATProto
+    let mut meta = state
+        .client
+        .get_record::<SecretMeta>(SECRET_META_COLLECTION, SECRET_META_KEY)
+        .await
+        .ok()
+        .map(|r| r.value)
+        .unwrap_or_else(|| SecretMeta {
+            secrets: Vec::new(),
+            created_at: Utc::now(),
+            last_updated: None,
+        });
+
+    if !meta.secrets.iter().any(|s| s.name == name) {
+        meta.secrets.push(winter_atproto::SecretEntry {
+            name: name.clone(),
+            description: form.description,
+        });
+        meta.last_updated = Some(Utc::now());
+        let _ = state
+            .client
+            .put_record(SECRET_META_COLLECTION, SECRET_META_KEY, &meta)
+            .await;
+    }
+
+    // Set value in local storage
+    if let Some(ref secrets) = state.secrets {
+        let mut mgr = secrets.write().await;
+        let _ = mgr.set(&name, &form.value).await;
+    }
+
+    Redirect::to("/secrets")
+}
+
+async fn update_secret(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Form(form): Form<SecretForm>,
+) -> impl IntoResponse {
+    if let Some(ref secrets) = state.secrets {
+        let mut mgr = secrets.write().await;
+        let _ = mgr.set(&name, &form.value).await;
+    }
+
+    Redirect::to("/secrets")
+}
+
+async fn delete_secret(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    // Remove from local storage
+    if let Some(ref secrets) = state.secrets {
+        let mut mgr = secrets.write().await;
+        let _ = mgr.delete(&name).await;
+    }
+
+    // Remove from metadata
+    if let Ok(mut meta) = state
+        .client
+        .get_record::<SecretMeta>(SECRET_META_COLLECTION, SECRET_META_KEY)
+        .await
+        .map(|r| r.value)
+    {
+        meta.secrets.retain(|s| s.name != name);
+        meta.last_updated = Some(Utc::now());
+        let _ = state
+            .client
+            .put_record(SECRET_META_COLLECTION, SECRET_META_KEY, &meta)
+            .await;
+    }
+
+    Redirect::to("/secrets")
+}
+
+const TOOLS_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Winter - Custom Tools</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 2rem;
+            background: #0a0a0a;
+            color: #e0e0e0;
+        }
+        h1 { color: #88c0d0; }
+        h1 a { color: #88c0d0; text-decoration: none; }
+        a { color: #81a1c1; }
+        table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+        th, td { padding: 0.75rem; text-align: left; border-bottom: 1px solid #3b4252; }
+        th { background: #2e3440; color: #88c0d0; }
+        tr:hover { background: #2e3440; }
+        .count { color: #888; margin-bottom: 1rem; }
+        .status {
+            padding: 0.2rem 0.5rem;
+            border-radius: 3px;
+            font-size: 0.85rem;
+        }
+        .status.pending { background: #ebcb8b; color: #000; }
+        .status.approved { background: #a3be8c; color: #000; }
+        .status.denied { background: #bf616a; color: #fff; }
+    </style>
+</head>
+<body>
+    <h1><a href="/">Winter</a> / Custom Tools</h1>
+    <p class="count"><!-- COUNT --> custom tools</p>
+    <table>
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>Description</th>
+                <th>Version</th>
+                <th>Status</th>
+                <th>Required Secrets</th>
+            </tr>
+        </thead>
+        <tbody>
+            <!-- TOOLS -->
+        </tbody>
+    </table>
+</body>
+</html>"#;
+
+const TOOL_DETAIL_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Winter - Tool: <!-- NAME --></title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 2rem;
+            background: #0a0a0a;
+            color: #e0e0e0;
+        }
+        h1 { color: #88c0d0; }
+        h1 a { color: #88c0d0; text-decoration: none; }
+        h2 { color: #81a1c1; margin-top: 2rem; }
+        a { color: #81a1c1; }
+        .status {
+            padding: 0.3rem 0.6rem;
+            border-radius: 3px;
+            font-size: 0.9rem;
+            margin-left: 1rem;
+        }
+        .status.pending { background: #ebcb8b; color: #000; }
+        .status.approved { background: #a3be8c; color: #000; }
+        .status.denied { background: #bf616a; color: #fff; }
+        pre {
+            background: #2e3440;
+            padding: 1rem;
+            border-radius: 4px;
+            overflow-x: auto;
+            font-family: "SF Mono", "Menlo", monospace;
+            font-size: 0.9rem;
+            line-height: 1.5;
+        }
+        .description {
+            background: #2e3440;
+            padding: 1rem;
+            border-radius: 4px;
+            margin: 1rem 0;
+        }
+        .approval-form {
+            background: #2e3440;
+            padding: 1.5rem;
+            border-radius: 4px;
+            margin: 1rem 0;
+        }
+        .approval-form h3 { margin-top: 0; color: #88c0d0; }
+        .form-group { margin: 1rem 0; }
+        .form-group label { display: block; margin-bottom: 0.5rem; }
+        input[type="text"], textarea {
+            width: 100%;
+            padding: 0.5rem;
+            background: #3b4252;
+            border: 1px solid #4c566a;
+            border-radius: 4px;
+            color: #e0e0e0;
+        }
+        .btn {
+            padding: 0.5rem 1rem;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            margin-right: 0.5rem;
+        }
+        .btn-approve { background: #a3be8c; color: #000; }
+        .btn-deny { background: #bf616a; color: #fff; }
+        .btn-revoke { background: #d08770; color: #000; }
+        .meta { color: #888; font-size: 0.9rem; }
+    </style>
+</head>
+<body>
+    <h1><a href="/">Winter</a> / <a href="/tools">Tools</a> / <!-- NAME --></h1>
+    <p class="meta">Version <!-- VERSION --> <span class="status <!-- STATUS_CLASS -->"><!-- STATUS --></span></p>
+
+    <h2>Description</h2>
+    <div class="description"><!-- DESCRIPTION --></div>
+
+    <h2>Input Schema</h2>
+    <pre><!-- INPUT_SCHEMA --></pre>
+
+    <h2>Source Code</h2>
+    <pre><!-- CODE --></pre>
+
+    <div class="approval-form">
+        <h3>Approval</h3>
+        <form action="/api/tools/<!-- RKEY -->/approve" method="post">
+            <div class="form-group">
+                <label><input type="checkbox" name="allow_network"<!-- NETWORK_CHECKED -->> Allow network access</label>
+            </div>
+            <div class="form-group">
+                <label>Allowed secrets:</label>
+                <!-- SECRETS_CHECKBOXES -->
+            </div>
+            <div class="form-group">
+                <label>Reason (optional):</label>
+                <input type="text" name="reason" placeholder="Approval reason">
+            </div>
+            <button type="submit" class="btn btn-approve">Approve</button>
+        </form>
+        <form action="/api/tools/<!-- RKEY -->/deny" method="post" style="display: inline;">
+            <input type="hidden" name="reason" value="">
+            <button type="submit" class="btn btn-deny">Deny</button>
+        </form>
+        <form action="/api/tools/<!-- RKEY -->/revoke" method="post" style="display: inline;">
+            <button type="submit" class="btn btn-revoke">Revoke</button>
+        </form>
+    </div>
+</body>
+</html>"#;
+
+const TOOL_NOT_FOUND_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Winter - Tool Not Found</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 2rem;
+            background: #0a0a0a;
+            color: #e0e0e0;
+        }
+        h1 { color: #88c0d0; }
+        h1 a { color: #88c0d0; text-decoration: none; }
+        .error {
+            background: #bf616a;
+            padding: 1rem;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <h1><a href="/">Winter</a> / <a href="/tools">Tools</a></h1>
+    <div class="error">Tool not found.</div>
+</body>
+</html>"#;
+
+const SECRETS_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Winter - Secrets</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 2rem;
+            background: #0a0a0a;
+            color: #e0e0e0;
+        }
+        h1 { color: #88c0d0; }
+        h1 a { color: #88c0d0; text-decoration: none; }
+        h2 { color: #81a1c1; margin-top: 2rem; }
+        a { color: #81a1c1; }
+        table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+        th, td { padding: 0.75rem; text-align: left; border-bottom: 1px solid #3b4252; }
+        th { background: #2e3440; color: #88c0d0; }
+        tr:hover { background: #2e3440; }
+        .status {
+            padding: 0.2rem 0.5rem;
+            border-radius: 3px;
+            font-size: 0.85rem;
+        }
+        .status.approved { background: #a3be8c; color: #000; }
+        .status.pending { background: #ebcb8b; color: #000; }
+        .inline-form { display: inline; }
+        input[type="password"], input[type="text"] {
+            padding: 0.3rem;
+            background: #3b4252;
+            border: 1px solid #4c566a;
+            border-radius: 4px;
+            color: #e0e0e0;
+            width: 120px;
+        }
+        .btn {
+            padding: 0.3rem 0.6rem;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85rem;
+            background: #5e81ac;
+            color: #fff;
+        }
+        .btn-danger { background: #bf616a; }
+        .add-form {
+            background: #2e3440;
+            padding: 1.5rem;
+            border-radius: 4px;
+            margin: 1rem 0;
+        }
+        .add-form h3 { margin-top: 0; color: #88c0d0; }
+        .form-group { margin: 1rem 0; }
+        .form-group label { display: block; margin-bottom: 0.5rem; }
+        .form-group input { width: 200px; }
+    </style>
+</head>
+<body>
+    <h1><a href="/">Winter</a> / Secrets</h1>
+
+    <table>
+        <thead>
+            <tr>
+                <th>Name</th>
+                <th>Description</th>
+                <th>Status</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            <!-- SECRETS -->
+        </tbody>
+    </table>
+
+    <div class="add-form">
+        <h3>Add New Secret</h3>
+        <form action="/api/secrets" method="post">
+            <div class="form-group">
+                <label>Name:</label>
+                <input type="text" name="name" required placeholder="API_KEY">
+            </div>
+            <div class="form-group">
+                <label>Description:</label>
+                <input type="text" name="description" placeholder="What this secret is for">
+            </div>
+            <div class="form-group">
+                <label>Value:</label>
+                <input type="password" name="value" required placeholder="Secret value">
+            </div>
+            <button type="submit" class="btn">Add Secret</button>
+        </form>
+    </div>
 </body>
 </html>"#;
