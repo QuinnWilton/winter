@@ -1,0 +1,51 @@
+[package]
+name = "winter-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Read-only observation web UI for Winter"
+
+[dependencies]
+# Error handling
+thiserror = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+futures-util = { workspace = true }
+
+# WebSocket for firehose
+tokio-tungstenite = { workspace = true }
+
+# Web framework
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Templates
+askama = { workspace = true }
+askama_axum = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_ipld_dagcbor = { workspace = true }
+serde_bytes = { workspace = true }
+ciborium = { workspace = true }
+ipld-core = { workspace = true }
+
+# CAR file parsing
+iroh-car = { workspace = true }
+
+# Date/time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Internal
+winter-atproto = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
