@@ -1,0 +1,17 @@
+target/
+**/target/
+.git/
+.idea/
+.vscode/
+.env
+.env.*
+docker/.env
+*.log
+*.tmp
+tests/
+examples/
+vendor/**/target/
+vendor/**/.git/
+vendor/**/*.md
+vendor/**/tasks/
+.DS_Store

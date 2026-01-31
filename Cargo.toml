@@ -1,0 +1,100 @@
+[workspace]
+members = [
+    "crates/winter",
+    "crates/winter-atproto",
+    "crates/winter-datalog",
+    "crates/winter-agent",
+    "crates/winter-mcp",
+    "crates/winter-scheduler",
+    "crates/winter-web",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/quinn/winter"
+
+[workspace.dependencies]
+# Error handling
+thiserror = "2.0"
+miette = { version = "7.0", features = ["fancy"] }
+
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+
+# Claude Code CLI wrapper (vendored)
+claude-sdk-rs = { path = "vendor/claude-sdk-rs" }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UUID and ID generation
+uuid = { version = "1.11", features = ["v4"] }
+
+# Base64 encoding
+base64 = "0.22"
+
+# Bluesky AT Protocol
+bsky-sdk = "0.1"
+atrium-api = "0.25"
+
+# CAR file parsing and firehose
+iroh-car = "0.5"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+serde_ipld_dagcbor = "0.6"
+ipld-core = "0.4"
+ciborium = "0.2"
+multibase = "0.9"
+serde_bytes = "0.11"
+
+# Concurrent data structures
+dashmap = "6.0"
+crossbeam = "0.8"
+
+# Web framework
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+askama = "0.12"
+askama_axum = "0.4"
+tokio-stream = "0.1"
+
+# Testing utilities
+test-case = "3.3"
+proptest = "1.6"
+insta = "1.41"
+pretty_assertions = "1.4"
+tempfile = "3.14"
+wiremock = "0.6"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Internal crates
+winter-atproto = { path = "crates/winter-atproto" }
+winter-datalog = { path = "crates/winter-datalog" }
+winter-agent = { path = "crates/winter-agent" }
+winter-mcp = { path = "crates/winter-mcp" }
+winter-scheduler = { path = "crates/winter-scheduler" }
+winter-web = { path = "crates/winter-web" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = 3
+panic = "abort"
