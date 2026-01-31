@@ -6,7 +6,7 @@ use std::time::Duration;
 use reqwest::Client;
 use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::RwLock;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     AtprotoError, CreateRecordResponse, GetRecordResponse, ListRecordItem, ListRecordsResponse,
@@ -137,6 +137,29 @@ impl AtprotoClient {
             .ok_or_else(|| AtprotoError::Auth("not authenticated".to_string()))
     }
 
+    /// Check if an error indicates an expired token.
+    fn is_expired_token_error(err: &AtprotoError) -> bool {
+        matches!(
+            err,
+            AtprotoError::Xrpc { error, .. } if error == "ExpiredToken"
+        )
+    }
+
+    /// Try to refresh the session if possible.
+    /// Returns true if refresh succeeded, false if it failed or wasn't possible.
+    async fn try_refresh(&self) -> bool {
+        match self.refresh_session().await {
+            Ok(()) => {
+                debug!("automatically refreshed expired session");
+                true
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to auto-refresh session");
+                false
+            }
+        }
+    }
+
     /// Create a new record.
     pub async fn create_record<T: Serialize>(
         &self,
@@ -159,22 +182,38 @@ impl AtprotoClient {
         }
 
         let url = format!("{}/xrpc/com.atproto.repo.createRecord", self.pds_url);
-        let token = self.access_token().await?;
 
-        let response = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .json(&CreateRequest {
-                repo: &did,
-                collection,
-                rkey,
-                record,
-            })
-            .send()
-            .await?;
+        for attempt in 0..2 {
+            let token = self.access_token().await?;
 
-        self.handle_response(response).await
+            let response = self
+                .http
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&CreateRequest {
+                    repo: &did,
+                    collection,
+                    rkey,
+                    record,
+                })
+                .send()
+                .await?;
+
+            let result = self.handle_response(response).await;
+
+            // Retry once on expired token
+            if attempt == 0 {
+                if let Err(ref e) = result {
+                    if Self::is_expired_token_error(e) && self.try_refresh().await {
+                        continue;
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        unreachable!()
     }
 
     /// Get a record by collection and rkey.
@@ -189,28 +228,44 @@ impl AtprotoClient {
             .ok_or_else(|| AtprotoError::Auth("not authenticated".to_string()))?;
 
         let url = format!("{}/xrpc/com.atproto.repo.getRecord", self.pds_url);
-        let token = self.access_token().await?;
 
-        let response = self
-            .http
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .query(&[
-                ("repo", &did),
-                ("collection", &collection.to_string()),
-                ("rkey", &rkey.to_string()),
-            ])
-            .send()
-            .await?;
+        for attempt in 0..2 {
+            let token = self.access_token().await?;
 
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(AtprotoError::NotFound {
-                collection: collection.to_string(),
-                rkey: rkey.to_string(),
-            });
+            let response = self
+                .http
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .query(&[
+                    ("repo", &did),
+                    ("collection", &collection.to_string()),
+                    ("rkey", &rkey.to_string()),
+                ])
+                .send()
+                .await?;
+
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err(AtprotoError::NotFound {
+                    collection: collection.to_string(),
+                    rkey: rkey.to_string(),
+                });
+            }
+
+            let result = self.handle_response(response).await;
+
+            // Retry once on expired token
+            if attempt == 0 {
+                if let Err(ref e) = result {
+                    if Self::is_expired_token_error(e) && self.try_refresh().await {
+                        continue;
+                    }
+                }
+            }
+
+            return result;
         }
 
-        self.handle_response(response).await
+        unreachable!()
     }
 
     /// List records in a collection.
@@ -226,26 +281,42 @@ impl AtprotoClient {
             .ok_or_else(|| AtprotoError::Auth("not authenticated".to_string()))?;
 
         let url = format!("{}/xrpc/com.atproto.repo.listRecords", self.pds_url);
-        let token = self.access_token().await?;
 
-        let mut query_params: Vec<(&str, String)> =
-            vec![("repo", did), ("collection", collection.to_string())];
-        if let Some(limit) = limit {
-            query_params.push(("limit", limit.to_string()));
+        for attempt in 0..2 {
+            let token = self.access_token().await?;
+
+            let mut query_params: Vec<(&str, String)> =
+                vec![("repo", did.clone()), ("collection", collection.to_string())];
+            if let Some(limit) = limit {
+                query_params.push(("limit", limit.to_string()));
+            }
+            if let Some(cursor) = cursor {
+                query_params.push(("cursor", cursor.to_string()));
+            }
+
+            let response = self
+                .http
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .query(&query_params)
+                .send()
+                .await?;
+
+            let result = self.handle_response(response).await;
+
+            // Retry once on expired token
+            if attempt == 0 {
+                if let Err(ref e) = result {
+                    if Self::is_expired_token_error(e) && self.try_refresh().await {
+                        continue;
+                    }
+                }
+            }
+
+            return result;
         }
-        if let Some(cursor) = cursor {
-            query_params.push(("cursor", cursor.to_string()));
-        }
 
-        let response = self
-            .http
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .query(&query_params)
-            .send()
-            .await?;
-
-        self.handle_response(response).await
+        unreachable!()
     }
 
     /// List all records in a collection (handles pagination).
@@ -293,22 +364,38 @@ impl AtprotoClient {
         }
 
         let url = format!("{}/xrpc/com.atproto.repo.putRecord", self.pds_url);
-        let token = self.access_token().await?;
 
-        let response = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .json(&PutRequest {
-                repo: &did,
-                collection,
-                rkey,
-                record,
-            })
-            .send()
-            .await?;
+        for attempt in 0..2 {
+            let token = self.access_token().await?;
 
-        self.handle_response(response).await
+            let response = self
+                .http
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&PutRequest {
+                    repo: &did,
+                    collection,
+                    rkey,
+                    record,
+                })
+                .send()
+                .await?;
+
+            let result = self.handle_response(response).await;
+
+            // Retry once on expired token
+            if attempt == 0 {
+                if let Err(ref e) = result {
+                    if Self::is_expired_token_error(e) && self.try_refresh().await {
+                        continue;
+                    }
+                }
+            }
+
+            return result;
+        }
+
+        unreachable!()
     }
 
     /// Get the PDS URL.
@@ -321,53 +408,72 @@ impl AtprotoClient {
     /// Returns the CAR bytes and the repository revision from the response header.
     pub async fn get_repo(&self, did: &str) -> Result<(Vec<u8>, Option<String>), AtprotoError> {
         let url = format!("{}/xrpc/com.atproto.sync.getRepo", self.pds_url);
-        let token = self.access_token().await?;
 
-        let response = self
-            .http
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .query(&[("did", did)])
-            .send()
-            .await?;
+        for attempt in 0..2 {
+            let token = self.access_token().await?;
 
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let retry_after_secs = response
+            let response = self
+                .http
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .query(&[("did", did)])
+                .send()
+                .await?;
+
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let retry_after_secs = response
+                    .headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse().ok());
+                return Err(AtprotoError::RateLimited {
+                    endpoint: Some("com.atproto.sync.getRepo".to_string()),
+                    retry_after_secs,
+                });
+            }
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let text = response.text().await.map_err(|e| {
+                    AtprotoError::InvalidResponse(format!(
+                        "get_repo failed ({}): failed to read response: {}",
+                        status, e
+                    ))
+                })?;
+
+                // Check for expired token before returning error
+                if let Ok(xrpc_error) = serde_json::from_str::<XrpcError>(&text) {
+                    let err = AtprotoError::Xrpc {
+                        error: xrpc_error.error.clone(),
+                        message: xrpc_error.message,
+                    };
+                    if attempt == 0 && Self::is_expired_token_error(&err) && self.try_refresh().await
+                    {
+                        continue;
+                    }
+                    return Err(err);
+                }
+
+                return Err(AtprotoError::InvalidResponse(format!(
+                    "get_repo failed ({}): {}",
+                    status, text
+                )));
+            }
+
+            // Extract the Atproto-Repo-Rev header
+            let repo_rev = response
                 .headers()
-                .get("Retry-After")
+                .get("Atproto-Repo-Rev")
                 .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse().ok());
-            return Err(AtprotoError::RateLimited {
-                endpoint: Some("com.atproto.sync.getRepo".to_string()),
-                retry_after_secs,
-            });
+                .map(String::from);
+
+            let bytes = response.bytes().await?.to_vec();
+            debug!(size = bytes.len(), rev = ?repo_rev, "fetched repo CAR");
+
+            return Ok((bytes, repo_rev));
         }
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.map_err(|e| {
-                AtprotoError::InvalidResponse(format!(
-                    "get_repo failed ({}): failed to read response: {}",
-                    status, e
-                ))
-            })?;
-            return Err(AtprotoError::InvalidResponse(format!(
-                "get_repo failed ({}): {}",
-                status, text
-            )));
-        }
-
-        // Extract the Atproto-Repo-Rev header
-        let repo_rev = response
-            .headers()
-            .get("Atproto-Repo-Rev")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-
-        let bytes = response.bytes().await?.to_vec();
-        debug!(size = bytes.len(), rev = ?repo_rev, "fetched repo CAR");
-
-        Ok((bytes, repo_rev))
+        unreachable!()
     }
 
     /// Delete a record.
@@ -385,41 +491,60 @@ impl AtprotoClient {
         }
 
         let url = format!("{}/xrpc/com.atproto.repo.deleteRecord", self.pds_url);
-        let token = self.access_token().await?;
 
-        let response = self
-            .http
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .json(&DeleteRequest {
-                repo: &did,
-                collection,
-                rkey,
-            })
-            .send()
-            .await?;
+        for attempt in 0..2 {
+            let token = self.access_token().await?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            if status == reqwest::StatusCode::NOT_FOUND {
-                return Err(AtprotoError::NotFound {
-                    collection: collection.to_string(),
-                    rkey: rkey.to_string(),
-                });
+            let response = self
+                .http
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&DeleteRequest {
+                    repo: &did,
+                    collection,
+                    rkey,
+                })
+                .send()
+                .await?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    return Err(AtprotoError::NotFound {
+                        collection: collection.to_string(),
+                        rkey: rkey.to_string(),
+                    });
+                }
+                let text = response.text().await.map_err(|e| {
+                    AtprotoError::InvalidResponse(format!(
+                        "delete failed ({}): failed to read response: {}",
+                        status, e
+                    ))
+                })?;
+
+                // Check for expired token before returning error
+                if let Ok(xrpc_error) = serde_json::from_str::<XrpcError>(&text) {
+                    let err = AtprotoError::Xrpc {
+                        error: xrpc_error.error.clone(),
+                        message: xrpc_error.message,
+                    };
+                    if attempt == 0 && Self::is_expired_token_error(&err) && self.try_refresh().await
+                    {
+                        continue;
+                    }
+                    return Err(err);
+                }
+
+                return Err(AtprotoError::InvalidResponse(format!(
+                    "delete failed ({}): {}",
+                    status, text
+                )));
             }
-            let text = response.text().await.map_err(|e| {
-                AtprotoError::InvalidResponse(format!(
-                    "delete failed ({}): failed to read response: {}",
-                    status, e
-                ))
-            })?;
-            return Err(AtprotoError::InvalidResponse(format!(
-                "delete failed ({}): {}",
-                status, text
-            )));
+
+            return Ok(());
         }
 
-        Ok(())
+        unreachable!()
     }
 
     /// Handle HTTP response and parse JSON.
