@@ -1,0 +1,53 @@
+[package]
+name = "winter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "winter"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+winter-atproto = { workspace = true }
+winter-datalog = { workspace = true }
+winter-agent = { workspace = true }
+winter-mcp = { workspace = true }
+winter-scheduler = { workspace = true }
+winter-web = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+miette = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Date/time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# CLI
+clap = { workspace = true, features = ["env"] }
+
+# Directory helpers
+dirs = "5.0"
+
+# Web (for run_web_server)
+axum = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
+
+[features]
+default = []
+integration = []
