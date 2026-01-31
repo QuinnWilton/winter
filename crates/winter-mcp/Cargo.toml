@@ -1,0 +1,40 @@
+[package]
+name = "winter-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP server and tools for Winter"
+
+[dependencies]
+# Error handling
+thiserror = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Date/time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Internal
+winter-atproto = { workspace = true }
+winter-datalog = { workspace = true }
+
+# Bluesky
+bsky-sdk = { workspace = true }
+atrium-api = { workspace = true }
+
+# Temp files for datalog execution
+tempfile = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+wiremock = { workspace = true }

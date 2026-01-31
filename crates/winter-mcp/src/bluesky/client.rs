@@ -1,0 +1,943 @@
+//! Bluesky client implementation.
+
+use atrium_api::agent::bluesky::{AtprotoServiceType, BSKY_CHAT_DID};
+use atrium_api::app::bsky::feed::like::RecordData as LikeRecordData;
+use atrium_api::app::bsky::feed::post::RecordData as PostRecordData;
+use atrium_api::com::atproto::repo::strong_ref::MainData as StrongRefData;
+use atrium_api::types::string::{Cid, Datetime};
+use bsky_sdk::BskyAgent;
+use bsky_sdk::agent::config::Config as BskyConfig;
+use bsky_sdk::rich_text::RichText;
+use thiserror::Error;
+use tracing::{debug, info};
+
+use super::types::{
+    BlueskyNotification, Conversation, ConvoMember, DirectMessage, NotificationReason, PostRef,
+    SearchPost, SearchUser, TimelinePost,
+};
+
+/// Errors that can occur when interacting with Bluesky.
+#[derive(Debug, Error)]
+pub enum BlueskyError {
+    #[error("authentication failed: {0}")]
+    Auth(String),
+
+    #[error("API error: {0}")]
+    Api(String),
+
+    #[error("rate limited{}", endpoint.as_ref().map(|e| format!(" on {}", e)).unwrap_or_default())]
+    RateLimited {
+        /// The endpoint that was rate limited (optional).
+        endpoint: Option<String>,
+    },
+
+    #[error("not configured")]
+    NotConfigured,
+}
+
+/// Client for interacting with Bluesky.
+pub struct BlueskyClient {
+    agent: BskyAgent,
+    handle: String,
+    /// Cursor for notification pagination (tracks last seen notification).
+    last_seen_at: Option<String>,
+    /// Cursor for DM pagination (tracks last seen DM timestamp).
+    last_dm_cursor: Option<String>,
+}
+
+impl BlueskyClient {
+    /// Create a new Bluesky client and authenticate.
+    pub async fn new(
+        pds_url: &str,
+        handle: &str,
+        app_password: &str,
+    ) -> Result<Self, BlueskyError> {
+        // Build agent with custom PDS URL if provided
+        let agent = if pds_url == "https://bsky.social" {
+            BskyAgent::builder()
+                .build()
+                .await
+                .map_err(|e| BlueskyError::Auth(e.to_string()))?
+        } else {
+            let config = BskyConfig {
+                endpoint: pds_url.to_string(),
+                ..Default::default()
+            };
+            BskyAgent::builder()
+                .config(config)
+                .build()
+                .await
+                .map_err(|e| BlueskyError::Auth(e.to_string()))?
+        };
+
+        // Login with app password
+        agent
+            .login(handle, app_password)
+            .await
+            .map_err(|e| BlueskyError::Auth(e.to_string()))?;
+
+        info!(handle = %handle, pds = %pds_url, "authenticated with bluesky");
+
+        Ok(Self {
+            agent,
+            handle: handle.to_string(),
+            last_seen_at: None,
+            last_dm_cursor: None,
+        })
+    }
+
+    /// Get the current user's DID.
+    pub async fn did(&self) -> Option<String> {
+        self.agent.get_session().await.map(|s| s.did.to_string())
+    }
+
+    /// Get the current user's handle.
+    pub fn handle(&self) -> &str {
+        &self.handle
+    }
+
+    /// Get the current notification cursor.
+    pub fn last_seen_at(&self) -> Option<&str> {
+        self.last_seen_at.as_deref()
+    }
+
+    /// Set the notification cursor (used to restore state on startup).
+    pub fn set_last_seen_at(&mut self, cursor: Option<String>) {
+        self.last_seen_at = cursor;
+    }
+
+    /// Get the current DM cursor.
+    pub fn last_dm_cursor(&self) -> Option<&str> {
+        self.last_dm_cursor.as_deref()
+    }
+
+    /// Set the DM cursor (used to restore state on startup).
+    pub fn set_last_dm_cursor(&mut self, cursor: Option<String>) {
+        self.last_dm_cursor = cursor;
+    }
+
+    /// Create a new post on Bluesky.
+    ///
+    /// Mentions (@handle) and URLs are automatically detected and linked.
+    pub async fn post(&self, text: &str) -> Result<PostRef, BlueskyError> {
+        // Use RichText to auto-detect mentions and links
+        let rt = RichText::new_with_detect_facets(text)
+            .await
+            .map_err(|e| BlueskyError::Api(e.to_string()))?;
+
+        let record_data = PostRecordData {
+            created_at: Datetime::now(),
+            embed: None,
+            entities: None,
+            facets: rt.facets,
+            labels: None,
+            langs: None,
+            reply: None,
+            tags: None,
+            text: rt.text,
+        };
+
+        let output = self
+            .agent
+            .create_record(record_data)
+            .await
+            .map_err(|e| BlueskyError::Api(e.to_string()))?;
+
+        debug!(uri = %output.uri, "created bluesky post");
+
+        Ok(PostRef {
+            uri: output.uri.to_string(),
+            cid: output.cid.as_ref().to_string(),
+        })
+    }
+
+    /// Reply to an existing post.
+    ///
+    /// `parent` is the post being directly replied to.
+    /// `root` is the root of the thread (same as parent for direct replies to root posts).
+    pub async fn reply(
+        &self,
+        text: &str,
+        parent: &PostRef,
+        root: &PostRef,
+    ) -> Result<PostRef, BlueskyError> {
+        // Use RichText to auto-detect mentions and links
+        let rt = RichText::new_with_detect_facets(text)
+            .await
+            .map_err(|e| BlueskyError::Api(e.to_string()))?;
+
+        // Parse CIDs (URIs are just strings)
+        let parent_cid: Cid = parent
+            .cid
+            .parse()
+            .map_err(|e| BlueskyError::Api(format!("invalid parent CID: {}", e)))?;
+        let root_cid: Cid = root
+            .cid
+            .parse()
+            .map_err(|e| BlueskyError::Api(format!("invalid root CID: {}", e)))?;
+
+        let reply_ref = atrium_api::app::bsky::feed::post::ReplyRefData {
+            parent: StrongRefData {
+                cid: parent_cid,
+                uri: parent.uri.clone(),
+            }
+            .into(),
+            root: StrongRefData {
+                cid: root_cid,
+                uri: root.uri.clone(),
+            }
+            .into(),
+        };
+
+        let record_data = PostRecordData {
+            created_at: Datetime::now(),
+            embed: None,
+            entities: None,
+            facets: rt.facets,
+            labels: None,
+            langs: None,
+            reply: Some(reply_ref.into()),
+            tags: None,
+            text: rt.text,
+        };
+
+        let output = self
+            .agent
+            .create_record(record_data)
+            .await
+            .map_err(|e| BlueskyError::Api(e.to_string()))?;
+
+        debug!(uri = %output.uri, parent = %parent.uri, "created bluesky reply");
+
+        Ok(PostRef {
+            uri: output.uri.to_string(),
+            cid: output.cid.as_ref().to_string(),
+        })
+    }
+
+    /// Send a direct message to a user.
+    ///
+    /// Note: DMs on Bluesky use the chat.bsky lexicon and require proxying to the chat service.
+    #[tracing::instrument(skip(self, text), fields(recipient = %recipient_did))]
+    pub async fn send_dm(&self, recipient_did: &str, text: &str) -> Result<String, BlueskyError> {
+        debug!("sending DM, getting chat API proxy");
+
+        // Get chat API with proxy to the Bluesky chat service
+        let chat_did = BSKY_CHAT_DID
+            .parse()
+            .map_err(|e| BlueskyError::Api(format!("invalid chat DID: {}", e)))?;
+        let chat_api = self
+            .agent
+            .api_with_proxy(chat_did, AtprotoServiceType::BskyChat);
+
+        debug!("getting or creating conversation");
+
+        // Get or create a conversation with the recipient
+        let convo =
+            chat_api
+                .chat
+                .bsky
+                .convo
+                .get_convo_for_members(
+                    atrium_api::chat::bsky::convo::get_convo_for_members::ParametersData {
+                        members: vec![recipient_did.parse().map_err(|e| {
+                            BlueskyError::Api(format!("invalid recipient DID: {}", e))
+                        })?],
+                    }
+                    .into(),
+                )
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "failed to get/create conversation");
+                    BlueskyError::Api(format!("failed to get/create conversation: {}", e))
+                })?;
+
+        let convo_id = convo.convo.id.clone();
+        debug!(convo_id = %convo_id, "got conversation, sending message");
+
+        // Send message to the conversation
+        let message = chat_api
+            .chat
+            .bsky
+            .convo
+            .send_message(
+                atrium_api::chat::bsky::convo::send_message::InputData {
+                    convo_id: convo_id.clone(),
+                    message: atrium_api::chat::bsky::convo::defs::MessageInputData {
+                        embed: None,
+                        facets: None,
+                        text: text.to_string(),
+                    }
+                    .into(),
+                }
+                .into(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to send message");
+                BlueskyError::Api(format!("failed to send message: {}", e))
+            })?;
+
+        debug!(convo_id = %convo_id, message_id = %message.id, "sent bluesky dm");
+
+        Ok(message.id.clone())
+    }
+
+    /// Send a direct message to an existing conversation.
+    ///
+    /// This is more reliable than `send_dm` when replying to a conversation
+    /// where the convo_id is already known, as it skips the get_convo_for_members lookup.
+    #[tracing::instrument(skip(self, text), fields(convo_id = %convo_id))]
+    pub async fn send_dm_to_convo(
+        &self,
+        convo_id: &str,
+        text: &str,
+    ) -> Result<String, BlueskyError> {
+        debug!("sending DM to existing conversation");
+
+        // Get chat API with proxy to the Bluesky chat service
+        let chat_did = BSKY_CHAT_DID
+            .parse()
+            .map_err(|e| BlueskyError::Api(format!("invalid chat DID: {}", e)))?;
+        let chat_api = self
+            .agent
+            .api_with_proxy(chat_did, AtprotoServiceType::BskyChat);
+
+        // Send message directly to the conversation
+        let message = chat_api
+            .chat
+            .bsky
+            .convo
+            .send_message(
+                atrium_api::chat::bsky::convo::send_message::InputData {
+                    convo_id: convo_id.to_string(),
+                    message: atrium_api::chat::bsky::convo::defs::MessageInputData {
+                        embed: None,
+                        facets: None,
+                        text: text.to_string(),
+                    }
+                    .into(),
+                }
+                .into(),
+            )
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "failed to send message to conversation");
+                BlueskyError::Api(format!("failed to send message: {}", e))
+            })?;
+
+        debug!(convo_id = %convo_id, message_id = %message.id, "sent DM to conversation");
+
+        Ok(message.id.clone())
+    }
+
+    /// Like a post.
+    pub async fn like(&self, uri: &str, cid: &str) -> Result<String, BlueskyError> {
+        let cid: Cid = cid
+            .parse()
+            .map_err(|e| BlueskyError::Api(format!("invalid CID: {}", e)))?;
+
+        let record_data = LikeRecordData {
+            created_at: Datetime::now(),
+            subject: StrongRefData {
+                cid,
+                uri: uri.to_string(),
+            }
+            .into(),
+            via: None,
+        };
+
+        let output = self
+            .agent
+            .create_record(record_data)
+            .await
+            .map_err(|e| BlueskyError::Api(e.to_string()))?;
+
+        debug!(like_uri = %output.uri, "liked bluesky post");
+
+        Ok(output.uri.to_string())
+    }
+
+    /// Follow a user by their DID or handle.
+    pub async fn follow(&self, subject: &str) -> Result<String, BlueskyError> {
+        // Parse as DID (subject can be a DID like "did:plc:xxx" or we need to resolve handle)
+        let did: atrium_api::types::string::Did = if subject.starts_with("did:") {
+            subject
+                .parse()
+                .map_err(|e| BlueskyError::Api(format!("invalid DID: {}", e)))?
+        } else {
+            // Resolve handle to DID
+            let resolved = self
+                .agent
+                .api
+                .com
+                .atproto
+                .identity
+                .resolve_handle(
+                    atrium_api::com::atproto::identity::resolve_handle::ParametersData {
+                        handle: subject
+                            .parse()
+                            .map_err(|e| BlueskyError::Api(format!("invalid handle: {}", e)))?,
+                    }
+                    .into(),
+                )
+                .await
+                .map_err(|e| BlueskyError::Api(format!("failed to resolve handle: {}", e)))?;
+            resolved.did.clone()
+        };
+
+        let record_data = atrium_api::app::bsky::graph::follow::RecordData {
+            created_at: Datetime::now(),
+            subject: did.clone(),
+        };
+
+        let output = self
+            .agent
+            .create_record(record_data)
+            .await
+            .map_err(|e| BlueskyError::Api(e.to_string()))?;
+
+        debug!(follow_uri = %output.uri, subject = %did.as_str(), "followed user");
+
+        Ok(output.uri.to_string())
+    }
+
+    /// Get the home timeline (posts from followed accounts).
+    ///
+    /// Returns a list of posts with author info and text.
+    pub async fn get_timeline(&self, limit: Option<u8>) -> Result<Vec<TimelinePost>, BlueskyError> {
+        let params = atrium_api::app::bsky::feed::get_timeline::ParametersData {
+            algorithm: None,
+            cursor: None,
+            limit: limit.map(|l| l.clamp(1, 100).try_into().unwrap()),
+        };
+
+        let output = self
+            .agent
+            .api
+            .app
+            .bsky
+            .feed
+            .get_timeline(params.into())
+            .await
+            .map_err(|e| BlueskyError::Api(e.to_string()))?;
+
+        let posts: Vec<TimelinePost> = output
+            .feed
+            .iter()
+            .map(|item| {
+                // Extract text from the post record
+                let text = self.extract_post_text(&item.post.record);
+
+                TimelinePost {
+                    uri: item.post.uri.clone(),
+                    cid: item.post.cid.as_ref().to_string(),
+                    author_did: item.post.author.did.to_string(),
+                    author_handle: item.post.author.handle.to_string(),
+                    author_name: item.post.author.display_name.clone(),
+                    text,
+                    created_at: self.extract_post_created_at(&item.post.record),
+                    like_count: item.post.like_count,
+                    repost_count: item.post.repost_count,
+                    reply_count: item.post.reply_count,
+                }
+            })
+            .collect();
+
+        debug!(count = posts.len(), "fetched timeline");
+
+        Ok(posts)
+    }
+
+    /// Get recent notifications.
+    pub async fn get_notifications(
+        &mut self,
+        limit: Option<u8>,
+    ) -> Result<Vec<BlueskyNotification>, BlueskyError> {
+        let params = atrium_api::app::bsky::notification::list_notifications::ParametersData {
+            cursor: None,
+            limit: Some(limit.unwrap_or(50).clamp(1, 100).try_into().unwrap()),
+            priority: None,
+            reasons: None,
+            seen_at: None,
+        };
+
+        let output = self
+            .agent
+            .api
+            .app
+            .bsky
+            .notification
+            .list_notifications(params.into())
+            .await
+            .map_err(|e| {
+                let error_str = e.to_string();
+                if error_str.contains("RateLimitExceeded") || error_str.contains("429") {
+                    BlueskyError::RateLimited {
+                        endpoint: Some("listNotifications".to_string()),
+                    }
+                } else {
+                    BlueskyError::Api(error_str)
+                }
+            })?;
+
+        // Get the newest timestamp from this batch
+        let newest_timestamp = output
+            .notifications
+            .first()
+            .map(|n| n.indexed_at.as_str().to_string());
+
+        // Filter out already-seen notifications
+        let mut notifications = Vec::new();
+
+        // Parse last_seen timestamp for proper datetime comparison
+        let last_seen_dt = self
+            .last_seen_at
+            .as_ref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+
+        for notif in &output.notifications {
+            let indexed_at = notif.indexed_at.as_str();
+
+            // Skip notifications we've already seen (use datetime comparison, not string)
+            if let Some(ref last_seen_dt) = last_seen_dt
+                && let Ok(indexed_dt) = chrono::DateTime::parse_from_rfc3339(indexed_at)
+                && indexed_dt <= *last_seen_dt
+            {
+                continue;
+            }
+
+            let reason = match NotificationReason::parse(&notif.reason) {
+                Some(r) => r,
+                None => {
+                    debug!(reason = %notif.reason, "unknown notification reason, skipping");
+                    continue;
+                }
+            };
+
+            // Extract text and reply refs from the record (if it's a post)
+            let (text, parent, root) = self.extract_post_data(&notif.record);
+
+            notifications.push(BlueskyNotification {
+                reason,
+                author_did: notif.author.did.to_string(),
+                author_handle: notif.author.handle.to_string(),
+                text,
+                uri: notif.uri.clone(),
+                cid: notif.cid.as_ref().to_string(),
+                parent,
+                root,
+            });
+        }
+
+        // Update last_seen_at to the newest timestamp
+        if let Some(ts) = newest_timestamp {
+            self.last_seen_at = Some(ts);
+        }
+
+        Ok(notifications)
+    }
+
+    /// Extract post text from a record.
+    fn extract_post_text(&self, record: &atrium_api::types::Unknown) -> Option<String> {
+        serde_json::from_value::<DeserPostRecord>(
+            serde_json::to_value(record).unwrap_or(serde_json::Value::Null),
+        )
+        .ok()
+        .map(|p| p.text)
+    }
+
+    /// Extract created_at from a record.
+    fn extract_post_created_at(&self, record: &atrium_api::types::Unknown) -> Option<String> {
+        #[derive(serde::Deserialize)]
+        struct PostWithTime {
+            #[serde(rename = "createdAt")]
+            created_at: Option<String>,
+        }
+        serde_json::from_value::<PostWithTime>(
+            serde_json::to_value(record).unwrap_or(serde_json::Value::Null),
+        )
+        .ok()
+        .and_then(|p| p.created_at)
+    }
+
+    /// Extract post text and reply references from a record.
+    fn extract_post_data(
+        &self,
+        record: &atrium_api::types::Unknown,
+    ) -> (Option<String>, Option<PostRef>, Option<PostRef>) {
+        // Try to deserialize as a post record
+        if let Ok(post) = serde_json::from_value::<DeserPostRecord>(
+            serde_json::to_value(record).unwrap_or(serde_json::Value::Null),
+        ) {
+            let text = Some(post.text);
+            let (parent, root) = if let Some(reply) = post.reply {
+                (
+                    Some(PostRef {
+                        uri: reply.parent.uri,
+                        cid: reply.parent.cid,
+                    }),
+                    Some(PostRef {
+                        uri: reply.root.uri,
+                        cid: reply.root.cid,
+                    }),
+                )
+            } else {
+                (None, None)
+            };
+            (text, parent, root)
+        } else {
+            (None, None, None)
+        }
+    }
+
+    /// List conversations with unread messages or recent activity.
+    pub async fn list_conversations(&self) -> Result<Vec<Conversation>, BlueskyError> {
+        // Get chat API with proxy to the Bluesky chat service
+        let chat_did = BSKY_CHAT_DID
+            .parse()
+            .map_err(|e| BlueskyError::Api(format!("invalid chat DID: {}", e)))?;
+        let chat_api = self
+            .agent
+            .api_with_proxy(chat_did, AtprotoServiceType::BskyChat);
+
+        let output = chat_api
+            .chat
+            .bsky
+            .convo
+            .list_convos(
+                atrium_api::chat::bsky::convo::list_convos::ParametersData {
+                    cursor: None,
+                    limit: Some(50.try_into().unwrap()),
+                    read_state: None,
+                    status: None,
+                }
+                .into(),
+            )
+            .await
+            .map_err(|e| BlueskyError::Api(format!("failed to list conversations: {}", e)))?;
+
+        let convos_len = output.convos.len();
+        let conversations = output
+            .convos
+            .iter()
+            .map(|convo| Conversation {
+                id: convo.id.clone(),
+                members: convo
+                    .members
+                    .iter()
+                    .map(|m| ConvoMember {
+                        did: m.did.to_string(),
+                        handle: m.handle.to_string(),
+                        display_name: m.display_name.clone(),
+                    })
+                    .collect(),
+                unread_count: convo.unread_count,
+            })
+            .collect();
+
+        debug!(count = convos_len, "listed conversations");
+
+        Ok(conversations)
+    }
+
+    /// Get messages from a conversation.
+    pub async fn get_messages(
+        &self,
+        convo_id: &str,
+        cursor: Option<&str>,
+    ) -> Result<Vec<DirectMessage>, BlueskyError> {
+        // Get chat API with proxy to the Bluesky chat service
+        let chat_did = BSKY_CHAT_DID
+            .parse()
+            .map_err(|e| BlueskyError::Api(format!("invalid chat DID: {}", e)))?;
+        let chat_api = self
+            .agent
+            .api_with_proxy(chat_did, AtprotoServiceType::BskyChat);
+
+        let output = chat_api
+            .chat
+            .bsky
+            .convo
+            .get_messages(
+                atrium_api::chat::bsky::convo::get_messages::ParametersData {
+                    convo_id: convo_id.to_string(),
+                    cursor: cursor.map(|s| s.to_string()),
+                    limit: Some(50.try_into().unwrap()),
+                }
+                .into(),
+            )
+            .await
+            .map_err(|e| BlueskyError::Api(format!("failed to get messages: {}", e)))?;
+
+        use atrium_api::chat::bsky::convo::get_messages::OutputMessagesItem;
+
+        let messages_len = output.messages.len();
+        let messages = output
+            .messages
+            .iter()
+            .filter_map(|msg| {
+                // Messages can be MessageView or DeletedMessageView
+                match msg {
+                    atrium_api::types::Union::Refs(
+                        OutputMessagesItem::ChatBskyConvoDefsMessageView(view),
+                    ) => {
+                        let sent_at = chrono::DateTime::parse_from_rfc3339(view.sent_at.as_str())
+                            .ok()?
+                            .with_timezone(&chrono::Utc);
+                        Some(DirectMessage {
+                            id: view.id.clone(),
+                            convo_id: convo_id.to_string(),
+                            sender_did: view.sender.did.to_string(),
+                            text: view.text.clone(),
+                            sent_at,
+                        })
+                    }
+                    _ => None, // Skip deleted messages or unknown types
+                }
+            })
+            .collect();
+
+        debug!(convo_id, count = messages_len, "fetched messages");
+
+        Ok(messages)
+    }
+
+    /// Get unread direct messages, filtering by cursor.
+    ///
+    /// Returns messages newer than the current DM cursor and updates the cursor.
+    /// Automatically filters out messages sent by the current user (to avoid echo loops).
+    pub async fn get_unread_dms(&mut self) -> Result<Vec<DirectMessage>, BlueskyError> {
+        // Get our own DID to filter out self-sent messages
+        let own_did = self.did().await;
+
+        // List conversations with unread messages
+        let convos = self.list_conversations().await?;
+        let unread_convos: Vec<_> = convos.into_iter().filter(|c| c.unread_count > 0).collect();
+
+        if unread_convos.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut all_messages = Vec::new();
+        let mut newest_dt: Option<chrono::DateTime<chrono::Utc>> = None;
+
+        // Parse cursor as datetime for proper comparison
+        let cursor_dt = self
+            .last_dm_cursor
+            .as_ref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&chrono::Utc));
+
+        for convo in unread_convos {
+            let messages = self.get_messages(&convo.id, None).await?;
+
+            for msg in messages {
+                // Skip messages we've already seen (use datetime comparison)
+                if let Some(ref cursor_dt) = cursor_dt
+                    && msg.sent_at <= *cursor_dt
+                {
+                    continue;
+                }
+
+                // Skip messages from ourselves (avoid echo loops)
+                if let Some(ref own_did) = own_did
+                    && msg.sender_did == *own_did
+                {
+                    debug!(message_id = %msg.id, "skipping self-sent DM");
+                    // Still track timestamp to advance cursor past our own messages
+                    if newest_dt.is_none() || msg.sent_at > newest_dt.unwrap() {
+                        newest_dt = Some(msg.sent_at);
+                    }
+                    continue;
+                }
+
+                // Track newest timestamp
+                if newest_dt.is_none() || msg.sent_at > newest_dt.unwrap() {
+                    newest_dt = Some(msg.sent_at);
+                }
+
+                all_messages.push(msg);
+            }
+        }
+
+        // Update cursor to newest message timestamp
+        if let Some(dt) = newest_dt {
+            self.last_dm_cursor = Some(dt.to_rfc3339());
+        }
+
+        // Sort by sent_at ascending (oldest first)
+        all_messages.sort_by(|a, b| a.sent_at.cmp(&b.sent_at));
+
+        debug!(count = all_messages.len(), "fetched unread DMs");
+
+        Ok(all_messages)
+    }
+
+    /// Search for posts across Bluesky.
+    ///
+    /// Returns posts matching the query with optional filters.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_posts(
+        &self,
+        query: &str,
+        author: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+        lang: Option<&str>,
+        tag: Option<Vec<String>>,
+        sort: Option<&str>,
+        limit: Option<u8>,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<SearchPost>, Option<String>), BlueskyError> {
+        // Parse author as AtIdentifier if provided
+        let author_id = if let Some(a) = author {
+            Some(
+                a.parse()
+                    .map_err(|e| BlueskyError::Api(format!("invalid author identifier: {}", e)))?,
+            )
+        } else {
+            None
+        };
+
+        // Parse lang as Language if provided
+        let lang_parsed = if let Some(l) = lang {
+            Some(
+                l.parse()
+                    .map_err(|e| BlueskyError::Api(format!("invalid language code: {}", e)))?,
+            )
+        } else {
+            None
+        };
+
+        let params = atrium_api::app::bsky::feed::search_posts::ParametersData {
+            author: author_id,
+            cursor: cursor.map(|s| s.to_string()),
+            domain: None,
+            lang: lang_parsed,
+            limit: limit.map(|l| l.clamp(1, 100).try_into().unwrap()),
+            mentions: None,
+            q: query.to_string(),
+            since: since.map(|s| s.to_string()),
+            sort: sort.map(|s| s.to_string()),
+            tag,
+            until: until.map(|s| s.to_string()),
+            url: None,
+        };
+
+        let output = self
+            .agent
+            .api
+            .app
+            .bsky
+            .feed
+            .search_posts(params.into())
+            .await
+            .map_err(|e| {
+                let error_str = e.to_string();
+                if error_str.contains("RateLimitExceeded") || error_str.contains("429") {
+                    BlueskyError::RateLimited {
+                        endpoint: Some("searchPosts".to_string()),
+                    }
+                } else {
+                    BlueskyError::Api(error_str)
+                }
+            })?;
+
+        let posts: Vec<SearchPost> = output
+            .posts
+            .iter()
+            .map(|post| {
+                let text = self.extract_post_text(&post.record);
+
+                SearchPost {
+                    uri: post.uri.clone(),
+                    cid: post.cid.as_ref().to_string(),
+                    author_did: post.author.did.to_string(),
+                    author_handle: post.author.handle.to_string(),
+                    author_name: post.author.display_name.clone(),
+                    text,
+                    created_at: self.extract_post_created_at(&post.record),
+                    like_count: post.like_count,
+                    repost_count: post.repost_count,
+                    reply_count: post.reply_count,
+                }
+            })
+            .collect();
+
+        debug!(query = %query, count = posts.len(), "searched posts");
+
+        Ok((posts, output.cursor.clone()))
+    }
+
+    /// Search for users across Bluesky.
+    ///
+    /// Returns users matching the query (by name, handle, or bio).
+    pub async fn search_users(
+        &self,
+        query: &str,
+        limit: Option<u8>,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<SearchUser>, Option<String>), BlueskyError> {
+        let params = atrium_api::app::bsky::actor::search_actors::ParametersData {
+            cursor: cursor.map(|s| s.to_string()),
+            limit: limit.map(|l| l.clamp(1, 100).try_into().unwrap()),
+            q: Some(query.to_string()),
+            term: None,
+        };
+
+        let output = self
+            .agent
+            .api
+            .app
+            .bsky
+            .actor
+            .search_actors(params.into())
+            .await
+            .map_err(|e| {
+                let error_str = e.to_string();
+                if error_str.contains("RateLimitExceeded") || error_str.contains("429") {
+                    BlueskyError::RateLimited {
+                        endpoint: Some("searchActors".to_string()),
+                    }
+                } else {
+                    BlueskyError::Api(error_str)
+                }
+            })?;
+
+        let users: Vec<SearchUser> = output
+            .actors
+            .iter()
+            .map(|actor| SearchUser {
+                did: actor.did.to_string(),
+                handle: actor.handle.to_string(),
+                display_name: actor.display_name.clone(),
+                description: actor.description.clone(),
+                avatar: actor.avatar.clone(),
+            })
+            .collect();
+
+        debug!(query = %query, count = users.len(), "searched users");
+
+        Ok((users, output.cursor.clone()))
+    }
+}
+
+/// Helper struct for deserializing post records from notifications.
+#[derive(Debug, serde::Deserialize)]
+struct DeserPostRecord {
+    text: String,
+    reply: Option<DeserReplyRef>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DeserReplyRef {
+    parent: DeserStrongRef,
+    root: DeserStrongRef,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DeserStrongRef {
+    uri: String,
+    cid: String,
+}

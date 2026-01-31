@@ -1,0 +1,586 @@
+//! Bluesky tools for MCP.
+
+use std::collections::HashMap;
+
+use serde_json::{Value, json};
+
+use crate::bluesky::PostRef;
+use crate::protocol::{CallToolResult, ToolDefinition};
+
+use super::ToolState;
+
+pub fn definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "post_to_bluesky".to_string(),
+            description: "Post a new message to Bluesky".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The text content of the post (max 300 characters)"
+                    }
+                },
+                "required": ["text"]
+            }),
+        },
+        ToolDefinition {
+            name: "reply_to_bluesky".to_string(),
+            description: "Reply to an existing Bluesky post".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The text content of the reply"
+                    },
+                    "parent_uri": {
+                        "type": "string",
+                        "description": "AT URI of the post to reply to"
+                    },
+                    "parent_cid": {
+                        "type": "string",
+                        "description": "CID of the post to reply to"
+                    },
+                    "root_uri": {
+                        "type": "string",
+                        "description": "AT URI of the thread root (same as parent for direct replies)"
+                    },
+                    "root_cid": {
+                        "type": "string",
+                        "description": "CID of the thread root"
+                    }
+                },
+                "required": ["text", "parent_uri", "parent_cid", "root_uri", "root_cid"]
+            }),
+        },
+        ToolDefinition {
+            name: "send_bluesky_dm".to_string(),
+            description: "Send a direct message to a Bluesky user (creates conversation if needed)".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "recipient_did": {
+                        "type": "string",
+                        "description": "DID of the recipient (e.g., did:plc:xxx)"
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "The message text"
+                    }
+                },
+                "required": ["recipient_did", "text"]
+            }),
+        },
+        ToolDefinition {
+            name: "reply_to_dm".to_string(),
+            description: "Reply to an existing DM conversation. Use this when you have a convo_id from a received DM.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "convo_id": {
+                        "type": "string",
+                        "description": "The conversation ID to reply to"
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "The message text"
+                    }
+                },
+                "required": ["convo_id", "text"]
+            }),
+        },
+        ToolDefinition {
+            name: "like_post".to_string(),
+            description: "Like a Bluesky post".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "uri": {
+                        "type": "string",
+                        "description": "AT URI of the post to like"
+                    },
+                    "cid": {
+                        "type": "string",
+                        "description": "CID of the post to like"
+                    }
+                },
+                "required": ["uri", "cid"]
+            }),
+        },
+        ToolDefinition {
+            name: "follow_user".to_string(),
+            description: "Follow a Bluesky user".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "did": {
+                        "type": "string",
+                        "description": "DID of the user to follow"
+                    }
+                },
+                "required": ["did"]
+            }),
+        },
+        ToolDefinition {
+            name: "get_timeline".to_string(),
+            description: "Get your Bluesky home timeline".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of posts to return (default 20, max 100)"
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "get_notifications".to_string(),
+            description: "Get recent Bluesky notifications".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of notifications to return (default 20, max 100)"
+                    }
+                }
+            }),
+        },
+        ToolDefinition {
+            name: "search_posts".to_string(),
+            description: "Search for posts across Bluesky by keyword, hashtag, author, or date range. Use this to discover conversations about topics you care about. Note: finding a conversation doesn't mean you're welcome in it—consider developing your own heuristics (via identity/rules) for when engagement is appropriate.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (Lucene syntax supported)"
+                    },
+                    "author": {
+                        "type": "string",
+                        "description": "Filter by author handle or DID (optional)"
+                    },
+                    "since": {
+                        "type": "string",
+                        "description": "Filter after datetime ISO 8601 (optional)"
+                    },
+                    "until": {
+                        "type": "string",
+                        "description": "Filter before datetime ISO 8601 (optional)"
+                    },
+                    "lang": {
+                        "type": "string",
+                        "description": "Filter by language code (optional)"
+                    },
+                    "tag": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Filter by hashtags (optional)"
+                    },
+                    "sort": {
+                        "type": "string",
+                        "enum": ["top", "latest"],
+                        "description": "Sort order: 'top' or 'latest' (default: latest)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum results 1-100 (default 25)"
+                    },
+                    "cursor": {
+                        "type": "string",
+                        "description": "Pagination cursor (optional)"
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDefinition {
+            name: "search_users".to_string(),
+            description: "Search for Bluesky users by name, handle, or bio. Use this to discover people working on topics you find interesting. Consider whether to follow, engage, or simply observe.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (name, handle, bio)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum results 1-100 (default 25)"
+                    },
+                    "cursor": {
+                        "type": "string",
+                        "description": "Pagination cursor (optional)"
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+    ]
+}
+
+pub async fn post_to_bluesky(
+    state: &ToolState,
+    arguments: &HashMap<String, Value>,
+) -> CallToolResult {
+    let text = match arguments.get("text").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return CallToolResult::error("Missing required parameter: text"),
+    };
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.post(text).await {
+        Ok(post_ref) => CallToolResult::success(
+            json!({
+                "uri": post_ref.uri,
+                "cid": post_ref.cid
+            })
+            .to_string(),
+        ),
+        Err(e) => CallToolResult::error(format!("Failed to post: {}", e)),
+    }
+}
+
+pub async fn reply_to_bluesky(
+    state: &ToolState,
+    arguments: &HashMap<String, Value>,
+) -> CallToolResult {
+    let text = match arguments.get("text").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return CallToolResult::error("Missing required parameter: text"),
+    };
+
+    let parent_uri = match arguments.get("parent_uri").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return CallToolResult::error("Missing required parameter: parent_uri"),
+    };
+
+    let parent_cid = match arguments.get("parent_cid").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        None => return CallToolResult::error("Missing required parameter: parent_cid"),
+    };
+
+    let root_uri = match arguments.get("root_uri").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return CallToolResult::error("Missing required parameter: root_uri"),
+    };
+
+    let root_cid = match arguments.get("root_cid").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        None => return CallToolResult::error("Missing required parameter: root_cid"),
+    };
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    let parent = PostRef {
+        uri: parent_uri.to_string(),
+        cid: parent_cid.to_string(),
+    };
+
+    let root = PostRef {
+        uri: root_uri.to_string(),
+        cid: root_cid.to_string(),
+    };
+
+    match client.reply(text, &parent, &root).await {
+        Ok(post_ref) => CallToolResult::success(
+            json!({
+                "uri": post_ref.uri,
+                "cid": post_ref.cid
+            })
+            .to_string(),
+        ),
+        Err(e) => CallToolResult::error(format!("Failed to reply: {}", e)),
+    }
+}
+
+pub async fn send_bluesky_dm(
+    state: &ToolState,
+    arguments: &HashMap<String, Value>,
+) -> CallToolResult {
+    let recipient_did = match arguments.get("recipient_did").and_then(|v| v.as_str()) {
+        Some(d) => d,
+        None => return CallToolResult::error("Missing required parameter: recipient_did"),
+    };
+
+    let text = match arguments.get("text").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return CallToolResult::error("Missing required parameter: text"),
+    };
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.send_dm(recipient_did, text).await {
+        Ok(message_id) => CallToolResult::success(
+            json!({
+                "message_id": message_id
+            })
+            .to_string(),
+        ),
+        Err(e) => CallToolResult::error(format!("Failed to send DM: {}", e)),
+    }
+}
+
+pub async fn reply_to_dm(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let convo_id = match arguments.get("convo_id").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        None => return CallToolResult::error("Missing required parameter: convo_id"),
+    };
+
+    let text = match arguments.get("text").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return CallToolResult::error("Missing required parameter: text"),
+    };
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.send_dm_to_convo(convo_id, text).await {
+        Ok(message_id) => CallToolResult::success(
+            json!({
+                "message_id": message_id
+            })
+            .to_string(),
+        ),
+        Err(e) => CallToolResult::error(format!("Failed to reply to DM: {}", e)),
+    }
+}
+
+pub async fn like_post(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let uri = match arguments.get("uri").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return CallToolResult::error("Missing required parameter: uri"),
+    };
+
+    let cid = match arguments.get("cid").and_then(|v| v.as_str()) {
+        Some(c) => c,
+        None => return CallToolResult::error("Missing required parameter: cid"),
+    };
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.like(uri, cid).await {
+        Ok(like_uri) => CallToolResult::success(
+            json!({
+                "like_uri": like_uri
+            })
+            .to_string(),
+        ),
+        Err(e) => CallToolResult::error(format!("Failed to like: {}", e)),
+    }
+}
+
+pub async fn follow_user(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let did = match arguments.get("did").and_then(|v| v.as_str()) {
+        Some(d) => d,
+        None => return CallToolResult::error("Missing required parameter: did"),
+    };
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.follow(did).await {
+        Ok(follow_uri) => CallToolResult::success(
+            json!({
+                "follow_uri": follow_uri
+            })
+            .to_string(),
+        ),
+        Err(e) => CallToolResult::error(format!("Failed to follow: {}", e)),
+    }
+}
+
+pub async fn get_timeline(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|l| l.min(100) as u8);
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.get_timeline(limit).await {
+        Ok(posts) => {
+            let result: Vec<Value> = posts
+                .into_iter()
+                .map(|p| {
+                    json!({
+                        "uri": p.uri,
+                        "cid": p.cid,
+                        "author_did": p.author_did,
+                        "author_handle": p.author_handle,
+                        "author_name": p.author_name,
+                        "text": p.text,
+                        "created_at": p.created_at,
+                        "like_count": p.like_count,
+                        "repost_count": p.repost_count,
+                        "reply_count": p.reply_count
+                    })
+                })
+                .collect();
+            CallToolResult::success(serde_json::to_string(&result).unwrap_or_default())
+        }
+        Err(e) => CallToolResult::error(format!("Failed to get timeline: {}", e)),
+    }
+}
+
+pub async fn get_notifications(
+    state: &mut ToolState,
+    arguments: &HashMap<String, Value>,
+) -> CallToolResult {
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|l| l.min(100) as u8);
+
+    let client = match &mut state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.get_notifications(limit).await {
+        Ok(notifications) => {
+            let result: Vec<Value> = notifications
+                .into_iter()
+                .map(|n| {
+                    json!({
+                        "reason": n.reason,
+                        "author_did": n.author_did,
+                        "author_handle": n.author_handle,
+                        "text": n.text,
+                        "uri": n.uri,
+                        "cid": n.cid,
+                        "parent": n.parent.map(|p| json!({"uri": p.uri, "cid": p.cid})),
+                        "root": n.root.map(|r| json!({"uri": r.uri, "cid": r.cid}))
+                    })
+                })
+                .collect();
+            CallToolResult::success(serde_json::to_string(&result).unwrap_or_default())
+        }
+        Err(e) => CallToolResult::error(format!("Failed to get notifications: {}", e)),
+    }
+}
+
+pub async fn search_posts(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let query = match arguments.get("query").and_then(|v| v.as_str()) {
+        Some(q) => q,
+        None => return CallToolResult::error("Missing required parameter: query"),
+    };
+
+    let author = arguments.get("author").and_then(|v| v.as_str());
+    let since = arguments.get("since").and_then(|v| v.as_str());
+    let until = arguments.get("until").and_then(|v| v.as_str());
+    let lang = arguments.get("lang").and_then(|v| v.as_str());
+    let tag = arguments.get("tag").and_then(|v| {
+        v.as_array().map(|arr| {
+            arr.iter()
+                .filter_map(|t| t.as_str().map(String::from))
+                .collect()
+        })
+    });
+    let sort = arguments.get("sort").and_then(|v| v.as_str());
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|l| l.min(100) as u8);
+    let cursor = arguments.get("cursor").and_then(|v| v.as_str());
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client
+        .search_posts(query, author, since, until, lang, tag, sort, limit, cursor)
+        .await
+    {
+        Ok((posts, next_cursor)) => {
+            let result: Vec<Value> = posts
+                .into_iter()
+                .map(|p| {
+                    json!({
+                        "uri": p.uri,
+                        "cid": p.cid,
+                        "author_did": p.author_did,
+                        "author_handle": p.author_handle,
+                        "author_name": p.author_name,
+                        "text": p.text,
+                        "created_at": p.created_at,
+                        "like_count": p.like_count,
+                        "repost_count": p.repost_count,
+                        "reply_count": p.reply_count
+                    })
+                })
+                .collect();
+            let response = json!({
+                "posts": result,
+                "cursor": next_cursor
+            });
+            CallToolResult::success(serde_json::to_string(&response).unwrap_or_default())
+        }
+        Err(e) => CallToolResult::error(format!("Failed to search posts: {}", e)),
+    }
+}
+
+pub async fn search_users(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let query = match arguments.get("query").and_then(|v| v.as_str()) {
+        Some(q) => q,
+        None => return CallToolResult::error("Missing required parameter: query"),
+    };
+
+    let limit = arguments
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|l| l.min(100) as u8);
+    let cursor = arguments.get("cursor").and_then(|v| v.as_str());
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.search_users(query, limit, cursor).await {
+        Ok((users, next_cursor)) => {
+            let result: Vec<Value> = users
+                .into_iter()
+                .map(|u| {
+                    json!({
+                        "did": u.did,
+                        "handle": u.handle,
+                        "display_name": u.display_name,
+                        "description": u.description,
+                        "avatar": u.avatar
+                    })
+                })
+                .collect();
+            let response = json!({
+                "users": result,
+                "cursor": next_cursor
+            });
+            CallToolResult::success(serde_json::to_string(&response).unwrap_or_default())
+        }
+        Err(e) => CallToolResult::error(format!("Failed to search users: {}", e)),
+    }
+}
