@@ -476,6 +476,16 @@ async fn run_event_loop(
                         "processing notification"
                     );
 
+                    // Persist notification cursor BEFORE processing to prevent re-processing on crash/timeout
+                    // This is "at-most-once" semantics - we'd rather skip a notification than repeat it
+                    if let Some(cursor) = bluesky.last_seen_at()
+                        && let Err(e) = state_manager
+                            .set_notification_cursor(Some(cursor.to_string()))
+                            .await
+                    {
+                        warn!(error = %e, "failed to persist notification cursor");
+                    }
+
                     // Load identity for context
                     let identity = match identity_manager.load().await {
                         Ok(id) => id,
@@ -487,15 +497,6 @@ async fn run_event_loop(
 
                     // Handle the notification with Claude
                     handle_notification(&notif, atproto, &agent, identity, cache.as_deref()).await;
-
-                    // Persist notification cursor after processing
-                    if let Some(cursor) = bluesky.last_seen_at()
-                        && let Err(e) = state_manager
-                            .set_notification_cursor(Some(cursor.to_string()))
-                            .await
-                    {
-                        warn!(error = %e, "failed to persist notification cursor");
-                    }
                 }
 
                 Event::DirectMessage(dm) => {
@@ -505,6 +506,14 @@ async fn run_event_loop(
                         text = %dm.text,
                         "processing direct message"
                     );
+
+                    // Persist DM cursor BEFORE processing to prevent re-processing on crash/timeout
+                    // This is "at-most-once" semantics - we'd rather skip a message than repeat it
+                    if let Some(cursor) = bluesky.last_dm_cursor()
+                        && let Err(e) = state_manager.set_dm_cursor(Some(cursor.to_string())).await
+                    {
+                        warn!(error = %e, "failed to persist DM cursor");
+                    }
 
                     // Load identity for context
                     let identity = match identity_manager.load().await {
@@ -517,13 +526,6 @@ async fn run_event_loop(
 
                     // Handle the DM with Claude
                     handle_dm(&dm, atproto, &agent, identity, &bluesky, cache.as_deref()).await;
-
-                    // Persist DM cursor after processing
-                    if let Some(cursor) = bluesky.last_dm_cursor()
-                        && let Err(e) = state_manager.set_dm_cursor(Some(cursor.to_string())).await
-                    {
-                        warn!(error = %e, "failed to persist DM cursor");
-                    }
                 }
 
                 Event::Job(job) => {
