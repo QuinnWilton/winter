@@ -1,0 +1,94 @@
+{
+  "lexicon": 1,
+  "id": "diy.razorgirl.winter.job",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Scheduled job record. Key is a TID.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["name", "instructions", "schedule", "status", "createdAt"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Job name",
+            "maxLength": 256
+          },
+          "instructions": {
+            "type": "string",
+            "description": "Instructions for the agent to execute",
+            "maxLength": 10000
+          },
+          "schedule": {
+            "type": "union",
+            "description": "Schedule configuration",
+            "refs": ["#scheduleOnce", "#scheduleInterval"]
+          },
+          "status": {
+            "type": "string",
+            "description": "Current status",
+            "knownValues": ["pending", "running", "completed", "failed"]
+          },
+          "statusError": {
+            "type": "string",
+            "description": "Error message if status is 'failed'",
+            "maxLength": 1024
+          },
+          "lastRun": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this job last ran"
+          },
+          "nextRun": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this job should next run"
+          },
+          "failureCount": {
+            "type": "integer",
+            "description": "Number of consecutive failures",
+            "default": 0
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this job was created"
+          }
+        }
+      }
+    },
+    "scheduleOnce": {
+      "type": "object",
+      "description": "Run once at a specific time",
+      "required": ["type", "at"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "once"
+        },
+        "at": {
+          "type": "string",
+          "format": "datetime",
+          "description": "When to run"
+        }
+      }
+    },
+    "scheduleInterval": {
+      "type": "object",
+      "description": "Run at regular intervals",
+      "required": ["type", "seconds"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "interval"
+        },
+        "seconds": {
+          "type": "integer",
+          "description": "Interval in seconds",
+          "minimum": 60
+        }
+      }
+    }
+  }
+}

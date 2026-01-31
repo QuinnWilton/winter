@@ -1,0 +1,32 @@
+{
+  "lexicon": 1,
+  "id": "diy.razorgirl.winter.state",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Daemon state record for Winter. Singleton (key: 'self'). Stores operational state that survives restarts.",
+      "key": "literal:self",
+      "record": {
+        "type": "object",
+        "required": ["createdAt", "lastUpdated"],
+        "properties": {
+          "notificationCursor": {
+            "type": "string",
+            "description": "Last seen notification indexed_at timestamp",
+            "maxLength": 64
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this state record was created"
+          },
+          "lastUpdated": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this state record was last updated"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "lexicon": 1,
+  "id": "diy.razorgirl.winter.note",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Free-form note record. Key is a TID.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["title", "content", "createdAt", "lastUpdated"],
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "Note title",
+            "maxLength": 256
+          },
+          "content": {
+            "type": "string",
+            "description": "Markdown content (max 50KB)",
+            "maxLength": 51200
+          },
+          "category": {
+            "type": "string",
+            "description": "Category for organization",
+            "maxLength": 64
+          },
+          "relatedFacts": {
+            "type": "array",
+            "description": "CID references to related facts",
+            "items": {
+              "type": "string",
+              "format": "cid"
+            },
+            "maxLength": 50
+          },
+          "tags": {
+            "type": "array",
+            "description": "Tags for categorization",
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "maxLength": 20
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this note was created"
+          },
+          "lastUpdated": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this note was last updated"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "lexicon": 1,
+  "id": "diy.razorgirl.winter.thought",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Stream of consciousness entry. Key is a TID.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["kind", "content", "createdAt"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "Kind of thought",
+            "knownValues": [
+              "insight",
+              "observation",
+              "inference",
+              "question",
+              "plan",
+              "reflection",
+              "error",
+              "tool_call",
+              "response"
+            ]
+          },
+          "content": {
+            "type": "string",
+            "description": "Content of the thought",
+            "maxLength": 10000
+          },
+          "trigger": {
+            "type": "string",
+            "description": "What triggered this thought (e.g., notification URI, job name)",
+            "maxLength": 1024
+          },
+          "durationMs": {
+            "type": "integer",
+            "description": "How long this thought took to generate (ms)"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this thought was recorded"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "lexicon": 1,
+  "id": "diy.razorgirl.winter.fact",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Atomic fact record. Key is a TID.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["predicate", "args", "createdAt"],
+        "properties": {
+          "predicate": {
+            "type": "string",
+            "description": "Predicate name (e.g., 'follows', 'interested_in', 'mentioned')",
+            "maxLength": 64
+          },
+          "args": {
+            "type": "array",
+            "description": "Arguments to the predicate. Use DIDs for account references, never handles.",
+            "items": {
+              "type": "string",
+              "maxLength": 1024
+            },
+            "maxLength": 10
+          },
+          "confidence": {
+            "type": "number",
+            "description": "Confidence level (0.0 to 1.0). Default is 1.0.",
+            "minimum": 0,
+            "maximum": 1,
+            "default": 1
+          },
+          "source": {
+            "type": "string",
+            "description": "CID reference to source record (optional)",
+            "format": "cid"
+          },
+          "supersedes": {
+            "type": "string",
+            "description": "CID of fact this supersedes (for updates)",
+            "format": "cid"
+          },
+          "tags": {
+            "type": "array",
+            "description": "Tags for categorization",
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "maxLength": 20
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this fact was created"
+          }
+        }
+      }
+    }
+  }
+}

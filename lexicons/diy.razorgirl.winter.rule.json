@@ -1,0 +1,66 @@
+{
+  "lexicon": 1,
+  "id": "diy.razorgirl.winter.rule",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Datalog rule record. Key is a TID.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["name", "description", "head", "body", "createdAt"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Rule name for reference",
+            "maxLength": 64
+          },
+          "description": {
+            "type": "string",
+            "description": "Human-readable description of what this rule derives",
+            "maxLength": 1024
+          },
+          "head": {
+            "type": "string",
+            "description": "Rule head (derived predicate), e.g., 'mutual_follow(X, Y)'",
+            "maxLength": 256
+          },
+          "body": {
+            "type": "array",
+            "description": "Rule body (conditions), e.g., ['follows(X, Y)', 'follows(Y, X)']",
+            "items": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "minLength": 1,
+            "maxLength": 20
+          },
+          "constraints": {
+            "type": "array",
+            "description": "Additional constraints, e.g., ['X != Y', 'X < Y']",
+            "items": {
+              "type": "string",
+              "maxLength": 256
+            },
+            "maxLength": 10
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether this rule is active",
+            "default": true
+          },
+          "priority": {
+            "type": "integer",
+            "description": "Priority for rule ordering (lower = evaluated earlier)",
+            "default": 0
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this rule was created"
+          }
+        }
+      }
+    }
+  }
+}
