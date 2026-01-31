@@ -1,0 +1,51 @@
+[package]
+name = "winter-atproto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ATProto XRPC client for Winter's local PDS"
+
+[dependencies]
+# Error handling
+thiserror = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Date/time
+chrono = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Base64 for auth
+base64 = { workspace = true }
+
+# CAR file parsing and firehose
+iroh-car = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+serde_ipld_dagcbor = { workspace = true }
+ipld-core = { workspace = true }
+ciborium = { workspace = true }
+multibase = { workspace = true }
+serde_bytes = { workspace = true }
+
+# Concurrent data structures
+dashmap = { workspace = true }
+crossbeam = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+insta = { workspace = true }
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }
+wiremock = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
