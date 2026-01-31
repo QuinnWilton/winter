@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "winter": {
+      "command": "winter",
+      "args": ["mcp-server"],
+      "env": {
+        "WINTER_PDS_URL": "${WINTER_PDS_URL}",
+        "WINTER_HANDLE": "${WINTER_HANDLE}",
+        "WINTER_APP_PASSWORD": "${WINTER_APP_PASSWORD}"
+      }
+    }
+  }
+}
