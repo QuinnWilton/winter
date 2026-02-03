@@ -4,7 +4,7 @@
 //! or use mocked responses for unit-like integration testing.
 
 use serde_json::json;
-use winter_atproto::{Fact, Identity, Thought, ThoughtKind};
+use winter_atproto::{Directive, DirectiveKind, Fact, Identity, Thought, ThoughtKind};
 
 // Helper to create a test fact
 fn test_fact(predicate: &str, args: &[&str]) -> Fact {
@@ -19,16 +19,71 @@ fn test_fact(predicate: &str, args: &[&str]) -> Fact {
     }
 }
 
-// Helper to create a test identity
+// Helper to create a test identity (slim version)
 fn test_identity() -> Identity {
     Identity {
         operator_did: "did:plc:test".to_string(),
-        values: vec!["curiosity".to_string(), "honesty".to_string()],
-        interests: vec!["distributed systems".to_string()],
-        self_description: "A test agent exploring the world.".to_string(),
         created_at: chrono::Utc::now(),
         last_updated: chrono::Utc::now(),
     }
+}
+
+// Helper to create test directives
+fn test_directives() -> Vec<Directive> {
+    vec![
+        Directive {
+            kind: DirectiveKind::SelfConcept,
+            content: "A test agent exploring the world.".to_string(),
+            summary: None,
+            active: true,
+            confidence: None,
+            source: None,
+            supersedes: None,
+            tags: vec![],
+            priority: 0,
+            created_at: chrono::Utc::now(),
+            last_updated: None,
+        },
+        Directive {
+            kind: DirectiveKind::Value,
+            content: "curiosity".to_string(),
+            summary: None,
+            active: true,
+            confidence: None,
+            source: None,
+            supersedes: None,
+            tags: vec![],
+            priority: 0,
+            created_at: chrono::Utc::now(),
+            last_updated: None,
+        },
+        Directive {
+            kind: DirectiveKind::Value,
+            content: "honesty".to_string(),
+            summary: None,
+            active: true,
+            confidence: None,
+            source: None,
+            supersedes: None,
+            tags: vec![],
+            priority: 0,
+            created_at: chrono::Utc::now(),
+            last_updated: None,
+        },
+        Directive {
+            kind: DirectiveKind::Interest,
+            content: "distributed systems".to_string(),
+            summary: None,
+            active: true,
+            confidence: None,
+            source: None,
+            supersedes: None,
+            tags: vec![],
+            priority: 0,
+            created_at: chrono::Utc::now(),
+            last_updated: None,
+        },
+    ]
 }
 
 mod fact_serialization {
@@ -101,9 +156,56 @@ mod identity_serialization {
         let json = serde_json::to_string(&identity).unwrap();
         let decoded: Identity = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(decoded.values, identity.values);
-        assert_eq!(decoded.interests, identity.interests);
-        assert_eq!(decoded.self_description, identity.self_description);
+        assert_eq!(decoded.operator_did, identity.operator_did);
+    }
+}
+
+mod directive_serialization {
+    use super::*;
+
+    #[test]
+    fn directive_roundtrip() {
+        let directives = test_directives();
+        for directive in &directives {
+            let json = serde_json::to_string(directive).unwrap();
+            let decoded: Directive = serde_json::from_str(&json).unwrap();
+
+            assert_eq!(decoded.kind, directive.kind);
+            assert_eq!(decoded.content, directive.content);
+            assert_eq!(decoded.active, directive.active);
+        }
+    }
+
+    #[test]
+    fn directive_kind_serializes_correctly() {
+        let kinds = vec![
+            (DirectiveKind::Value, "value"),
+            (DirectiveKind::Interest, "interest"),
+            (DirectiveKind::Belief, "belief"),
+            (DirectiveKind::Guideline, "guideline"),
+            (DirectiveKind::SelfConcept, "self_concept"),
+            (DirectiveKind::Boundary, "boundary"),
+            (DirectiveKind::Aspiration, "aspiration"),
+        ];
+
+        for (kind, expected) in kinds {
+            let directive = Directive {
+                kind: kind.clone(),
+                content: "test".to_string(),
+                summary: None,
+                active: true,
+                confidence: None,
+                source: None,
+                supersedes: None,
+                tags: vec![],
+                priority: 0,
+                created_at: chrono::Utc::now(),
+                last_updated: None,
+            };
+
+            let json = serde_json::to_value(&directive).unwrap();
+            assert_eq!(json["kind"], expected);
+        }
     }
 }
 
@@ -145,9 +247,19 @@ mod agent_context {
         let identity = test_identity();
         let context = AgentContext::new(identity.clone());
 
-        assert_eq!(context.identity.values, identity.values);
+        assert_eq!(context.identity.operator_did, identity.operator_did);
         assert!(context.trigger.is_none());
         assert!(context.recent_thoughts.is_empty());
+        assert!(context.directives.is_empty());
+    }
+
+    #[test]
+    fn context_includes_directives() {
+        let identity = test_identity();
+        let directives = test_directives();
+        let context = AgentContext::new(identity).with_directives(directives.clone());
+
+        assert_eq!(context.directives.len(), directives.len());
     }
 
     #[test]
@@ -162,6 +274,7 @@ mod agent_context {
             cid: "bafyreiabc123".to_string(),
             parent: None,
             root: None,
+            facets: vec![],
         };
 
         let context = AgentContext::new(identity).with_trigger(trigger);
@@ -169,9 +282,10 @@ mod agent_context {
     }
 
     #[test]
-    fn prompt_builder_includes_identity() {
+    fn prompt_builder_includes_directives() {
         let identity = test_identity();
-        let context = AgentContext::new(identity);
+        let directives = test_directives();
+        let context = AgentContext::new(identity).with_directives(directives);
         let prompt = PromptBuilder::build(&context);
 
         assert!(prompt.contains("A test agent exploring the world."));
@@ -182,6 +296,7 @@ mod agent_context {
     #[test]
     fn prompt_builder_includes_notification_trigger() {
         let identity = test_identity();
+        let directives = test_directives();
         let trigger = ContextTrigger::Notification {
             kind: "mention".to_string(),
             author_did: "did:plc:abc".to_string(),
@@ -191,9 +306,12 @@ mod agent_context {
             cid: "bafyreiabc123".to_string(),
             parent: None,
             root: None,
+            facets: vec![],
         };
 
-        let context = AgentContext::new(identity).with_trigger(trigger);
+        let context = AgentContext::new(identity)
+            .with_directives(directives)
+            .with_trigger(trigger);
         let prompt = PromptBuilder::build(&context);
 
         assert!(prompt.contains("mention"));

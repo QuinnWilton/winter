@@ -1,7 +1,7 @@
 //! Property-based tests for Winter's core types.
 
 use proptest::prelude::*;
-use winter_atproto::{Fact, Identity, Note, Rule, Thought, ThoughtKind};
+use winter_atproto::{Directive, DirectiveKind, Fact, Identity, Note, Rule, Thought, ThoughtKind};
 
 // Strategy for generating valid identifiers (alphanumeric + underscore)
 fn valid_identifier() -> impl Strategy<Value = String> {
@@ -30,19 +30,27 @@ fn thought_kind() -> impl Strategy<Value = ThoughtKind> {
     ]
 }
 
+// Strategy for generating DirectiveKind
+fn directive_kind() -> impl Strategy<Value = DirectiveKind> {
+    prop_oneof![
+        Just(DirectiveKind::Value),
+        Just(DirectiveKind::Interest),
+        Just(DirectiveKind::Belief),
+        Just(DirectiveKind::Guideline),
+        Just(DirectiveKind::SelfConcept),
+        Just(DirectiveKind::Boundary),
+        Just(DirectiveKind::Aspiration),
+    ]
+}
+
 proptest! {
-    // Identity tests
+    // Identity tests (slim version)
     #[test]
     fn identity_roundtrip(
-        values in prop::collection::vec(non_empty_string(), 0..5),
-        interests in prop::collection::vec(non_empty_string(), 0..5),
-        self_description in non_empty_string(),
+        operator_did in non_empty_string(),
     ) {
         let identity = Identity {
-            operator_did: "did:plc:test".to_string(),
-            values: values.clone(),
-            interests: interests.clone(),
-            self_description: self_description.clone(),
+            operator_did: operator_did.clone(),
             created_at: chrono::Utc::now(),
             last_updated: chrono::Utc::now(),
         };
@@ -51,9 +59,50 @@ proptest! {
         let json = serde_json::to_string(&identity).unwrap();
         let decoded: Identity = serde_json::from_str(&json).unwrap();
 
-        prop_assert_eq!(decoded.values, values);
-        prop_assert_eq!(decoded.interests, interests);
-        prop_assert_eq!(decoded.self_description, self_description);
+        prop_assert_eq!(decoded.operator_did, operator_did);
+    }
+
+    // Directive tests
+    #[test]
+    fn directive_roundtrip(
+        kind in directive_kind(),
+        content in non_empty_string(),
+        summary in proptest::option::of(non_empty_string()),
+        active in proptest::bool::ANY,
+        confidence in confidence_value(),
+        priority in 0i32..100,
+        tags in prop::collection::vec(valid_identifier(), 0..5),
+    ) {
+        let directive = Directive {
+            kind: kind.clone(),
+            content: content.clone(),
+            summary: summary.clone(),
+            active,
+            confidence,
+            source: None,
+            supersedes: None,
+            tags: tags.clone(),
+            priority,
+            created_at: chrono::Utc::now(),
+            last_updated: None,
+        };
+
+        // Serialize and deserialize
+        let json = serde_json::to_string(&directive).unwrap();
+        let decoded: Directive = serde_json::from_str(&json).unwrap();
+
+        prop_assert_eq!(decoded.kind, kind);
+        prop_assert_eq!(decoded.content, content);
+        prop_assert_eq!(decoded.summary, summary);
+        prop_assert_eq!(decoded.active, active);
+        // Allow small floating point differences for confidence
+        match (decoded.confidence, confidence) {
+            (Some(d), Some(c)) => prop_assert!((d - c).abs() < 0.0001),
+            (None, None) => {}
+            _ => prop_assert!(false, "confidence mismatch"),
+        }
+        prop_assert_eq!(decoded.priority, priority);
+        prop_assert_eq!(decoded.tags, tags);
     }
 
     // Fact tests
