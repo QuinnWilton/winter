@@ -35,6 +35,15 @@
             "description": "What triggered this thought (e.g., notification URI, job name)",
             "maxLength": 1024
           },
+          "tags": {
+            "type": "array",
+            "description": "Tags for categorization and querying",
+            "maxLength": 20,
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            }
+          },
           "durationMs": {
             "type": "integer",
             "description": "How long this thought took to generate (ms)"
