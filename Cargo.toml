@@ -23,6 +23,7 @@ miette = { version = "7.0", features = ["fancy"] }
 
 # Async runtime
 tokio = { version = "1.42", features = ["full"] }
+async-trait = "0.1"
 
 # Claude Code CLI wrapper (vendored)
 claude-sdk-rs = { path = "vendor/claude-sdk-rs" }
@@ -65,8 +66,11 @@ serde_bytes = "0.11"
 dashmap = "6.0"
 crossbeam = "0.8"
 
+# Regular expressions
+regex = "1.10"
+
 # Web framework
-axum = { version = "0.7", features = ["macros"] }
+axum = { version = "0.8.8", features = ["macros"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 askama = "0.12"

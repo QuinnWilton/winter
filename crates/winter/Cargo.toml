@@ -23,6 +23,7 @@ miette = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
+async-trait = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
@@ -43,6 +44,7 @@ dirs = "5.0"
 
 # Web (for run_web_server)
 axum = { workspace = true }
+tempfile.workspace = true
 
 [dev-dependencies]
 tempfile = { workspace = true }
