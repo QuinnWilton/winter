@@ -15,10 +15,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::{RwLock, broadcast};
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
-use winter_atproto::{CacheUpdate, Fact, RepoCache, Rule};
+use winter_atproto::{CacheUpdate, Fact, FactDeclaration, RepoCache, Rule, SyncState};
 
+use crate::derived::DerivedFactGenerator;
 use crate::error::DatalogError;
 use crate::{RuleCompiler, SouffleExecutor};
 
@@ -53,6 +54,12 @@ pub struct DatalogCache {
     /// Persistent directory for TSV files.
     fact_dir: PathBuf,
 
+    /// Winter's DID for derived fact generation.
+    self_did: Option<String>,
+
+    /// Winter's handle (for blog WhiteWind URLs in derived facts).
+    handle: Option<String>,
+
     /// Predicate name -> arity (for declaration generation).
     predicate_arities: RwLock<HashMap<String, usize>>,
 
@@ -67,6 +74,9 @@ pub struct DatalogCache {
 
     /// Cached rules (for compilation).
     rules: RwLock<Vec<Rule>>,
+
+    /// Cached fact declarations (for query-time .decl generation).
+    declarations: RwLock<HashMap<String, FactDeclaration>>,
 
     /// Cached base program (declarations + compiled rules).
     base_program: RwLock<Option<CachedProgram>>,
@@ -85,29 +95,53 @@ pub struct DatalogCache {
 
     /// Soufflé executor for query execution.
     executor: SouffleExecutor,
+
+    /// Derived fact generator for Bluesky/Winter record-based facts.
+    derived: RwLock<DerivedFactGenerator>,
 }
 
 impl DatalogCache {
     /// Create a new DatalogCache with the given cache directory.
     ///
     /// The directory will be created if it doesn't exist.
+    /// Use `new_with_did` to enable derived fact generation.
     pub fn new(cache_dir: impl Into<PathBuf>) -> Result<Arc<Self>, DatalogError> {
+        Self::new_with_did(cache_dir, None, None)
+    }
+
+    /// Create a new DatalogCache with a specific DID and handle for derived facts.
+    ///
+    /// The `self_did` is used to generate derived facts like `follows(self, target)`.
+    /// The `handle` is used for WhiteWind blog URLs.
+    pub fn new_with_did(
+        cache_dir: impl Into<PathBuf>,
+        self_did: Option<String>,
+        handle: Option<String>,
+    ) -> Result<Arc<Self>, DatalogError> {
         let fact_dir = cache_dir.into();
         std::fs::create_dir_all(&fact_dir)?;
 
+        // Create derived generator with empty values if not provided
+        let derived_did = self_did.clone().unwrap_or_default();
+        let derived_handle = handle.clone().unwrap_or_default();
+
         Ok(Arc::new(Self {
             fact_dir,
+            self_did,
+            handle,
             predicate_arities: RwLock::new(HashMap::new()),
             facts_by_rkey: RwLock::new(HashMap::new()),
             cid_to_rkey: RwLock::new(HashMap::new()),
             superseded_cids: RwLock::new(HashSet::new()),
             rules: RwLock::new(Vec::new()),
+            declarations: RwLock::new(HashMap::new()),
             base_program: RwLock::new(None),
             facts_generation: AtomicU64::new(0),
             rules_generation: AtomicU64::new(0),
             dirty_predicates: RwLock::new(HashSet::new()),
             full_regen_needed: RwLock::new(true),
             executor: SouffleExecutor::new(),
+            derived: RwLock::new(DerivedFactGenerator::new(derived_did, derived_handle)),
         }))
     }
 
@@ -119,6 +153,15 @@ impl DatalogCache {
         Self::new(path)
     }
 
+    /// Set the DID and handle for derived fact generation.
+    ///
+    /// This recreates the derived generator with the new values.
+    pub async fn set_self_did(&self, did: String, handle: String) {
+        let mut derived = self.derived.write().await;
+        *derived = DerivedFactGenerator::new(did, handle);
+        derived.mark_all_dirty();
+    }
+
     /// Get the fact directory path.
     pub fn fact_dir(&self) -> &Path {
         &self.fact_dir
@@ -127,14 +170,39 @@ impl DatalogCache {
     /// Start listening for updates from a RepoCache.
     ///
     /// This spawns a background task that processes cache updates
-    /// and maintains the datalog cache in sync.
-    pub fn start_update_listener(self: &Arc<Self>, repo_cache: &RepoCache) {
+    /// and maintains the datalog cache in sync. When the RepoCache
+    /// becomes synchronized, it will also perform initial population
+    /// of derived facts.
+    ///
+    /// If the RepoCache is already synchronized when this is called,
+    /// population happens immediately.
+    pub fn start_update_listener(self: &Arc<Self>, repo_cache: Arc<RepoCache>) {
         let mut rx = repo_cache.subscribe();
         let cache = Arc::clone(self);
 
+        // Check if already synchronized - if so, we need to populate immediately
+        // because we won't receive the Synchronized event
+        let already_live = repo_cache.state() == SyncState::Live;
+
         tokio::spawn(async move {
+            let mut populated = false;
+
+            // If already live when we started, populate now
+            if already_live {
+                debug!("repo cache already synchronized, populating datalog cache immediately");
+                cache.populate_from_repo_cache(&repo_cache).await;
+                populated = true;
+            }
+
             loop {
                 match rx.recv().await {
+                    Ok(CacheUpdate::Synchronized) => {
+                        if !populated {
+                            debug!("repo cache synchronized, populating datalog cache");
+                            cache.populate_from_repo_cache(&repo_cache).await;
+                            populated = true;
+                        }
+                    }
                     Ok(update) => {
                         if let Err(e) = cache.handle_update(update).await {
                             warn!(error = %e, "failed to handle cache update");
@@ -158,10 +226,21 @@ impl DatalogCache {
     ///
     /// This should be called once after the RepoCache is synchronized.
     pub async fn populate_from_repo_cache(&self, repo_cache: &RepoCache) {
+        info!(
+            repo_state = ?repo_cache.state(),
+            repo_notes = repo_cache.note_count(),
+            repo_thoughts = repo_cache.thought_count(),
+            repo_blog_entries = repo_cache.blog_entry_count(),
+            "starting datalog cache population from repo cache"
+        );
+
+        info!("loading facts and rules from repo cache");
         let facts = repo_cache.list_facts();
         let rules = repo_cache.list_rules();
+        info!(facts = facts.len(), rules = rules.len(), "loaded facts and rules");
 
         // Clear existing data
+        info!("clearing existing datalog cache data");
         {
             let mut facts_guard = self.facts_by_rkey.write().await;
             let mut cid_guard = self.cid_to_rkey.write().await;
@@ -181,7 +260,7 @@ impl DatalogCache {
             }
 
             // Second pass: insert facts
-            for (rkey, cached) in facts {
+            for (rkey, cached) in facts.clone() {
                 let is_superseded = superseded_guard.contains(&cached.cid);
 
                 // Track arity
@@ -204,11 +283,160 @@ impl DatalogCache {
         }
 
         // Insert rules
+        info!("inserting rules into cache");
         {
             let mut rules_guard = self.rules.write().await;
             rules_guard.clear();
             for (_, cached) in rules {
                 rules_guard.push(cached.value);
+            }
+        }
+        info!("rules inserted, starting derived facts population");
+
+        // Populate derived facts generator with all record types
+        {
+            let mut derived = self.derived.write().await;
+
+            // Facts (for tags)
+            info!(count = facts.len(), "populating facts (for tags)");
+            for (rkey, cached) in &facts {
+                derived.handle_update(&CacheUpdate::FactCreated {
+                    rkey: rkey.clone(),
+                    fact: cached.value.clone(),
+                });
+            }
+
+            // Follows
+            let follows_list = repo_cache.list_follows();
+            info!(count = follows_list.len(), "populating follows");
+            for (rkey, cached) in follows_list {
+                derived.handle_update(&CacheUpdate::FollowCreated {
+                    rkey,
+                    follow: cached.value,
+                });
+            }
+
+            // Likes
+            let likes_list = repo_cache.list_likes();
+            info!(count = likes_list.len(), "populating likes");
+            for (rkey, cached) in likes_list {
+                derived.handle_update(&CacheUpdate::LikeCreated {
+                    rkey,
+                    like: cached.value,
+                });
+            }
+
+            // Reposts
+            let reposts_list = repo_cache.list_reposts();
+            info!(count = reposts_list.len(), "populating reposts");
+            for (rkey, cached) in reposts_list {
+                derived.handle_update(&CacheUpdate::RepostCreated {
+                    rkey,
+                    repost: cached.value,
+                });
+            }
+
+            // Posts
+            let posts_list = repo_cache.list_posts();
+            info!(count = posts_list.len(), "populating posts");
+            for (rkey, cached) in posts_list {
+                derived.handle_update(&CacheUpdate::PostCreated {
+                    rkey,
+                    post: cached.value,
+                });
+            }
+
+            // Directives
+            let directives_list = repo_cache.list_directives();
+            info!(count = directives_list.len(), "populating directives");
+            for (rkey, cached) in directives_list {
+                derived.handle_update(&CacheUpdate::DirectiveCreated {
+                    rkey,
+                    directive: cached.value,
+                });
+            }
+
+            // Tools
+            let tools_list = repo_cache.list_tools();
+            info!(count = tools_list.len(), "populating tools");
+            for (rkey, cached) in tools_list {
+                derived.handle_update(&CacheUpdate::ToolCreated {
+                    rkey,
+                    tool: cached.value,
+                });
+            }
+
+            // Tool approvals
+            let tool_approvals_list = repo_cache.list_tool_approvals();
+            info!(count = tool_approvals_list.len(), "populating tool approvals");
+            for (rkey, cached) in tool_approvals_list {
+                derived.handle_update(&CacheUpdate::ToolApprovalCreated {
+                    rkey,
+                    approval: cached.value,
+                });
+            }
+
+            // Jobs
+            let jobs_list = repo_cache.list_jobs();
+            info!(count = jobs_list.len(), "populating jobs");
+            for (rkey, cached) in jobs_list {
+                derived.handle_update(&CacheUpdate::JobCreated {
+                    rkey,
+                    job: cached.value,
+                });
+            }
+
+            // Notes
+            let notes_list = repo_cache.list_notes();
+            info!(count = notes_list.len(), "populating notes");
+            for (rkey, cached) in notes_list {
+                derived.handle_update(&CacheUpdate::NoteCreated {
+                    rkey,
+                    note: cached.value,
+                });
+            }
+
+            // Thoughts
+            let thoughts_list = repo_cache.list_thoughts();
+            info!(count = thoughts_list.len(), "populating thoughts");
+            for (rkey, cached) in thoughts_list {
+                derived.handle_update(&CacheUpdate::ThoughtCreated {
+                    rkey,
+                    thought: cached.value,
+                });
+            }
+
+            // Blog entries
+            let blog_list = repo_cache.list_blog_entries();
+            info!(count = blog_list.len(), "populating blog entries");
+            for (rkey, cached) in blog_list {
+                derived.handle_update(&CacheUpdate::BlogEntryCreated {
+                    rkey,
+                    entry: cached.value,
+                });
+            }
+
+            // Followers from daemon state (stored in PDS so MCP can access via CAR)
+            let followers = repo_cache.get_followers().await;
+            if !followers.is_empty() {
+                info!(count = followers.len(), "populating followers from state");
+                let followers_set: std::collections::HashSet<String> =
+                    followers.into_iter().collect();
+                derived.set_followers(followers_set);
+            }
+
+            // Mark all derived predicates as needing regeneration
+            derived.mark_all_dirty();
+            info!("all derived facts populated and marked dirty");
+        }
+
+        // Populate fact declarations
+        {
+            let declarations_list = repo_cache.list_declarations();
+            info!(count = declarations_list.len(), "populating fact declarations");
+            let mut decls = self.declarations.write().await;
+            for (rkey, cached) in declarations_list {
+                decls.insert(rkey, cached.value);
             }
         }
 
@@ -220,11 +448,32 @@ impl DatalogCache {
         // Invalidate cached program
         *self.base_program.write().await = None;
 
-        debug!(
-            facts = self.facts_by_rkey.read().await.len(),
-            rules = self.rules.read().await.len(),
-            "datalog cache populated from repo cache"
+        // Log derived fact counts for diagnostics
+        // Collect all values first to avoid holding locks across debug! macro
+        let facts_count = self.facts_by_rkey.read().await.len();
+        let rules_count = self.rules.read().await.len();
+        let stats = {
+            let derived = self.derived.read().await;
+            derived.stats()
+        };
+        info!(
+            facts = facts_count,
+            rules = rules_count,
+            notes = stats.notes,
+            thoughts = stats.thoughts,
+            blog_entries = stats.blog_entries,
+            follows = stats.follows,
+            likes = stats.likes,
+            directives = stats.directives,
+            "datalog cache populated, flushing TSV files"
         );
+
+        // Immediately flush all TSV files so they exist before any query runs
+        if let Err(e) = self.flush_dirty_predicates().await {
+            warn!(error = %e, "failed to flush TSV files after population");
+        } else {
+            info!("TSV files flushed successfully");
+        }
     }
 
     /// Handle a cache update event.
@@ -251,17 +500,84 @@ impl DatalogCache {
             CacheUpdate::Synchronized => {
                 debug!("repo cache synchronized");
             }
-            // DatalogCache only cares about facts and rules
-            CacheUpdate::ThoughtCreated { .. }
-            | CacheUpdate::ThoughtDeleted { .. }
-            | CacheUpdate::NoteCreated { .. }
-            | CacheUpdate::NoteUpdated { .. }
-            | CacheUpdate::NoteDeleted { .. }
-            | CacheUpdate::JobCreated { .. }
-            | CacheUpdate::JobUpdated { .. }
-            | CacheUpdate::JobDeleted { .. }
-            | CacheUpdate::IdentityUpdated { .. } => {
-                // Ignored - these don't affect datalog queries
+            // Non-datalog records (identity only)
+            CacheUpdate::IdentityUpdated { .. } => {
+                // Ignored - this doesn't affect datalog queries
+            }
+            // Notes, thoughts, blog entries - forward to DerivedFactGenerator
+            ref update @ CacheUpdate::NoteCreated { .. }
+            | ref update @ CacheUpdate::NoteUpdated { .. }
+            | ref update @ CacheUpdate::NoteDeleted { .. }
+            | ref update @ CacheUpdate::ThoughtCreated { .. }
+            | ref update @ CacheUpdate::ThoughtDeleted { .. }
+            | ref update @ CacheUpdate::BlogEntryCreated { .. }
+            | ref update @ CacheUpdate::BlogEntryUpdated { .. }
+            | ref update @ CacheUpdate::BlogEntryDeleted { .. } => {
+                // Forward to DerivedFactGenerator
+                let mut derived = self.derived.write().await;
+                derived.handle_update(update);
+                // Invalidate cached program since derived predicates may have changed
+                if derived.has_dirty_predicates() {
+                    *self.base_program.write().await = None;
+                }
+            }
+            // Bluesky records - forward to DerivedFactGenerator
+            ref update @ CacheUpdate::FollowCreated { .. }
+            | ref update @ CacheUpdate::FollowDeleted { .. }
+            | ref update @ CacheUpdate::LikeCreated { .. }
+            | ref update @ CacheUpdate::LikeDeleted { .. }
+            | ref update @ CacheUpdate::RepostCreated { .. }
+            | ref update @ CacheUpdate::RepostDeleted { .. }
+            | ref update @ CacheUpdate::PostCreated { .. }
+            | ref update @ CacheUpdate::PostUpdated { .. }
+            | ref update @ CacheUpdate::PostDeleted { .. }
+            // Winter records - forward to DerivedFactGenerator
+            | ref update @ CacheUpdate::DirectiveCreated { .. }
+            | ref update @ CacheUpdate::DirectiveUpdated { .. }
+            | ref update @ CacheUpdate::DirectiveDeleted { .. }
+            | ref update @ CacheUpdate::ToolCreated { .. }
+            | ref update @ CacheUpdate::ToolUpdated { .. }
+            | ref update @ CacheUpdate::ToolDeleted { .. }
+            | ref update @ CacheUpdate::ToolApprovalCreated { .. }
+            | ref update @ CacheUpdate::ToolApprovalUpdated { .. }
+            | ref update @ CacheUpdate::ToolApprovalDeleted { .. }
+            | ref update @ CacheUpdate::JobCreated { .. }
+            | ref update @ CacheUpdate::JobUpdated { .. }
+            | ref update @ CacheUpdate::JobDeleted { .. } => {
+                // Forward to DerivedFactGenerator
+                let mut derived = self.derived.write().await;
+                derived.handle_update(update);
+                // Invalidate cached program since derived predicates may have changed
+                if derived.has_dirty_predicates() {
+                    *self.base_program.write().await = None;
+                }
+            }
+            // Declaration records - store for query-time .decl generation
+            CacheUpdate::DeclarationCreated { rkey, declaration }
+            | CacheUpdate::DeclarationUpdated { rkey, declaration } => {
+                let mut decls = self.declarations.write().await;
+                decls.insert(rkey, declaration);
+                // Invalidate base program since declarations changed
+                let mut prog = self.base_program.write().await;
+                *prog = None;
+            }
+            CacheUpdate::DeclarationDeleted { rkey } => {
+                let mut decls = self.declarations.write().await;
+                decls.remove(&rkey);
+                // Invalidate base program since declarations changed
+                let mut prog = self.base_program.write().await;
+                *prog = None;
+            }
+            // State updates - extract followers for is_followed_by predicate
+            CacheUpdate::StateUpdated { state } => {
+                let followers_set: std::collections::HashSet<String> =
+                    state.followers.into_iter().collect();
+                let mut derived = self.derived.write().await;
+                derived.set_followers(followers_set);
+                // Invalidate cached program since derived predicates may have changed
+                if derived.has_dirty_predicates() {
+                    *self.base_program.write().await = None;
+                }
             }
         }
         Ok(())
@@ -390,12 +706,44 @@ impl DatalogCache {
     /// This will:
     /// 1. Flush any dirty predicates (regenerate changed TSV files)
     /// 2. Get or generate the base program
-    /// 3. Append the query and extra rules
+    /// 3. Append extra facts, rules, and query
     /// 4. Execute with Soufflé
+    ///
+    /// The `extra_facts` parameter allows injecting ephemeral facts at query time
+    /// without persisting them. Useful for runtime context like thread state.
     pub async fn execute_query(
         &self,
         query: &str,
         extra_rules: Option<&str>,
+    ) -> Result<Vec<Vec<String>>, DatalogError> {
+        self.execute_query_with_facts(query, extra_rules, None).await
+    }
+
+    /// Execute a query with optional ephemeral facts.
+    ///
+    /// Like `execute_query`, but also accepts `extra_facts` - inline facts that
+    /// are included in the query but not persisted to the PDS.
+    pub async fn execute_query_with_facts(
+        &self,
+        query: &str,
+        extra_rules: Option<&str>,
+        extra_facts: Option<&[String]>,
+    ) -> Result<Vec<Vec<String>>, DatalogError> {
+        self.execute_query_with_facts_and_declarations(query, extra_rules, extra_facts, None)
+            .await
+    }
+
+    /// Execute a query with optional ephemeral facts and ad-hoc declarations.
+    ///
+    /// Like `execute_query_with_facts`, but also accepts `extra_declarations` -
+    /// ad-hoc predicate declarations (e.g., "my_pred(arg1: symbol, arg2: symbol)")
+    /// for predicates not yet stored.
+    pub async fn execute_query_with_facts_and_declarations(
+        &self,
+        query: &str,
+        extra_rules: Option<&str>,
+        extra_facts: Option<&[String]>,
+        extra_declarations: Option<&[String]>,
     ) -> Result<Vec<Vec<String>>, DatalogError> {
         // Flush dirty predicates
         self.flush_dirty_predicates().await?;
@@ -403,41 +751,171 @@ impl DatalogCache {
         // Get or generate base program
         let (base_program, declared_predicates) = self.get_or_generate_base_program().await?;
 
-        // Parse query to get predicate info
-        let (query_pred, query_arity) = parse_query_predicate(query);
-
         // Build full program
         let mut program = base_program;
 
-        // Add extra ad-hoc rules if provided
-        if let Some(extra) = extra_rules {
-            program.push_str("// Ad-hoc rules\n");
-            program.push_str(extra);
-            program.push_str("\n\n");
+        // Track predicates declared by ad-hoc rules/facts
+        let mut all_declared = declared_predicates;
+
+        // Parse extra_rules for explicit .decl statements to avoid conflicts
+        let mut user_declared: HashSet<String> = extra_rules
+            .map(|rules| parse_decl_statements(rules))
+            .unwrap_or_default();
+
+        // Add stored declarations from PDS (fact declarations created via MCP tools)
+        {
+            let stored_decls = self.declarations.read().await;
+            if !stored_decls.is_empty() {
+                program.push_str("// Stored fact declarations\n");
+                for (_, decl) in stored_decls.iter() {
+                    // Skip if already declared
+                    if all_declared.contains(&decl.predicate) || user_declared.contains(&decl.predicate) {
+                        continue;
+                    }
+                    // Generate .decl statement from FactDeclaration
+                    let args: Vec<String> = decl
+                        .args
+                        .iter()
+                        .map(|a| format!("{}: {}", a.name, a.r#type))
+                        .collect();
+                    program.push_str(&format!(".decl {}({})\n", decl.predicate, args.join(", ")));
+                    all_declared.insert(decl.predicate.clone());
+                }
+                program.push('\n');
+            }
         }
 
-        // Generate output declaration for the query predicate
-        program.push_str(&RuleCompiler::generate_output_declaration(
-            &query_pred,
-            query_arity,
-            Some(&declared_predicates),
-        ));
+        // Process extra_declarations parameter (ad-hoc declarations like "my_pred(arg1: symbol)")
+        if let Some(decls) = extra_declarations {
+            program.push_str("// Ad-hoc declarations\n");
+            for decl in decls {
+                let decl = decl.trim();
+                // Parse predicate name from declaration
+                if let Some(paren_idx) = decl.find('(') {
+                    let pred_name = decl[..paren_idx].trim();
+                    if !all_declared.contains(pred_name) && !user_declared.contains(pred_name) {
+                        program.push_str(&format!(".decl {}\n", decl));
+                        all_declared.insert(pred_name.to_string());
+                        user_declared.insert(pred_name.to_string());
+                    }
+                }
+            }
+            program.push('\n');
+        }
 
-        debug!(
-            query = %query,
-            program_len = program.len(),
-            "executing cached query"
-        );
+        // Add user's explicit declarations FIRST (from extra_rules)
+        // This ensures typed declarations appear before inline facts that use them
+        if let Some(extra) = extra_rules {
+            // Extract and add only the .decl statements first
+            for line in extra.lines() {
+                let line_trimmed = line.trim();
+                if line_trimmed.starts_with(".decl ") {
+                    program.push_str(line);
+                    program.push('\n');
+                }
+            }
+        }
+
+        // Generate declarations and assertions for extra_facts
+        if let Some(facts) = extra_facts {
+            if !facts.is_empty() {
+                // Parse facts to extract predicates and arities
+                let parsed_facts = parse_extra_facts(facts);
+
+                // Auto-declare any new predicates (skip if user declared explicitly)
+                for (name, arity) in &parsed_facts {
+                    if !all_declared.contains(name) && !user_declared.contains(name) {
+                        let params: Vec<String> = (0..*arity)
+                            .map(|i| format!("arg{}: symbol", i))
+                            .collect();
+                        program.push_str(&format!(".decl {}({})\n", name, params.join(", ")));
+                        all_declared.insert(name.clone());
+                    }
+                }
+
+                // Add the facts as inline assertions
+                program.push_str("// Ephemeral facts\n");
+                for fact in facts {
+                    // Ensure fact ends with a period
+                    let fact = fact.trim();
+                    if fact.ends_with('.') {
+                        program.push_str(fact);
+                    } else {
+                        program.push_str(fact);
+                        program.push('.');
+                    }
+                    program.push('\n');
+                }
+                program.push('\n');
+            }
+        }
+
+        // Generate declarations for ad-hoc rule heads
+        if let Some(extra) = extra_rules {
+            let heads = RuleCompiler::parse_extra_rules_heads(extra);
+            for (name, arity) in heads {
+                if !all_declared.contains(&name) && !user_declared.contains(&name) {
+                    let params: Vec<String> = (0..arity)
+                        .map(|i| format!("arg{}: symbol", i))
+                        .collect();
+                    program.push_str(&format!(".decl {}({})\n", name, params.join(", ")));
+                    all_declared.insert(name);
+                }
+            }
+
+            // Add rules (skip .decl lines since we already added them)
+            program.push_str("// Ad-hoc rules\n");
+            for line in extra.lines() {
+                let line_trimmed = line.trim();
+                if !line_trimmed.starts_with(".decl ") {
+                    program.push_str(line);
+                    program.push('\n');
+                }
+            }
+            program.push('\n');
+        }
+
+        // Generate wrapper rule that properly handles constants as filters
+        let (wrapper, _result_arity) = generate_query_wrapper(query, Some(&all_declared));
+        program.push_str(&wrapper);
+
+        // Log program details for debugging derived predicate issues
+        if query.contains("has_note") || query.contains("has_thought") || query.contains("has_blog") {
+            info!(
+                query = %query,
+                program_len = program.len(),
+                program_preview = %program.chars().take(2000).collect::<String>(),
+                "executing derived predicate query"
+            );
+        } else {
+            debug!(
+                query = %query,
+                program_len = program.len(),
+                "executing cached query"
+            );
+        }
 
         // Execute
         let output = self.executor.execute(&program, &self.fact_dir).await?;
 
         // Parse results
-        Ok(SouffleExecutor::parse_output(&output))
+        let results = SouffleExecutor::parse_output(&output);
+
+        // Log if query returned no results but we expected some (for debugging)
+        if results.is_empty() && !output.trim().is_empty() {
+            debug!(
+                query = %query,
+                output_len = output.len(),
+                output_preview = %output.chars().take(500).collect::<String>(),
+                "query returned no parsed results despite non-empty output"
+            );
+        }
+
+        Ok(results)
     }
 
     /// Flush dirty predicates by regenerating their TSV files.
-    async fn flush_dirty_predicates(&self) -> Result<(), DatalogError> {
+    pub async fn flush_dirty_predicates(&self) -> Result<(), DatalogError> {
         let full_regen = *self.full_regen_needed.read().await;
 
         if full_regen {
@@ -445,29 +923,37 @@ impl DatalogCache {
             self.regenerate_all_files().await?;
             *self.full_regen_needed.write().await = false;
             self.dirty_predicates.write().await.clear();
+
+            // Also regenerate all derived facts
+            let mut derived = self.derived.write().await;
+            derived.regenerate_all(&self.fact_dir)?;
             return Ok(());
         }
 
-        // Get dirty predicates
+        // Get dirty predicates (user facts)
         let dirty: HashSet<String> = {
             let mut dirty_guard = self.dirty_predicates.write().await;
             std::mem::take(&mut *dirty_guard)
         };
 
-        if dirty.is_empty() {
-            return Ok(());
+        if !dirty.is_empty() {
+            debug!(predicates = ?dirty, "flushing dirty predicates");
+
+            // Get facts and arities
+            let facts = self.facts_by_rkey.read().await;
+            let arities = self.predicate_arities.read().await;
+
+            for predicate in dirty {
+                if let Some(&arity) = arities.get(&predicate) {
+                    self.regenerate_predicate_files(&predicate, arity, &facts)?;
+                }
+            }
         }
 
-        debug!(predicates = ?dirty, "flushing dirty predicates");
-
-        // Get facts and arities
-        let facts = self.facts_by_rkey.read().await;
-        let arities = self.predicate_arities.read().await;
-
-        for predicate in dirty {
-            if let Some(&arity) = arities.get(&predicate) {
-                self.regenerate_predicate_files(&predicate, arity, &facts)?;
-            }
+        // Flush derived predicates
+        let mut derived = self.derived.write().await;
+        if derived.has_dirty_predicates() {
+            derived.flush_to_dir(&self.fact_dir)?;
         }
 
         Ok(())
@@ -493,14 +979,21 @@ impl DatalogCache {
                 continue;
             }
 
-            let args = data.fact.args.join("\t");
+            // Escape tabs and newlines in arguments to prevent TSV corruption
+            let args: Vec<String> = data
+                .fact
+                .args
+                .iter()
+                .map(|a| a.replace('\t', " ").replace('\n', " "))
+                .collect();
+            let args_str = args.join("\t");
 
-            // Write to all file (always)
-            writeln!(all_file, "{}\t{}", rkey, args)?;
+            // Write to all file (always, rkey at end)
+            writeln!(all_file, "{}\t{}", args_str, rkey)?;
 
-            // Write to current file (only if not superseded)
+            // Write to current file (only if not superseded, rkey at end)
             if !data.is_superseded {
-                writeln!(current_file, "{}", args)?;
+                writeln!(current_file, "{}\t{}", args_str, rkey)?;
             }
         }
 
@@ -518,6 +1011,7 @@ impl DatalogCache {
         let mut confidence_file = std::fs::File::create(self.fact_dir.join("_confidence.facts"))?;
         let mut source_file = std::fs::File::create(self.fact_dir.join("_source.facts"))?;
         let mut supersedes_file = std::fs::File::create(self.fact_dir.join("_supersedes.facts"))?;
+        let mut created_at_file = std::fs::File::create(self.fact_dir.join("_created_at.facts"))?;
 
         // Group facts by predicate for efficient file writing
         let mut by_predicate: HashMap<&str, Vec<(&str, &CachedFactData)>> = HashMap::new();
@@ -548,6 +1042,9 @@ impl DatalogCache {
                     writeln!(supersedes_file, "{}\t{}", rkey, old_rkey)?;
                 }
             }
+
+            // Write to _created_at.facts (dense - every fact)
+            writeln!(created_at_file, "{}\t{}", rkey, data.fact.created_at.to_rfc3339())?;
         }
 
         // Write predicate files
@@ -560,12 +1057,20 @@ impl DatalogCache {
                 let mut all_file = std::fs::File::create(&all_path)?;
 
                 for (rkey, data) in facts_for_pred {
-                    let args = data.fact.args.join("\t");
+                    // Escape tabs and newlines in arguments to prevent TSV corruption
+                    let args: Vec<String> = data
+                        .fact
+                        .args
+                        .iter()
+                        .map(|a| a.replace('\t', " ").replace('\n', " "))
+                        .collect();
+                    let args_str = args.join("\t");
 
-                    writeln!(all_file, "{}\t{}", rkey, args)?;
+                    // Write with rkey at end
+                    writeln!(all_file, "{}\t{}", args_str, rkey)?;
 
                     if !data.is_superseded {
-                        writeln!(current_file, "{}", args)?;
+                        writeln!(current_file, "{}\t{}", args_str, rkey)?;
                     }
                 }
             }
@@ -606,13 +1111,19 @@ impl DatalogCache {
         let mut program = String::new();
         let mut declared_predicates = HashSet::new();
 
-        // Generate input declarations from arities
+        // Generate input declarations from user fact arities
         let arities = self.predicate_arities.read().await;
         let (input_decls, input_declared) = generate_input_declarations_from_arities(&arities);
         program.push_str(&input_decls);
         declared_predicates.extend(input_declared);
 
-        // Generate derived declarations from rules (skip already-declared input predicates)
+        // Generate input declarations for derived predicates
+        let (derived_input_decls, derived_input_declared) =
+            generate_derived_input_declarations(&declared_predicates);
+        program.push_str(&derived_input_decls);
+        declared_predicates.extend(derived_input_declared);
+
+        // Generate derived declarations from rules (skip already-declared predicates)
         let rules = self.rules.read().await;
         let (derived_decls, derived_declared) =
             RuleCompiler::generate_derived_declarations(&rules, Some(&declared_predicates));
@@ -635,6 +1146,32 @@ impl DatalogCache {
         }
 
         Ok((program, declared_predicates))
+    }
+
+    /// Get access to the derived fact generator (for follower sync).
+    pub async fn derived(&self) -> tokio::sync::RwLockReadGuard<'_, DerivedFactGenerator> {
+        self.derived.read().await
+    }
+
+    /// Get mutable access to the derived fact generator (for follower sync).
+    pub async fn derived_mut(&self) -> tokio::sync::RwLockWriteGuard<'_, DerivedFactGenerator> {
+        self.derived.write().await
+    }
+
+    /// Update the followers set from an external sync.
+    ///
+    /// This is called by the daemon after fetching followers from the Bluesky API.
+    pub async fn set_followers(&self, followers: HashSet<String>) {
+        let mut derived = self.derived.write().await;
+        derived.set_followers(followers);
+    }
+
+    /// Add a single follower (from Follow notification).
+    ///
+    /// Returns true if this was a new follower.
+    pub async fn add_follower(&self, did: String) -> bool {
+        let mut derived = self.derived.write().await;
+        derived.add_follower(did)
     }
 
     /// Get the current facts generation counter.
@@ -671,22 +1208,28 @@ pub fn generate_input_declarations_from_arities(
     declarations.push_str(
         ".decl _fact(rkey: symbol, predicate: symbol, cid: symbol)\n\
          .input _fact\n\n\
-         .decl _confidence(rkey: symbol, value: float)\n\
+         .decl _confidence(rkey: symbol, value: symbol)\n\
          .input _confidence\n\n\
          .decl _source(rkey: symbol, source_cid: symbol)\n\
          .input _source\n\n\
          .decl _supersedes(new_rkey: symbol, old_rkey: symbol)\n\
-         .input _supersedes\n\n",
+         .input _supersedes\n\n\
+         .decl _created_at(rkey: symbol, timestamp: symbol)\n\
+         .input _created_at\n\n",
     );
     declared_set.insert("_fact".to_string());
     declared_set.insert("_confidence".to_string());
     declared_set.insert("_source".to_string());
     declared_set.insert("_supersedes".to_string());
+    declared_set.insert("_created_at".to_string());
 
-    // User predicates (current facts only) and _all_{predicate} (all facts with rkey)
+    // User predicates (current facts only) and _all_{predicate} (all facts with rkey at end)
     for (predicate, &arity) in arities {
-        // Current predicate (no rkey prefix)
-        let params: Vec<String> = (0..arity).map(|i| format!("arg{}: symbol", i)).collect();
+        // Current predicate (with rkey suffix)
+        let params: Vec<String> = (0..arity)
+            .map(|i| format!("arg{}: symbol", i))
+            .chain(std::iter::once("rkey: symbol".to_string()))
+            .collect();
         declarations.push_str(&format!(
             ".decl {}({})\n.input {}\n\n",
             predicate,
@@ -695,9 +1238,10 @@ pub fn generate_input_declarations_from_arities(
         ));
         declared_set.insert(predicate.clone());
 
-        // _all_{predicate} (with rkey prefix)
-        let all_params: Vec<String> = std::iter::once("rkey: symbol".to_string())
-            .chain((0..arity).map(|i| format!("arg{}: symbol", i)))
+        // _all_{predicate} (with rkey at end, same format as current)
+        let all_params: Vec<String> = (0..arity)
+            .map(|i| format!("arg{}: symbol", i))
+            .chain(std::iter::once("rkey: symbol".to_string()))
             .collect();
         let all_name = format!("_all_{}", predicate);
         declarations.push_str(&format!(
@@ -712,27 +1256,300 @@ pub fn generate_input_declarations_from_arities(
     (declarations, declared_set)
 }
 
-/// Parse a query predicate to extract the name and arity.
-/// e.g., "mutual_follow(X, Y)" -> ("mutual_follow", 2)
-fn parse_query_predicate(query: &str) -> (String, usize) {
-    if let Some(paren_idx) = query.find('(') {
-        let name = query[..paren_idx].trim().to_string();
-        let args_part = &query[paren_idx..];
+/// Generate input declarations for derived predicates (from DerivedFactGenerator).
+///
+/// Returns a tuple of (declarations string, set of declared predicate names).
+fn generate_derived_input_declarations(
+    already_declared: &HashSet<String>,
+) -> (String, HashSet<String>) {
+    let mut declarations = String::new();
+    let mut declared_set = HashSet::new();
 
-        // Count arguments by counting commas + 1
-        let arity = if args_part.contains(',') {
-            args_part.matches(',').count() + 1
-        } else if args_part.contains("()") || args_part.trim() == "()" {
-            0
-        } else {
-            1
-        };
+    // Note: We used to declare _derived here but it's not needed and the file
+    // wasn't being created, causing Soufflé to fail when it couldn't find the input.
 
-        (name, arity)
-    } else {
-        // No parentheses, assume it's just a predicate name with arity 0
-        (query.trim().to_string(), 0)
+    // Get arities from DerivedFactGenerator
+    for (predicate, arity) in DerivedFactGenerator::arities() {
+        if already_declared.contains(predicate) {
+            continue;
+        }
+
+        let params: Vec<String> = (0..arity).map(|i| format!("arg{}: symbol", i)).collect();
+        declarations.push_str(&format!(
+            ".decl {}({})\n.input {}\n\n",
+            predicate,
+            params.join(", "),
+            predicate
+        ));
+        declared_set.insert(predicate.to_string());
     }
+
+    (declarations, declared_set)
+}
+
+/// Represents a query argument - either a variable or a constant.
+#[derive(Debug, Clone, PartialEq)]
+enum QueryArg {
+    Variable(String),
+    Constant(String),
+}
+
+/// Parsed query with predicate name and arguments.
+#[derive(Debug)]
+struct ParsedQuery {
+    name: String,
+    args: Vec<QueryArg>,
+}
+
+impl ParsedQuery {
+    /// Get the variables in this query (for use in result predicate).
+    /// Excludes anonymous variables (`_`) since they can't appear in rule heads.
+    fn variables(&self) -> Vec<&str> {
+        self.args
+            .iter()
+            .filter_map(|arg| match arg {
+                QueryArg::Variable(v) if v != "_" => Some(v.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Get the arity (number of arguments).
+    fn arity(&self) -> usize {
+        self.args.len()
+    }
+}
+
+/// Parse a query to extract predicate name and typed arguments.
+fn parse_query(query: &str) -> Option<ParsedQuery> {
+    let paren_idx = query.find('(')?;
+    let name = query[..paren_idx].trim().to_string();
+
+    let close_paren = query.rfind(')')?;
+    let args_str = &query[paren_idx + 1..close_paren];
+
+    if args_str.trim().is_empty() {
+        return Some(ParsedQuery {
+            name,
+            args: vec![],
+        });
+    }
+
+    // Parse arguments, handling quoted strings and nested parens
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut depth = 0;
+
+    for c in args_str.chars() {
+        match c {
+            '"' if depth == 0 => {
+                in_string = !in_string;
+                current.push(c);
+            }
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if !in_string && depth == 0 => {
+                let arg = current.trim().to_string();
+                if !arg.is_empty() {
+                    args.push(parse_single_arg(&arg));
+                }
+                current.clear();
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+
+    // Don't forget the last argument
+    let arg = current.trim().to_string();
+    if !arg.is_empty() {
+        args.push(parse_single_arg(&arg));
+    }
+
+    Some(ParsedQuery { name, args })
+}
+
+/// Parse a single argument to determine if it's a variable or constant.
+fn parse_single_arg(arg: &str) -> QueryArg {
+    let arg = arg.trim();
+    if arg.starts_with('"') && arg.ends_with('"') {
+        // String constant
+        QueryArg::Constant(arg.to_string())
+    } else if arg
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase() || c == '_')
+        .unwrap_or(false)
+    {
+        // Starts with uppercase or underscore = variable in Datalog convention
+        QueryArg::Variable(arg.to_string())
+    } else {
+        // Numeric constant or other literal
+        QueryArg::Constant(arg.to_string())
+    }
+}
+
+/// Parse `.decl` statements from extra_rules to find user-declared predicates.
+///
+/// This allows us to skip auto-declaring predicates that the user explicitly declared,
+/// avoiding conflicts when parameter names differ.
+fn parse_decl_statements(rules: &str) -> HashSet<String> {
+    let mut declared = HashSet::new();
+    for line in rules.lines() {
+        let line = line.trim();
+        if line.starts_with(".decl ") {
+            // Extract predicate name: ".decl predicate_name(..."
+            let rest = &line[6..]; // Skip ".decl "
+            if let Some(paren_idx) = rest.find('(') {
+                let name = rest[..paren_idx].trim();
+                if !name.is_empty() {
+                    declared.insert(name.to_string());
+                }
+            }
+        }
+    }
+    declared
+}
+
+/// Parse extra facts to extract predicate names and arities.
+///
+/// Each fact should be in the form `predicate(arg1, arg2, ...)` with or without trailing period.
+/// Returns a list of (predicate_name, arity) pairs.
+fn parse_extra_facts(facts: &[String]) -> Vec<(String, usize)> {
+    let mut result = Vec::new();
+
+    for fact in facts {
+        let fact = fact.trim().trim_end_matches('.');
+        if let Some(paren_idx) = fact.find('(') {
+            let name = fact[..paren_idx].trim().to_string();
+            if let Some(close_paren) = fact.rfind(')') {
+                let args_str = &fact[paren_idx + 1..close_paren];
+                // Count arguments by counting commas (handling quoted strings)
+                let arity = if args_str.trim().is_empty() {
+                    0
+                } else {
+                    count_args(args_str)
+                };
+                result.push((name, arity));
+            }
+        }
+    }
+
+    result
+}
+
+/// Count the number of arguments in an argument string, handling quoted strings.
+fn count_args(args_str: &str) -> usize {
+    let mut count = 1; // At least one arg if non-empty
+    let mut in_string = false;
+    let mut depth = 0;
+
+    for c in args_str.chars() {
+        match c {
+            '"' if depth == 0 => in_string = !in_string,
+            '(' if !in_string => depth += 1,
+            ')' if !in_string => depth -= 1,
+            ',' if !in_string && depth == 0 => count += 1,
+            _ => {}
+        }
+    }
+
+    count
+}
+
+/// Generate a wrapper rule and output declaration for a query.
+/// This ensures constants in the query are properly used as filters.
+fn generate_query_wrapper(
+    query: &str,
+    declared_predicates: Option<&HashSet<String>>,
+) -> (String, usize) {
+    let parsed = match parse_query(query) {
+        Some(p) => p,
+        None => {
+            // Fallback: treat as nullary predicate
+            return (
+                format!(
+                    ".decl _query_result()\n.output _query_result\n_query_result() :- {}.\n",
+                    query
+                ),
+                0,
+            );
+        }
+    };
+
+    let variables = parsed.variables();
+    let result_arity = if variables.is_empty() {
+        // No named variables - count only constants (anonymous _ are filtered out)
+        parsed
+            .args
+            .iter()
+            .filter(|a| matches!(a, QueryArg::Constant(_)))
+            .count()
+    } else {
+        variables.len()
+    };
+
+    // Build the result predicate declaration
+    let decl = if result_arity > 0 {
+        let params: Vec<String> = (0..result_arity)
+            .map(|i| format!("arg{}: symbol", i))
+            .collect();
+        format!(".decl _query_result({})\n", params.join(", "))
+    } else {
+        ".decl _query_result()\n".to_string()
+    };
+
+    // Build the wrapper rule head
+    let head_args = if variables.is_empty() {
+        // All constants (or all anonymous variables) - include constants in output
+        parsed
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                QueryArg::Constant(c) => Some(c.as_str()),
+                QueryArg::Variable(v) if v != "_" => Some(v.as_str()),
+                QueryArg::Variable(_) => None, // Skip anonymous variables
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        variables.join(", ")
+    };
+
+    let head = if head_args.is_empty() {
+        "_query_result()".to_string()
+    } else {
+        format!("_query_result({})", head_args)
+    };
+
+    // Check if the base predicate needs declaration
+    let base_decl = if let Some(declared) = declared_predicates {
+        if !declared.contains(&parsed.name) && parsed.arity() > 0 {
+            let params: Vec<String> = (0..parsed.arity())
+                .map(|i| format!("arg{}: symbol", i))
+                .collect();
+            format!(".decl {}({})\n", parsed.name, params.join(", "))
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let wrapper = format!(
+        "{}{}.output _query_result\n{} :- {}.\n",
+        base_decl, decl, head, query
+    );
+
+    (wrapper, result_arity)
 }
 
 #[cfg(test)]
@@ -753,18 +1570,65 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_query_predicate() {
-        let (name, arity) = parse_query_predicate("mutual_follow(X, Y)");
-        assert_eq!(name, "mutual_follow");
-        assert_eq!(arity, 2);
+    fn test_parse_query() {
+        let parsed = parse_query("mutual_follow(X, Y)").unwrap();
+        assert_eq!(parsed.name, "mutual_follow");
+        assert_eq!(parsed.arity(), 2);
+        assert_eq!(parsed.variables(), vec!["X", "Y"]);
 
-        let (name, arity) = parse_query_predicate("is_active(X)");
-        assert_eq!(name, "is_active");
+        let parsed = parse_query("is_active(X)").unwrap();
+        assert_eq!(parsed.name, "is_active");
+        assert_eq!(parsed.arity(), 1);
+
+        let parsed = parse_query("has_data()").unwrap();
+        assert_eq!(parsed.name, "has_data");
+        assert_eq!(parsed.arity(), 0);
+    }
+
+    #[test]
+    fn test_parse_query_with_constants() {
+        let parsed = parse_query(r#"should_engage("did:plc:abc")"#).unwrap();
+        assert_eq!(parsed.name, "should_engage");
+        assert_eq!(parsed.arity(), 1);
+        assert!(parsed.variables().is_empty());
+        assert_eq!(
+            parsed.args,
+            vec![QueryArg::Constant(r#""did:plc:abc""#.to_string())]
+        );
+    }
+
+    #[test]
+    fn test_generate_query_wrapper_with_constant() {
+        let (wrapper, arity) = generate_query_wrapper(r#"should_engage("did:plc:abc")"#, None);
         assert_eq!(arity, 1);
+        assert!(wrapper.contains(".decl _query_result(arg0: symbol)"));
+        assert!(wrapper.contains(".output _query_result"));
+        assert!(wrapper.contains(r#"_query_result("did:plc:abc") :- should_engage("did:plc:abc")."#));
+    }
 
-        let (name, arity) = parse_query_predicate("has_data()");
-        assert_eq!(name, "has_data");
+    #[test]
+    fn test_generate_query_wrapper_mixed_args() {
+        let (wrapper, arity) = generate_query_wrapper(r#"follows(X, "did:plc:abc")"#, None);
+        assert_eq!(arity, 1);
+        assert!(wrapper.contains(r#"_query_result(X) :- follows(X, "did:plc:abc")."#));
+    }
+
+    #[test]
+    fn test_generate_query_wrapper_with_underscore() {
+        // Underscore (anonymous variable) should be excluded from the head
+        let (wrapper, arity) = generate_query_wrapper(r#"did_handle(DID, Handle, _)"#, None);
+        assert_eq!(arity, 2);
+        // Head should NOT contain underscore
+        assert!(wrapper.contains("_query_result(DID, Handle) :- did_handle(DID, Handle, _)."));
+        assert!(!wrapper.contains("_query_result(DID, Handle, _)"));
+    }
+
+    #[test]
+    fn test_generate_query_wrapper_all_underscores() {
+        // Query with all anonymous variables should produce nullary result
+        let (wrapper, arity) = generate_query_wrapper(r#"did_handle(_, _, _)"#, None);
         assert_eq!(arity, 0);
+        assert!(wrapper.contains("_query_result() :- did_handle(_, _, _)."));
     }
 
     #[test]
@@ -778,11 +1642,12 @@ mod tests {
         // Should have metadata relations
         assert!(decls.contains(".decl _fact"));
         assert!(decls.contains(".decl _confidence"));
+        assert!(decls.contains(".decl _created_at(rkey: symbol, timestamp: symbol)"));
 
-        // Should have user predicates
-        assert!(decls.contains(".decl follows(arg0: symbol, arg1: symbol)"));
+        // Should have user predicates (with rkey suffix)
+        assert!(decls.contains(".decl follows(arg0: symbol, arg1: symbol, rkey: symbol)"));
         assert!(decls.contains(".input follows"));
-        assert!(decls.contains(".decl _all_follows(rkey: symbol, arg0: symbol, arg1: symbol)"));
+        assert!(decls.contains(".decl _all_follows(arg0: symbol, arg1: symbol, rkey: symbol)"));
 
         // Check declared set
         assert!(declared.contains("follows"));
@@ -831,5 +1696,345 @@ mod tests {
         let dirty = cache.dirty_predicates.read().await;
         assert!(dirty.contains("follows"));
         assert!(dirty.contains("interested_in"));
+    }
+
+    #[tokio::test]
+    async fn test_extra_rules_constant_filtering() {
+        // This test demonstrates the bug: constant arguments in ad-hoc rules
+        // should filter results, not return all rows.
+
+        let cache = DatalogCache::new_temp().unwrap();
+
+        // Add facts with different second arguments
+        cache
+            .add_fact(
+                "rkey1".to_string(),
+                make_fact("category", vec!["did:a", "protocol_design"]),
+                "cid1".to_string(),
+            )
+            .await;
+        cache
+            .add_fact(
+                "rkey2".to_string(),
+                make_fact("category", vec!["did:b", "social"]),
+                "cid2".to_string(),
+            )
+            .await;
+        cache
+            .add_fact(
+                "rkey3".to_string(),
+                make_fact("category", vec!["did:c", "protocol_design"]),
+                "cid3".to_string(),
+            )
+            .await;
+        cache
+            .add_fact(
+                "rkey4".to_string(),
+                make_fact("category", vec!["did:d", "governance"]),
+                "cid4".to_string(),
+            )
+            .await;
+
+        // Query with constant filter - should only return protocol_design rows
+        // Note: category now has rkey as last arg, so use _ to ignore it
+        let result = cache
+            .execute_query(
+                "filtered(X)",
+                Some(r#"filtered(X) :- category(X, "protocol_design", _)."#),
+            )
+            .await
+            .unwrap();
+
+        // BUG: Without fix, this returns ALL 4 rows
+        // FIXED: Should return only 2 rows (did:a and did:c)
+        assert_eq!(
+            result.len(),
+            2,
+            "Expected 2 results for protocol_design filter, got {}",
+            result.len()
+        );
+
+        let dids: Vec<&str> = result.iter().map(|r| r[0].as_str()).collect();
+        assert!(dids.contains(&"did:a"));
+        assert!(dids.contains(&"did:c"));
+        assert!(!dids.contains(&"did:b")); // social
+        assert!(!dids.contains(&"did:d")); // governance
+    }
+
+    #[tokio::test]
+    async fn test_extra_rules_multiple_constants() {
+        // Test with multiple constant filters in same rule
+        let cache = DatalogCache::new_temp().unwrap();
+
+        cache
+            .add_fact(
+                "rkey1".to_string(),
+                make_fact("triple", vec!["a", "type", "person"]),
+                "cid1".to_string(),
+            )
+            .await;
+        cache
+            .add_fact(
+                "rkey2".to_string(),
+                make_fact("triple", vec!["b", "type", "org"]),
+                "cid2".to_string(),
+            )
+            .await;
+        cache
+            .add_fact(
+                "rkey3".to_string(),
+                make_fact("triple", vec!["c", "status", "active"]),
+                "cid3".to_string(),
+            )
+            .await;
+
+        // Note: triple now has rkey as last arg, so use _ to ignore it
+        let result = cache
+            .execute_query(
+                "person(X)",
+                Some(r#"person(X) :- triple(X, "type", "person", _)."#),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0][0], "a");
+    }
+
+    #[tokio::test]
+    async fn test_extra_rules_without_constants_still_works() {
+        // Regression test: extra rules without constants should still work
+        // Note: using "link" instead of "follows" since "follows" is a derived predicate
+        let cache = DatalogCache::new_temp().unwrap();
+
+        cache
+            .add_fact(
+                "rkey1".to_string(),
+                make_fact("link", vec!["a", "b"]),
+                "cid1".to_string(),
+            )
+            .await;
+        cache
+            .add_fact(
+                "rkey2".to_string(),
+                make_fact("link", vec!["b", "c"]),
+                "cid2".to_string(),
+            )
+            .await;
+
+        // Note: link now has rkey as last arg, so use _ to ignore it
+        let result = cache
+            .execute_query(
+                "reachable(X, Y)",
+                Some("reachable(X, Y) :- link(X, Y, _)."),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_created_at_temporal_query() {
+        let cache = DatalogCache::new_temp().unwrap();
+
+        // Add a fact
+        cache
+            .add_fact(
+                "rkey1".to_string(),
+                make_fact("knows", vec!["alice", "bob"]),
+                "cid1".to_string(),
+            )
+            .await;
+
+        // Query for recent facts (after year 2020)
+        let result = cache
+            .execute_query(
+                "recent(R)",
+                Some(r#"recent(R) :- _created_at(R, T), T > "2020-01-01T00:00:00Z"."#),
+            )
+            .await
+            .unwrap();
+
+        // Should find the fact we just created
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0][0], "rkey1");
+    }
+
+    #[tokio::test]
+    async fn test_created_at_file_generation() {
+        let cache = DatalogCache::new_temp().unwrap();
+
+        // Add facts
+        cache
+            .add_fact(
+                "rkey1".to_string(),
+                make_fact("follows", vec!["did:a", "did:b"]),
+                "cid1".to_string(),
+            )
+            .await;
+        cache
+            .add_fact(
+                "rkey2".to_string(),
+                make_fact("follows", vec!["did:b", "did:c"]),
+                "cid2".to_string(),
+            )
+            .await;
+
+        // Flush to generate files
+        cache.flush_dirty_predicates().await.unwrap();
+
+        // Check _created_at.facts exists and has correct format
+        let created_at_path = cache.fact_dir.join("_created_at.facts");
+        let content = std::fs::read_to_string(&created_at_path).unwrap();
+
+        // Should have entries for both facts
+        assert!(content.contains("rkey1\t"));
+        assert!(content.contains("rkey2\t"));
+
+        // Each line should have ISO8601 timestamp format
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            assert_eq!(parts.len(), 2);
+            let timestamp = parts[1];
+            assert!(timestamp.contains('T'), "timestamp should be ISO8601 format");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extra_facts_ephemeral() {
+        let cache = DatalogCache::new_temp().unwrap();
+
+        // Create a durable rule that uses ephemeral predicates
+        // Query with ephemeral facts injected at query time
+        let extra_facts = vec![
+            r#"thread_depth("at://test/thread", "7")"#.to_string(),
+            r#"my_reply_count("at://test/thread", "4")"#.to_string(),
+        ];
+
+        let result = cache
+            .execute_query_with_facts(
+                "should_not_reply(T)",
+                Some(r#"should_not_reply(T) :- thread_depth(T, D), D > "5", my_reply_count(T, C), C > "3"."#),
+                Some(&extra_facts),
+            )
+            .await
+            .unwrap();
+
+        // Should match since depth=7>5 and reply_count=4>3
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0][0], "at://test/thread");
+    }
+
+    #[tokio::test]
+    async fn test_extra_facts_no_match() {
+        let cache = DatalogCache::new_temp().unwrap();
+
+        // Ephemeral facts that don't satisfy the rule
+        let extra_facts = vec![
+            r#"thread_depth("at://test/thread", "3")"#.to_string(), // depth=3, not > 5
+            r#"my_reply_count("at://test/thread", "4")"#.to_string(),
+        ];
+
+        let result = cache
+            .execute_query_with_facts(
+                "should_not_reply(T)",
+                Some(r#"should_not_reply(T) :- thread_depth(T, D), D > "5", my_reply_count(T, C), C > "3"."#),
+                Some(&extra_facts),
+            )
+            .await
+            .unwrap();
+
+        // Should not match since depth=3 is not > 5
+        assert_eq!(result.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_extra_facts_combined_with_durable() {
+        let cache = DatalogCache::new_temp().unwrap();
+
+        // Add a durable fact
+        cache
+            .add_fact(
+                "rkey1".to_string(),
+                make_fact("interested_in", vec!["did:test", "rust"]),
+                "cid1".to_string(),
+            )
+            .await;
+
+        // Inject ephemeral context
+        let extra_facts = vec![r#"current_topic("rust")"#.to_string()];
+
+        // Note: interested_in now has rkey as last arg, so use _ to ignore it
+        let result = cache
+            .execute_query_with_facts(
+                "relevant_interest(Who, Topic)",
+                Some(r#"relevant_interest(Who, Topic) :- interested_in(Who, Topic, _), current_topic(Topic)."#),
+                Some(&extra_facts),
+            )
+            .await
+            .unwrap();
+
+        // Should find the match combining durable and ephemeral facts
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0][0], "did:test");
+        assert_eq!(result[0][1], "rust");
+    }
+
+    #[tokio::test]
+    async fn test_extra_facts_direct_query() {
+        // Test querying the extra_facts predicate directly
+        let cache = DatalogCache::new_temp().unwrap();
+
+        // Add a durable placeholder fact
+        cache
+            .add_fact(
+                "rkey1".to_string(),
+                make_fact("thread_depth", vec!["at://placeholder", "0"]),
+                "cid1".to_string(),
+            )
+            .await;
+
+        // Inject ephemeral fact for same predicate (must include rkey placeholder)
+        let extra_facts = vec![r#"thread_depth("at://test/uri", "7", "ephemeral")"#.to_string()];
+
+        // Query the predicate directly - should see BOTH facts
+        // Note: thread_depth now has rkey as last arg, use R variable to capture it
+        let result = cache
+            .execute_query_with_facts("thread_depth(X, Y, R)", None, Some(&extra_facts))
+            .await
+            .unwrap();
+
+        // Should have both the durable and ephemeral facts
+        assert_eq!(result.len(), 2, "Expected 2 results (durable + ephemeral), got {:?}", result);
+
+        let uris: Vec<&str> = result.iter().map(|r| r[0].as_str()).collect();
+        assert!(uris.contains(&"at://placeholder"), "Missing durable fact");
+        assert!(uris.contains(&"at://test/uri"), "Missing ephemeral fact");
+    }
+
+    #[tokio::test]
+    async fn test_extra_facts_with_rules_and_declarations() {
+        // Test the full scenario: extra_facts + extra_rules with declarations
+        let cache = DatalogCache::new_temp().unwrap();
+
+        let extra_facts = vec![
+            r#"thread_depth("at://test/thread", "7")"#.to_string(),
+            r#"reply_cnt("at://test/thread", "4")"#.to_string(),
+        ];
+
+        // Include declarations in extra_rules (multi-line)
+        // Note: avoid reserved words like "count" in parameter names
+        let extra_rules = r#".decl thread_depth(uri: symbol, depth: symbol)
+.decl reply_cnt(uri: symbol, cnt: symbol)
+test_result(Uri) :- thread_depth(Uri, D), D > "5", reply_cnt(Uri, C), C > "3"."#;
+
+        let result = cache
+            .execute_query_with_facts("test_result(X)", Some(extra_rules), Some(&extra_facts))
+            .await
+            .unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0][0], "at://test/thread");
     }
 }

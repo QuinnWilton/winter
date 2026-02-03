@@ -59,6 +59,7 @@ impl FactExtractor {
         let mut confidence_file = File::create(output_dir.join("_confidence.facts"))?;
         let mut source_file = File::create(output_dir.join("_source.facts"))?;
         let mut supersedes_file = File::create(output_dir.join("_supersedes.facts"))?;
+        let mut created_at_file = File::create(output_dir.join("_created_at.facts"))?;
 
         for item in facts {
             let fact = &item.value;
@@ -78,14 +79,16 @@ impl FactExtractor {
             }
 
             // Write to current predicate file (only non-superseded facts)
+            // Format: args..., rkey (rkey at end)
             if is_current {
                 let file = current_files.get_mut(predicate).unwrap();
-                writeln!(file, "{}", args)?;
+                writeln!(file, "{}\t{}", args, rkey)?;
             }
 
-            // Write to _all_{predicate} file (all facts with rkey prefix)
+            // Write to _all_{predicate} file (all facts with rkey at end)
+            // Format: args..., rkey (rkey at end, same as current)
             let all_file = all_files.get_mut(predicate).unwrap();
-            writeln!(all_file, "{}\t{}", rkey, args)?;
+            writeln!(all_file, "{}\t{}", args, rkey)?;
 
             // Write to _fact.facts (rkey, predicate, cid)
             writeln!(fact_file, "{}\t{}\t{}", rkey, predicate, cid)?;
@@ -108,11 +111,14 @@ impl FactExtractor {
             {
                 writeln!(supersedes_file, "{}\t{}", rkey, old_rkey)?;
             }
+
+            // Write to _created_at.facts (dense - every fact)
+            writeln!(created_at_file, "{}\t{}", rkey, fact.created_at.to_rfc3339())?;
         }
 
         Ok(ExtractResult {
             predicates,
-            meta_relations: vec!["_fact", "_confidence", "_source", "_supersedes"],
+            meta_relations: vec!["_fact", "_confidence", "_source", "_supersedes", "_created_at"],
         })
     }
 
@@ -138,22 +144,28 @@ impl FactExtractor {
         declarations.push_str(
             ".decl _fact(rkey: symbol, predicate: symbol, cid: symbol)\n\
              .input _fact\n\n\
-             .decl _confidence(rkey: symbol, value: float)\n\
+             .decl _confidence(rkey: symbol, value: symbol)\n\
              .input _confidence\n\n\
              .decl _source(rkey: symbol, source_cid: symbol)\n\
              .input _source\n\n\
              .decl _supersedes(new_rkey: symbol, old_rkey: symbol)\n\
-             .input _supersedes\n\n",
+             .input _supersedes\n\n\
+             .decl _created_at(rkey: symbol, timestamp: symbol)\n\
+             .input _created_at\n\n",
         );
         declared_set.insert("_fact".to_string());
         declared_set.insert("_confidence".to_string());
         declared_set.insert("_source".to_string());
         declared_set.insert("_supersedes".to_string());
+        declared_set.insert("_created_at".to_string());
 
-        // User predicates (current facts only) and _all_{predicate} (all facts with rkey)
+        // User predicates (current facts only) and _all_{predicate} (all facts with rkey at end)
         for (predicate, arity) in arities {
-            // Current predicate (no rkey prefix)
-            let params: Vec<String> = (0..arity).map(|i| format!("arg{}: symbol", i)).collect();
+            // Current predicate (with rkey suffix)
+            let params: Vec<String> = (0..arity)
+                .map(|i| format!("arg{}: symbol", i))
+                .chain(std::iter::once("rkey: symbol".to_string()))
+                .collect();
             declarations.push_str(&format!(
                 ".decl {}({})\n.input {}\n\n",
                 predicate,
@@ -162,9 +174,10 @@ impl FactExtractor {
             ));
             declared_set.insert(predicate.to_string());
 
-            // _all_{predicate} (with rkey prefix)
-            let all_params: Vec<String> = std::iter::once("rkey: symbol".to_string())
-                .chain((0..arity).map(|i| format!("arg{}: symbol", i)))
+            // _all_{predicate} (with rkey at end, same format as current)
+            let all_params: Vec<String> = (0..arity)
+                .map(|i| format!("arg{}: symbol", i))
+                .chain(std::iter::once("rkey: symbol".to_string()))
                 .collect();
             let all_name = format!("_all_{}", predicate);
             declarations.push_str(&format!(
@@ -195,22 +208,28 @@ impl FactExtractor {
         declarations.push_str(
             ".decl _fact(rkey: symbol, predicate: symbol, cid: symbol)\n\
              .input _fact\n\n\
-             .decl _confidence(rkey: symbol, value: float)\n\
+             .decl _confidence(rkey: symbol, value: symbol)\n\
              .input _confidence\n\n\
              .decl _source(rkey: symbol, source_cid: symbol)\n\
              .input _source\n\n\
              .decl _supersedes(new_rkey: symbol, old_rkey: symbol)\n\
-             .input _supersedes\n\n",
+             .input _supersedes\n\n\
+             .decl _created_at(rkey: symbol, timestamp: symbol)\n\
+             .input _created_at\n\n",
         );
         declared_set.insert("_fact".to_string());
         declared_set.insert("_confidence".to_string());
         declared_set.insert("_source".to_string());
         declared_set.insert("_supersedes".to_string());
+        declared_set.insert("_created_at".to_string());
 
-        // User predicates (current facts only) and _all_{predicate} (all facts with rkey)
+        // User predicates (current facts only) and _all_{predicate} (all facts with rkey at end)
         for (predicate, &arity) in arities {
-            // Current predicate (no rkey prefix)
-            let params: Vec<String> = (0..arity).map(|i| format!("arg{}: symbol", i)).collect();
+            // Current predicate (with rkey suffix)
+            let params: Vec<String> = (0..arity)
+                .map(|i| format!("arg{}: symbol", i))
+                .chain(std::iter::once("rkey: symbol".to_string()))
+                .collect();
             declarations.push_str(&format!(
                 ".decl {}({})\n.input {}\n\n",
                 predicate,
@@ -219,9 +238,10 @@ impl FactExtractor {
             ));
             declared_set.insert(predicate.clone());
 
-            // _all_{predicate} (with rkey prefix)
-            let all_params: Vec<String> = std::iter::once("rkey: symbol".to_string())
-                .chain((0..arity).map(|i| format!("arg{}: symbol", i)))
+            // _all_{predicate} (with rkey at end, same format as current)
+            let all_params: Vec<String> = (0..arity)
+                .map(|i| format!("arg{}: symbol", i))
+                .chain(std::iter::once("rkey: symbol".to_string()))
                 .collect();
             let all_name = format!("_all_{}", predicate);
             declarations.push_str(&format!(
@@ -262,12 +282,12 @@ impl FactExtractor {
 
             let args = data.fact.args.join("\t");
 
-            // Write to all file (always)
-            writeln!(all_file, "{}\t{}", rkey, args)?;
+            // Write to all file (always, rkey at end)
+            writeln!(all_file, "{}\t{}", args, rkey)?;
 
-            // Write to current file (only if not superseded)
+            // Write to current file (only if not superseded, rkey at end)
             if !data.is_superseded {
-                writeln!(current_file, "{}", args)?;
+                writeln!(current_file, "{}\t{}", args, rkey)?;
             }
         }
 
@@ -341,7 +361,7 @@ mod tests {
         assert!(result.predicates.contains(&"interested_in".to_string()));
         assert_eq!(
             result.meta_relations,
-            vec!["_fact", "_confidence", "_source", "_supersedes"]
+            vec!["_fact", "_confidence", "_source", "_supersedes", "_created_at"]
         );
 
         // Check current facts file
@@ -524,27 +544,32 @@ mod tests {
         // Metadata relations
         assert!(decls.contains(".decl _fact(rkey: symbol, predicate: symbol, cid: symbol)"));
         assert!(decls.contains(".input _fact"));
-        assert!(decls.contains(".decl _confidence(rkey: symbol, value: float)"));
+        assert!(decls.contains(".decl _confidence(rkey: symbol, value: symbol)"));
         assert!(decls.contains(".decl _source(rkey: symbol, source_cid: symbol)"));
         assert!(decls.contains(".decl _supersedes(new_rkey: symbol, old_rkey: symbol)"));
 
-        // User predicates (current)
-        assert!(decls.contains(".decl follows(arg0: symbol, arg1: symbol)"));
+        // User predicates (current, with rkey suffix)
+        assert!(decls.contains(".decl follows(arg0: symbol, arg1: symbol, rkey: symbol)"));
         assert!(decls.contains(".input follows"));
-        assert!(decls.contains(".decl interested_in(arg0: symbol, arg1: symbol)"));
+        assert!(decls.contains(".decl interested_in(arg0: symbol, arg1: symbol, rkey: symbol)"));
 
-        // _all_ predicates (with rkey)
-        assert!(decls.contains(".decl _all_follows(rkey: symbol, arg0: symbol, arg1: symbol)"));
+        // _all_ predicates (with rkey at end, same format as current)
+        assert!(decls.contains(".decl _all_follows(arg0: symbol, arg1: symbol, rkey: symbol)"));
         assert!(decls.contains(".input _all_follows"));
         assert!(
-            decls.contains(".decl _all_interested_in(rkey: symbol, arg0: symbol, arg1: symbol)")
+            decls.contains(".decl _all_interested_in(arg0: symbol, arg1: symbol, rkey: symbol)")
         );
+
+        // _created_at declaration
+        assert!(decls.contains(".decl _created_at(rkey: symbol, timestamp: symbol)"));
+        assert!(decls.contains(".input _created_at"));
 
         // Check declared set
         assert!(declared.contains("_fact"));
         assert!(declared.contains("_confidence"));
         assert!(declared.contains("_source"));
         assert!(declared.contains("_supersedes"));
+        assert!(declared.contains("_created_at"));
         assert!(declared.contains("follows"));
         assert!(declared.contains("_all_follows"));
         assert!(declared.contains("interested_in"));
@@ -552,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn test_all_files_include_rkey_prefix() {
+    fn test_all_files_include_rkey_suffix() {
         let dir = tempdir().unwrap();
 
         let facts = vec![make_fact_with_meta(
@@ -567,7 +592,41 @@ mod tests {
         FactExtractor::extract_to_dir(&facts, dir.path()).unwrap();
 
         let all = std::fs::read_to_string(dir.path().join("_all_follows.facts")).unwrap();
-        // Format: rkey\targ0\targ1
-        assert!(all.contains("rkey-my-cid\tdid:a\tdid:b"));
+        // Format: arg0\targ1\trkey (rkey at end)
+        assert!(all.contains("did:a\tdid:b\trkey-my-cid"));
+    }
+
+    #[test]
+    fn test_created_at_dense_output() {
+        let dir = tempdir().unwrap();
+
+        let facts = vec![
+            make_fact_with_meta("follows", vec!["did:a", "did:b"], None, None, None, "cid1"),
+            make_fact_with_meta("follows", vec!["did:b", "did:c"], None, None, None, "cid2"),
+            make_fact_with_meta(
+                "interested_in",
+                vec!["did:a", "rust"],
+                None,
+                None,
+                None,
+                "cid3",
+            ),
+        ];
+
+        FactExtractor::extract_to_dir(&facts, dir.path()).unwrap();
+
+        let created_at = std::fs::read_to_string(dir.path().join("_created_at.facts")).unwrap();
+        // Every fact should have an entry (dense relation)
+        assert!(created_at.contains("rkey-cid1\t"));
+        assert!(created_at.contains("rkey-cid2\t"));
+        assert!(created_at.contains("rkey-cid3\t"));
+
+        // Verify ISO8601 format (contains 'T' separator and ends with 'Z' or offset)
+        for line in created_at.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            assert_eq!(parts.len(), 2);
+            let timestamp = parts[1];
+            assert!(timestamp.contains('T'), "timestamp should be ISO8601 format");
+        }
     }
 }

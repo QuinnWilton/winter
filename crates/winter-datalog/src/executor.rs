@@ -59,10 +59,15 @@ impl SouffleExecutor {
 
         match result {
             Ok(Ok(output)) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
                 if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
                     warn!(stderr = %stderr, "Soufflé execution failed");
                     return Err(DatalogError::Execution(stderr.to_string()));
+                }
+
+                // Log stderr warnings even on success
+                if !stderr.is_empty() {
+                    debug!(stderr = %stderr, "Soufflé stderr (non-fatal)");
                 }
 
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -88,24 +93,27 @@ impl SouffleExecutor {
     ///
     /// Soufflé's `-D-` output format includes relation name headers:
     /// ```text
-    /// ===============
+    /// ---------------
     /// relationName
+    /// col1
+    /// col2
     /// ===============
     /// tuple1_col1\ttuple1_col2
+    /// ===============
     /// ```
-    /// This function filters out the separator lines and relation name headers,
+    /// This function filters out the separator lines, relation name, and column headers,
     /// returning only the actual tuple data.
+    ///
+    /// Also handles raw TSV data without headers (for backwards compatibility).
     pub fn parse_output(output: &str) -> Vec<Vec<String>> {
         let mut results = Vec::new();
 
         // State machine for parsing Soufflé output:
-        // - ExpectingRelationName: just saw first separator, next is relation name
-        // - ExpectingDataSeparator: saw relation name, next separator starts data section
-        // - InData: collecting data tuples until next separator
+        // - InData: collecting data tuples (initial state for raw TSV)
+        // - InHeader: skipping relation name and column headers until === separator
         enum State {
             InData,
-            ExpectingRelationName,
-            ExpectingDataSeparator,
+            InHeader,
         }
 
         let mut state = State::InData;
@@ -118,27 +126,27 @@ impl SouffleExecutor {
                 continue;
             }
 
-            if line.starts_with("===") {
+            // Check for separator lines (--- or ===)
+            let is_dash_separator = line.chars().all(|c| c == '-') && line.len() >= 3;
+            let is_equals_separator = line.chars().all(|c| c == '=') && line.len() >= 3;
+
+            if is_dash_separator {
+                // Start of a new relation header section
+                state = State::InHeader;
+                continue;
+            }
+
+            if is_equals_separator {
                 state = match state {
-                    State::InData => State::ExpectingRelationName,
-                    State::ExpectingRelationName => State::ExpectingRelationName, // Double separator
-                    State::ExpectingDataSeparator => State::InData, // End of header, data follows
+                    State::InHeader => State::InData, // End of header, data follows
+                    State::InData => State::InHeader, // Start of next relation's header
                 };
                 continue;
             }
 
             match state {
-                State::ExpectingRelationName => {
-                    // This line is the relation name, skip it
-                    state = State::ExpectingDataSeparator;
-                }
-                State::ExpectingDataSeparator => {
-                    // Unexpected non-separator, treat as data (fallback)
-                    state = State::InData;
-                    let tuple: Vec<String> = line.split('\t').map(String::from).collect();
-                    if !tuple.is_empty() && !tuple[0].is_empty() {
-                        results.push(tuple);
-                    }
+                State::InHeader => {
+                    // Skip relation name and column headers
                 }
                 State::InData => {
                     // Soufflé outputs tab-separated values

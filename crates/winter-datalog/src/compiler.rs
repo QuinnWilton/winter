@@ -111,9 +111,36 @@ impl RuleCompiler {
         (declarations, declared_set)
     }
 
+    /// Parse head predicates from raw extra_rules text.
+    ///
+    /// Extracts predicate names and arities from rule heads like:
+    /// "test(X) :- foo(X)." -> [("test", 1)]
+    /// "bar(A, B) :- baz(A), qux(B)." -> [("bar", 2)]
+    pub fn parse_extra_rules_heads(extra_rules: &str) -> Vec<(String, usize)> {
+        let mut heads = Vec::new();
+
+        for line in extra_rules.lines() {
+            let line = line.trim();
+            // Skip comments and empty lines
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+
+            // Find rule separator
+            if let Some(sep_idx) = line.find(":-") {
+                let head_part = line[..sep_idx].trim();
+                if let Some((name, arity)) = Self::parse_head(head_part) {
+                    heads.push((name, arity));
+                }
+            }
+        }
+
+        heads
+    }
+
     /// Parse a rule head to extract predicate name and arity.
     /// e.g., "mutual_follow(X, Y)" -> Some(("mutual_follow", 2))
-    fn parse_head(head: &str) -> Option<(String, usize)> {
+    pub fn parse_head(head: &str) -> Option<(String, usize)> {
         let paren_idx = head.find('(')?;
         let name = head[..paren_idx].trim().to_string();
         if name.is_empty() {
@@ -356,5 +383,43 @@ mod tests {
         let output = RuleCompiler::generate_output_declaration("test_pred", 1, None);
         assert!(output.contains(".decl test_pred("));
         assert!(output.contains(".output test_pred"));
+    }
+
+    #[test]
+    fn test_parse_extra_rules_heads_single() {
+        let heads = RuleCompiler::parse_extra_rules_heads("test(X) :- foo(X).");
+        assert_eq!(heads, vec![("test".to_string(), 1)]);
+    }
+
+    #[test]
+    fn test_parse_extra_rules_heads_multiple() {
+        let heads = RuleCompiler::parse_extra_rules_heads(
+            "test(X) :- foo(X).\nbar(A, B) :- baz(A), qux(B).",
+        );
+        assert_eq!(heads.len(), 2);
+        assert!(heads.contains(&("test".to_string(), 1)));
+        assert!(heads.contains(&("bar".to_string(), 2)));
+    }
+
+    #[test]
+    fn test_parse_extra_rules_heads_with_comments() {
+        let heads = RuleCompiler::parse_extra_rules_heads(
+            "// This is a comment\ntest(X) :- foo(X).\n// Another comment",
+        );
+        assert_eq!(heads, vec![("test".to_string(), 1)]);
+    }
+
+    #[test]
+    fn test_parse_extra_rules_heads_empty() {
+        let heads = RuleCompiler::parse_extra_rules_heads("");
+        assert!(heads.is_empty());
+    }
+
+    #[test]
+    fn test_parse_extra_rules_heads_with_constant() {
+        // The key case: rule with constant argument in body
+        let heads =
+            RuleCompiler::parse_extra_rules_heads(r#"filtered(X) :- category(X, "protocol_design")."#);
+        assert_eq!(heads, vec![("filtered".to_string(), 1)]);
     }
 }
