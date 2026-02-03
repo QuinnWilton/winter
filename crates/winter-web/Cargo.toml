@@ -43,8 +43,12 @@ chrono = { workspace = true }
 # Logging
 tracing = { workspace = true }
 
+# Regular expressions
+regex = { workspace = true }
+
 # Internal
 winter-atproto = { workspace = true }
+winter-mcp = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

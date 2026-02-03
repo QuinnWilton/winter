@@ -12,4 +12,4 @@ mod sse;
 mod thought_stream;
 
 pub use error::WebError;
-pub use routes::create_router;
+pub use routes::{create_router, create_router_with_secrets};
