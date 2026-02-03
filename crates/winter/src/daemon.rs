@@ -605,6 +605,7 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
                                 kind: ThoughtKind::Response,
                                 content: truncate_chars(&response, 500),
                                 trigger: trigger_str.clone(),
+                                tags: vec![],
                                 duration_ms: Some(duration_ms),
                                 created_at: chrono::Utc::now(),
                             };
@@ -629,6 +630,7 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
                             kind: ThoughtKind::Error,
                             content: format!("Job '{}' failed: {}", job.name, e),
                             trigger: trigger_str.clone(),
+                            tags: vec![],
                             duration_ms: Some(duration_ms),
                             created_at: chrono::Utc::now(),
                         };
@@ -1072,6 +1074,7 @@ async fn handle_notification(
         kind: ThoughtKind::Insight,
         content: content.clone(),
         trigger: Some(trigger_str.clone()),
+        tags: vec![],
         duration_ms: None,
         created_at: chrono::Utc::now(),
     };
@@ -1138,6 +1141,7 @@ async fn handle_notification(
                 kind: ThoughtKind::Response,
                 content: truncate_chars(&response, 500),
                 trigger: Some(trigger_str.clone()),
+                tags: vec![],
                 duration_ms: Some(duration_ms),
                 created_at: chrono::Utc::now(),
             };
@@ -1163,6 +1167,7 @@ async fn handle_notification(
                 kind: ThoughtKind::Error,
                 content: format!("Failed to handle notification: {}", e),
                 trigger: Some(trigger_str.clone()),
+                tags: vec![],
                 duration_ms: Some(start.elapsed().as_millis() as u64),
                 created_at: chrono::Utc::now(),
             };
@@ -1204,6 +1209,7 @@ async fn handle_dm(
         kind: ThoughtKind::Insight,
         content: content.clone(),
         trigger: Some(trigger_str.clone()),
+        tags: vec![],
         duration_ms: None,
         created_at: chrono::Utc::now(),
     };
@@ -1255,6 +1261,7 @@ async fn handle_dm(
                 kind: ThoughtKind::Response,
                 content: truncate_chars(&response, 500),
                 trigger: Some(trigger_str.clone()),
+                tags: vec![],
                 duration_ms: Some(duration_ms),
                 created_at: chrono::Utc::now(),
             };
@@ -1281,6 +1288,7 @@ async fn handle_dm(
                 kind: ThoughtKind::Error,
                 content: format!("Failed to handle DM: {}", e),
                 trigger: Some(trigger_str.clone()),
+                tags: vec![],
                 duration_ms: Some(start.elapsed().as_millis() as u64),
                 created_at: chrono::Utc::now(),
             };

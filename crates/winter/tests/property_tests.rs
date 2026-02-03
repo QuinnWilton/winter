@@ -213,6 +213,7 @@ proptest! {
             kind: kind.clone(),
             content: content.clone(),
             trigger: trigger.clone(),
+            tags: vec![],
             duration_ms,
             created_at: chrono::Utc::now(),
         };

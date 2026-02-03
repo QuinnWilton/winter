@@ -228,6 +228,7 @@ mod thought_serialization {
                 kind,
                 content: "test".to_string(),
                 trigger: None,
+                tags: vec![],
                 duration_ms: None,
                 created_at: chrono::Utc::now(),
             };
