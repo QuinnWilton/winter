@@ -11,8 +11,12 @@ use serde::de::DeserializeOwned;
 use tracing::{debug, trace, warn};
 
 use crate::{
-    AtprotoError, FACT_COLLECTION, Fact, IDENTITY_COLLECTION, IDENTITY_KEY, Identity,
-    JOB_COLLECTION, Job, NOTE_COLLECTION, Note, RULE_COLLECTION, Rule, THOUGHT_COLLECTION, Thought,
+    AtprotoError, BLOG_COLLECTION, BlogEntry, CustomTool, DIRECTIVE_COLLECTION, DaemonState,
+    Directive, FACT_COLLECTION, FACT_DECLARATION_COLLECTION, FOLLOW_COLLECTION, Fact,
+    FactDeclaration, Follow, IDENTITY_COLLECTION, IDENTITY_KEY, Identity, JOB_COLLECTION, Job,
+    LIKE_COLLECTION, Like, NOTE_COLLECTION, Note, POST_COLLECTION, Post, REPOST_COLLECTION,
+    RULE_COLLECTION, Repost, Rule, STATE_COLLECTION, STATE_KEY, THOUGHT_COLLECTION,
+    TOOL_APPROVAL_COLLECTION, TOOL_COLLECTION, Thought, ToolApproval,
 };
 
 /// Result of parsing a CAR file.
@@ -30,8 +34,34 @@ pub struct CarParseResult {
     pub jobs: HashMap<String, (Job, String)>,
     /// Identity (singleton), if present.
     pub identity: Option<(Identity, String)>,
+    /// Daemon state (singleton), if present.
+    pub daemon_state: Option<(DaemonState, String)>,
     /// The repo revision from the commit.
     pub rev: Option<String>,
+    // =========================================================================
+    // Bluesky records (for derived facts)
+    // =========================================================================
+    /// Follows extracted from the repo, keyed by rkey.
+    pub follows: HashMap<String, (Follow, String)>,
+    /// Likes extracted from the repo, keyed by rkey.
+    pub likes: HashMap<String, (Like, String)>,
+    /// Reposts extracted from the repo, keyed by rkey.
+    pub reposts: HashMap<String, (Repost, String)>,
+    /// Posts extracted from the repo, keyed by rkey.
+    pub posts: HashMap<String, (Post, String)>,
+    // =========================================================================
+    // Winter records (for derived facts)
+    // =========================================================================
+    /// Directives extracted from the repo, keyed by rkey.
+    pub directives: HashMap<String, (Directive, String)>,
+    /// Fact declarations extracted from the repo, keyed by rkey.
+    pub declarations: HashMap<String, (FactDeclaration, String)>,
+    /// Custom tools extracted from the repo, keyed by rkey.
+    pub tools: HashMap<String, (CustomTool, String)>,
+    /// Tool approvals extracted from the repo, keyed by rkey.
+    pub tool_approvals: HashMap<String, (ToolApproval, String)>,
+    /// Blog entries extracted from the repo, keyed by rkey.
+    pub blog_entries: HashMap<String, (BlogEntry, String)>,
 }
 
 /// Parse a CAR file and extract Winter facts and rules.
@@ -97,7 +127,16 @@ pub async fn parse_car(car_bytes: &[u8]) -> Result<CarParseResult, AtprotoError>
         thoughts = result.thoughts.len(),
         notes = result.notes.len(),
         jobs = result.jobs.len(),
+        follows = result.follows.len(),
+        likes = result.likes.len(),
+        reposts = result.reposts.len(),
+        posts = result.posts.len(),
+        directives = result.directives.len(),
+        tools = result.tools.len(),
+        tool_approvals = result.tool_approvals.len(),
+        blog_entries = result.blog_entries.len(),
         has_identity = result.identity.is_some(),
+        has_daemon_state = result.daemon_state.is_some(),
         "extracted records from CAR"
     );
 
@@ -388,9 +427,128 @@ fn extract_record(
                 }
             }
         }
+        STATE_COLLECTION => {
+            // Only parse if rkey is the expected singleton key
+            if rkey == STATE_KEY {
+                match parse_cbor::<DaemonState>(data) {
+                    Ok(state) => {
+                        trace!(followers = state.followers.len(), "extracted daemon state");
+                        result.daemon_state = Some((state, value_cid.to_string()));
+                    }
+                    Err(e) => {
+                        warn!(rkey = %rkey, error = %e, "failed to parse daemon state");
+                    }
+                }
+            }
+        }
+        // =====================================================================
+        // Bluesky collections (for derived facts)
+        // =====================================================================
+        FOLLOW_COLLECTION => match parse_cbor::<Follow>(data) {
+            Ok(follow) => {
+                trace!(rkey = %rkey, subject = %follow.subject, "extracted follow");
+                result
+                    .follows
+                    .insert(rkey.to_string(), (follow, value_cid.to_string()));
+            }
+            Err(e) => {
+                warn!(rkey = %rkey, error = %e, "failed to parse follow");
+            }
+        },
+        LIKE_COLLECTION => match parse_cbor::<Like>(data) {
+            Ok(like) => {
+                trace!(rkey = %rkey, uri = %like.subject.uri, "extracted like");
+                result
+                    .likes
+                    .insert(rkey.to_string(), (like, value_cid.to_string()));
+            }
+            Err(e) => {
+                warn!(rkey = %rkey, error = %e, "failed to parse like");
+            }
+        },
+        REPOST_COLLECTION => match parse_cbor::<Repost>(data) {
+            Ok(repost) => {
+                trace!(rkey = %rkey, uri = %repost.subject.uri, "extracted repost");
+                result
+                    .reposts
+                    .insert(rkey.to_string(), (repost, value_cid.to_string()));
+            }
+            Err(e) => {
+                warn!(rkey = %rkey, error = %e, "failed to parse repost");
+            }
+        },
+        POST_COLLECTION => match parse_cbor::<Post>(data) {
+            Ok(post) => {
+                trace!(rkey = %rkey, "extracted post");
+                result
+                    .posts
+                    .insert(rkey.to_string(), (post, value_cid.to_string()));
+            }
+            Err(e) => {
+                warn!(rkey = %rkey, error = %e, "failed to parse post");
+            }
+        },
+        // =====================================================================
+        // Winter collections (for derived facts)
+        // =====================================================================
+        DIRECTIVE_COLLECTION => match parse_cbor::<Directive>(data) {
+            Ok(directive) => {
+                trace!(rkey = %rkey, kind = %directive.kind, "extracted directive");
+                result
+                    .directives
+                    .insert(rkey.to_string(), (directive, value_cid.to_string()));
+            }
+            Err(e) => {
+                warn!(rkey = %rkey, error = %e, "failed to parse directive");
+            }
+        },
+        FACT_DECLARATION_COLLECTION => match parse_cbor::<FactDeclaration>(data) {
+            Ok(declaration) => {
+                trace!(rkey = %rkey, predicate = %declaration.predicate, "extracted fact declaration");
+                result
+                    .declarations
+                    .insert(rkey.to_string(), (declaration, value_cid.to_string()));
+            }
+            Err(e) => {
+                warn!(rkey = %rkey, error = %e, "failed to parse fact declaration");
+            }
+        },
+        TOOL_COLLECTION => match parse_cbor::<CustomTool>(data) {
+            Ok(tool) => {
+                trace!(rkey = %rkey, name = %tool.name, "extracted custom tool");
+                result
+                    .tools
+                    .insert(rkey.to_string(), (tool, value_cid.to_string()));
+            }
+            Err(e) => {
+                warn!(rkey = %rkey, error = %e, "failed to parse custom tool");
+            }
+        },
+        TOOL_APPROVAL_COLLECTION => match parse_cbor::<ToolApproval>(data) {
+            Ok(approval) => {
+                trace!(rkey = %rkey, tool_rkey = %approval.tool_rkey, "extracted tool approval");
+                result
+                    .tool_approvals
+                    .insert(rkey.to_string(), (approval, value_cid.to_string()));
+            }
+            Err(e) => {
+                warn!(rkey = %rkey, error = %e, "failed to parse tool approval");
+            }
+        },
+        BLOG_COLLECTION => match parse_cbor::<BlogEntry>(data) {
+            Ok(entry) => {
+                trace!(rkey = %rkey, title = %entry.title, "extracted blog entry");
+                result
+                    .blog_entries
+                    .insert(rkey.to_string(), (entry, value_cid.to_string()));
+            }
+            Err(e) => {
+                warn!(rkey = %rkey, error = %e, "failed to parse blog entry");
+            }
+        },
         _ => {
             // Skip other collections
-            trace!(collection = %collection, rkey = %rkey, "skipping non-Winter collection");
+            trace!(collection = %collection, rkey = %rkey, "skipping unknown collection");
         }
     }
 

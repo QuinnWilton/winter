@@ -16,8 +16,11 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::cache::{FirehoseCommit, FirehoseOp, RepoCache, SyncState};
 use crate::{
-    AtprotoError, FACT_COLLECTION, Fact, IDENTITY_COLLECTION, IDENTITY_KEY, Identity,
-    JOB_COLLECTION, Job, NOTE_COLLECTION, Note, RULE_COLLECTION, Rule, THOUGHT_COLLECTION, Thought,
+    AtprotoError, BLOG_COLLECTION, BlogEntry, CustomTool, DIRECTIVE_COLLECTION, Directive,
+    FACT_COLLECTION, FACT_DECLARATION_COLLECTION, FOLLOW_COLLECTION, Fact, FactDeclaration, Follow,
+    IDENTITY_COLLECTION, IDENTITY_KEY, Identity, JOB_COLLECTION, Job, LIKE_COLLECTION, Like,
+    NOTE_COLLECTION, Note, POST_COLLECTION, Post, REPOST_COLLECTION, RULE_COLLECTION, Repost, Rule,
+    THOUGHT_COLLECTION, TOOL_APPROVAL_COLLECTION, TOOL_COLLECTION, Thought, ToolApproval,
 };
 
 /// Default firehose URL (Bluesky relay).
@@ -230,14 +233,8 @@ impl FirehoseClient {
                 }
             };
 
-            // Only care about Winter collections
-            if collection != FACT_COLLECTION
-                && collection != RULE_COLLECTION
-                && collection != THOUGHT_COLLECTION
-                && collection != NOTE_COLLECTION
-                && collection != JOB_COLLECTION
-                && collection != IDENTITY_COLLECTION
-            {
+            // Only care about Winter collections and Bluesky collections we track
+            if !is_tracked_collection(collection) {
                 continue;
             }
 
@@ -333,6 +330,31 @@ fn parse_record_path(path: &str) -> Option<(&str, &str)> {
     Some((collection, rkey))
 }
 
+/// Check if a collection is one we track in the cache.
+fn is_tracked_collection(collection: &str) -> bool {
+    matches!(
+        collection,
+        // Winter collections
+        FACT_COLLECTION
+            | RULE_COLLECTION
+            | THOUGHT_COLLECTION
+            | NOTE_COLLECTION
+            | JOB_COLLECTION
+            | IDENTITY_COLLECTION
+            | DIRECTIVE_COLLECTION
+            | FACT_DECLARATION_COLLECTION
+            | TOOL_COLLECTION
+            | TOOL_APPROVAL_COLLECTION
+            // Bluesky collections
+            | FOLLOW_COLLECTION
+            | LIKE_COLLECTION
+            | REPOST_COLLECTION
+            | POST_COLLECTION
+            // WhiteWind blog
+            | BLOG_COLLECTION
+    )
+}
+
 /// Apply a commit to the cache.
 pub fn apply_commit(cache: &RepoCache, commit: &FirehoseCommit) -> Result<(), AtprotoError> {
     for op in &commit.ops {
@@ -343,60 +365,150 @@ pub fn apply_commit(cache: &RepoCache, commit: &FirehoseCommit) -> Result<(), At
                 cid,
                 record,
             } => {
-                if collection == FACT_COLLECTION {
-                    let fact: Fact = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
-                        AtprotoError::CborDecode(format!("failed to decode fact: {}", e))
-                    })?;
-                    cache.upsert_fact(rkey.clone(), fact, cid.clone());
-                } else if collection == RULE_COLLECTION {
-                    let rule: Rule = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
-                        AtprotoError::CborDecode(format!("failed to decode rule: {}", e))
-                    })?;
-                    cache.upsert_rule(rkey.clone(), rule, cid.clone());
-                } else if collection == THOUGHT_COLLECTION {
-                    let thought: Thought = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
-                        AtprotoError::CborDecode(format!("failed to decode thought: {}", e))
-                    })?;
-                    cache.upsert_thought(rkey.clone(), thought, cid.clone());
-                } else if collection == NOTE_COLLECTION {
-                    let note: Note = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
-                        AtprotoError::CborDecode(format!("failed to decode note: {}", e))
-                    })?;
-                    cache.upsert_note(rkey.clone(), note, cid.clone());
-                } else if collection == JOB_COLLECTION {
-                    let job: Job = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
-                        AtprotoError::CborDecode(format!("failed to decode job: {}", e))
-                    })?;
-                    cache.upsert_job(rkey.clone(), job, cid.clone());
-                } else if collection == IDENTITY_COLLECTION && rkey == IDENTITY_KEY {
-                    let identity: Identity =
-                        serde_ipld_dagcbor::from_slice(record).map_err(|e| {
-                            AtprotoError::CborDecode(format!("failed to decode identity: {}", e))
-                        })?;
-                    // Use a blocking approach since this is sync code
-                    if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                        rt.block_on(cache.set_identity(identity, cid.clone()));
-                    }
-                }
+                apply_create_or_update(cache, collection, rkey, cid, record)?;
             }
             FirehoseOp::Delete { collection, rkey } => {
-                if collection == FACT_COLLECTION {
-                    cache.delete_fact(rkey);
-                } else if collection == RULE_COLLECTION {
-                    cache.delete_rule(rkey);
-                } else if collection == THOUGHT_COLLECTION {
-                    cache.delete_thought(rkey);
-                } else if collection == NOTE_COLLECTION {
-                    cache.delete_note(rkey);
-                } else if collection == JOB_COLLECTION {
-                    cache.delete_job(rkey);
-                }
-                // Identity is a singleton and typically not deleted
+                apply_delete(cache, collection, rkey);
             }
         }
     }
 
     Ok(())
+}
+
+/// Apply a create or update operation to the cache.
+fn apply_create_or_update(
+    cache: &RepoCache,
+    collection: &str,
+    rkey: &str,
+    cid: &str,
+    record: &[u8],
+) -> Result<(), AtprotoError> {
+    match collection {
+        // Winter collections
+        FACT_COLLECTION => {
+            let fact: Fact = serde_ipld_dagcbor::from_slice(record)
+                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode fact: {}", e)))?;
+            cache.upsert_fact(rkey.to_string(), fact, cid.to_string());
+        }
+        RULE_COLLECTION => {
+            let rule: Rule = serde_ipld_dagcbor::from_slice(record)
+                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode rule: {}", e)))?;
+            cache.upsert_rule(rkey.to_string(), rule, cid.to_string());
+        }
+        THOUGHT_COLLECTION => {
+            let thought: Thought = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
+                AtprotoError::CborDecode(format!("failed to decode thought: {}", e))
+            })?;
+            cache.upsert_thought(rkey.to_string(), thought, cid.to_string());
+        }
+        NOTE_COLLECTION => {
+            let note: Note = serde_ipld_dagcbor::from_slice(record)
+                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode note: {}", e)))?;
+            cache.upsert_note(rkey.to_string(), note, cid.to_string());
+        }
+        JOB_COLLECTION => {
+            let job: Job = serde_ipld_dagcbor::from_slice(record)
+                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode job: {}", e)))?;
+            cache.upsert_job(rkey.to_string(), job, cid.to_string());
+        }
+        IDENTITY_COLLECTION => {
+            if rkey == IDENTITY_KEY {
+                let identity: Identity = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
+                    AtprotoError::CborDecode(format!("failed to decode identity: {}", e))
+                })?;
+                // Use a blocking approach since this is sync code
+                if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                    rt.block_on(cache.set_identity(identity, cid.to_string()));
+                }
+            }
+        }
+        DIRECTIVE_COLLECTION => {
+            let directive: Directive = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
+                AtprotoError::CborDecode(format!("failed to decode directive: {}", e))
+            })?;
+            cache.upsert_directive(rkey.to_string(), directive, cid.to_string());
+        }
+        FACT_DECLARATION_COLLECTION => {
+            let declaration: FactDeclaration =
+                serde_ipld_dagcbor::from_slice(record).map_err(|e| {
+                    AtprotoError::CborDecode(format!("failed to decode fact declaration: {}", e))
+                })?;
+            cache.upsert_declaration(rkey.to_string(), declaration, cid.to_string());
+        }
+        TOOL_COLLECTION => {
+            let tool: CustomTool = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
+                AtprotoError::CborDecode(format!("failed to decode custom tool: {}", e))
+            })?;
+            cache.upsert_tool(rkey.to_string(), tool, cid.to_string());
+        }
+        TOOL_APPROVAL_COLLECTION => {
+            let approval: ToolApproval = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
+                AtprotoError::CborDecode(format!("failed to decode tool approval: {}", e))
+            })?;
+            cache.upsert_tool_approval(rkey.to_string(), approval, cid.to_string());
+        }
+        // Bluesky collections
+        FOLLOW_COLLECTION => {
+            let follow: Follow = serde_ipld_dagcbor::from_slice(record)
+                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode follow: {}", e)))?;
+            cache.insert_follow(rkey.to_string(), follow, cid.to_string());
+        }
+        LIKE_COLLECTION => {
+            let like: Like = serde_ipld_dagcbor::from_slice(record)
+                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode like: {}", e)))?;
+            cache.insert_like(rkey.to_string(), like, cid.to_string());
+        }
+        REPOST_COLLECTION => {
+            let repost: Repost = serde_ipld_dagcbor::from_slice(record)
+                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode repost: {}", e)))?;
+            cache.insert_repost(rkey.to_string(), repost, cid.to_string());
+        }
+        POST_COLLECTION => {
+            let post: Post = serde_ipld_dagcbor::from_slice(record)
+                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode post: {}", e)))?;
+            cache.upsert_post(rkey.to_string(), post, cid.to_string());
+        }
+        BLOG_COLLECTION => {
+            let entry: BlogEntry = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
+                AtprotoError::CborDecode(format!("failed to decode blog entry: {}", e))
+            })?;
+            cache.upsert_blog_entry(rkey.to_string(), entry, cid.to_string());
+        }
+        _ => {
+            // Unknown collection - shouldn't happen if is_tracked_collection is correct
+            trace!(collection = %collection, rkey = %rkey, "ignoring unknown collection in apply");
+        }
+    }
+    Ok(())
+}
+
+/// Apply a delete operation to the cache.
+fn apply_delete(cache: &RepoCache, collection: &str, rkey: &str) {
+    match collection {
+        // Winter collections
+        FACT_COLLECTION => cache.delete_fact(rkey),
+        RULE_COLLECTION => cache.delete_rule(rkey),
+        THOUGHT_COLLECTION => cache.delete_thought(rkey),
+        NOTE_COLLECTION => cache.delete_note(rkey),
+        JOB_COLLECTION => cache.delete_job(rkey),
+        DIRECTIVE_COLLECTION => cache.delete_directive(rkey),
+        FACT_DECLARATION_COLLECTION => cache.delete_declaration(rkey),
+        TOOL_COLLECTION => cache.delete_tool(rkey),
+        TOOL_APPROVAL_COLLECTION => cache.delete_tool_approval(rkey),
+        // Bluesky collections
+        FOLLOW_COLLECTION => cache.delete_follow(rkey),
+        LIKE_COLLECTION => cache.delete_like(rkey),
+        REPOST_COLLECTION => cache.delete_repost(rkey),
+        POST_COLLECTION => cache.delete_post(rkey),
+        // WhiteWind blog
+        BLOG_COLLECTION => cache.delete_blog_entry(rkey),
+        // Identity is a singleton and typically not deleted
+        IDENTITY_COLLECTION => {}
+        _ => {
+            trace!(collection = %collection, rkey = %rkey, "ignoring unknown collection in delete");
+        }
+    }
 }
 
 // Firehose frame header (first CBOR value in each message)

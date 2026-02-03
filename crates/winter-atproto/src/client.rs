@@ -172,16 +172,38 @@ impl AtprotoClient {
             .await
             .ok_or_else(|| AtprotoError::Auth("not authenticated".to_string()))?;
 
+        // Serialize record to JSON and add $type field
+        // ATProto records must include $type for proper validation
+        let mut record_value = serde_json::to_value(record)?;
+        if let serde_json::Value::Object(ref mut map) = record_value {
+            map.insert(
+                "$type".to_string(),
+                serde_json::Value::String(collection.to_string()),
+            );
+        }
+
         #[derive(Serialize)]
-        struct CreateRequest<'a, T> {
+        struct CreateRequest<'a> {
             repo: &'a str,
             collection: &'a str,
             #[serde(skip_serializing_if = "Option::is_none")]
             rkey: Option<&'a str>,
-            record: &'a T,
+            record: serde_json::Value,
         }
 
         let url = format!("{}/xrpc/com.atproto.repo.createRecord", self.pds_url);
+
+        let request_body = CreateRequest {
+            repo: &did,
+            collection,
+            rkey,
+            record: record_value,
+        };
+
+        // Debug log the request body for troubleshooting
+        if let Ok(json) = serde_json::to_string(&request_body) {
+            debug!(collection = %collection, body = %json, "creating record");
+        }
 
         for attempt in 0..2 {
             let token = self.access_token().await?;
@@ -190,12 +212,7 @@ impl AtprotoClient {
                 .http
                 .post(&url)
                 .header("Authorization", format!("Bearer {}", token))
-                .json(&CreateRequest {
-                    repo: &did,
-                    collection,
-                    rkey,
-                    record,
-                })
+                .json(&request_body)
                 .send()
                 .await?;
 
@@ -285,8 +302,10 @@ impl AtprotoClient {
         for attempt in 0..2 {
             let token = self.access_token().await?;
 
-            let mut query_params: Vec<(&str, String)> =
-                vec![("repo", did.clone()), ("collection", collection.to_string())];
+            let mut query_params: Vec<(&str, String)> = vec![
+                ("repo", did.clone()),
+                ("collection", collection.to_string()),
+            ];
             if let Some(limit) = limit {
                 query_params.push(("limit", limit.to_string()));
             }
@@ -355,12 +374,22 @@ impl AtprotoClient {
             .await
             .ok_or_else(|| AtprotoError::Auth("not authenticated".to_string()))?;
 
+        // Serialize record to JSON and add $type field
+        // ATProto records must include $type for proper validation
+        let mut record_value = serde_json::to_value(record)?;
+        if let serde_json::Value::Object(ref mut map) = record_value {
+            map.insert(
+                "$type".to_string(),
+                serde_json::Value::String(collection.to_string()),
+            );
+        }
+
         #[derive(Serialize)]
-        struct PutRequest<'a, T> {
+        struct PutRequest<'a> {
             repo: &'a str,
             collection: &'a str,
             rkey: &'a str,
-            record: &'a T,
+            record: serde_json::Value,
         }
 
         let url = format!("{}/xrpc/com.atproto.repo.putRecord", self.pds_url);
@@ -376,7 +405,7 @@ impl AtprotoClient {
                     repo: &did,
                     collection,
                     rkey,
-                    record,
+                    record: record_value.clone(),
                 })
                 .send()
                 .await?;
@@ -447,7 +476,9 @@ impl AtprotoClient {
                         error: xrpc_error.error.clone(),
                         message: xrpc_error.message,
                     };
-                    if attempt == 0 && Self::is_expired_token_error(&err) && self.try_refresh().await
+                    if attempt == 0
+                        && Self::is_expired_token_error(&err)
+                        && self.try_refresh().await
                     {
                         continue;
                     }
@@ -528,7 +559,9 @@ impl AtprotoClient {
                         error: xrpc_error.error.clone(),
                         message: xrpc_error.message,
                     };
-                    if attempt == 0 && Self::is_expired_token_error(&err) && self.try_refresh().await
+                    if attempt == 0
+                        && Self::is_expired_token_error(&err)
+                        && self.try_refresh().await
                     {
                         continue;
                     }

@@ -127,15 +127,65 @@ impl SyncCoordinator {
             .jobs
             .into_iter()
             .map(|(rkey, (job, cid))| (rkey, job, cid));
+        let follows = parse_result
+            .follows
+            .into_iter()
+            .map(|(rkey, (follow, cid))| (rkey, follow, cid));
+        let likes = parse_result
+            .likes
+            .into_iter()
+            .map(|(rkey, (like, cid))| (rkey, like, cid));
+        let reposts = parse_result
+            .reposts
+            .into_iter()
+            .map(|(rkey, (repost, cid))| (rkey, repost, cid));
+        let posts = parse_result
+            .posts
+            .into_iter()
+            .map(|(rkey, (post, cid))| (rkey, post, cid));
+        let directives = parse_result
+            .directives
+            .into_iter()
+            .map(|(rkey, (directive, cid))| (rkey, directive, cid));
+        let declarations = parse_result
+            .declarations
+            .into_iter()
+            .map(|(rkey, (declaration, cid))| (rkey, declaration, cid));
+        let tools = parse_result
+            .tools
+            .into_iter()
+            .map(|(rkey, (tool, cid))| (rkey, tool, cid));
+        let tool_approvals = parse_result
+            .tool_approvals
+            .into_iter()
+            .map(|(rkey, (approval, cid))| (rkey, approval, cid));
+        let blog_entries = parse_result
+            .blog_entries
+            .into_iter()
+            .map(|(rkey, (entry, cid))| (rkey, entry, cid));
 
-        self.cache.populate_from_car_extended(
+        self.cache.populate_from_car_full(
             facts,
             rules,
             thoughts,
             notes,
             jobs,
             parse_result.identity,
+            follows,
+            likes,
+            reposts,
+            posts,
+            directives,
+            declarations,
+            tools,
+            tool_approvals,
+            blog_entries,
         );
+
+        // Populate daemon state if present (contains followers list)
+        if let Some((state, cid)) = parse_result.daemon_state {
+            self.cache.set_daemon_state(state, cid).await;
+        }
 
         info!(
             facts = self.cache.fact_count(),
