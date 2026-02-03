@@ -1,7 +1,8 @@
 [Unit]
 Description=Winter - Autonomous Bluesky Agent
-After=network-online.target
+After=network-online.target winter-web.service
 Wants=network-online.target
+Requires=winter-web.service
 
 [Service]
 Type=simple
@@ -16,13 +17,23 @@ StandardError=journal
 
 # Environment
 Environment=RUST_LOG=winter=info
+Environment=WINTER_SECRETS_PATH=/opt/winter/secrets.json
 EnvironmentFile=/opt/winter/.env
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=read-only
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
 ReadWritePaths=/opt/winter
 
 [Install]

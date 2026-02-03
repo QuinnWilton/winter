@@ -27,6 +27,12 @@ services:
       dockerfile: docker/Dockerfile
     container_name: winter-web
     restart: unless-stopped
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     ports:
       - "8080:8080"
     environment:
@@ -34,7 +40,11 @@ services:
       - WINTER_HANDLE=${WINTER_HANDLE}
       - WINTER_APP_PASSWORD=${WINTER_APP_PASSWORD}
       - WINTER_FIREHOSE_URL=${WINTER_FIREHOSE_URL:-wss://bsky.network}
+      - WINTER_WEB_URL=${WINTER_WEB_URL:-http://localhost:8080}
+      - WINTER_SECRETS_PATH=/home/winter/.config/winter/secrets.json
       - RUST_LOG=winter=info,winter_web=debug
+    volumes:
+      - ${HOME}/.config/winter:/home/winter/.config/winter
     command: ["winter", "web", "--port", "8080"]
 
   winter:
@@ -43,12 +53,26 @@ services:
       dockerfile: docker/Dockerfile
     container_name: winter-daemon
     restart: unless-stopped
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     environment:
       - WINTER_PDS_URL=${WINTER_PDS_URL}
       - WINTER_HANDLE=${WINTER_HANDLE}
       - WINTER_APP_PASSWORD=${WINTER_APP_PASSWORD}
       - CLAUDE_CODE_OAUTH_TOKEN=${CLAUDE_CODE_OAUTH_TOKEN}
+      - WINTER_WEB_URL=${WINTER_WEB_URL:-http://localhost:8080}
+      - WINTER_SECRETS_PATH=/home/winter/.config/winter/secrets.json
+      - WINTER_WORKSPACE=/home/winter/workspace
+      - WINTER_FAST_FORWARD=${WINTER_FAST_FORWARD:-}
       - RUST_LOG=winter=info
+    volumes:
+      - ${HOME}/.config/winter:/home/winter/.config/winter
+      - ${HOME}/.winter-workspace:/home/winter/workspace
+      - ${HOME}/.cache/winter:/home/winter/.cache/winter
     command: ["winter", "daemon"]
     depends_on:
       - web

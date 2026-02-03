@@ -15,14 +15,25 @@ StandardOutput=journal
 StandardError=journal
 
 # Environment
-Environment=RUST_LOG=winter=info
+Environment=RUST_LOG=winter=info,winter_web=debug
+Environment=WINTER_SECRETS_PATH=/opt/winter/secrets.json
 EnvironmentFile=/opt/winter/.env
 
 # Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=read-only
 PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+ReadWritePaths=/opt/winter
 
 [Install]
 WantedBy=multi-user.target

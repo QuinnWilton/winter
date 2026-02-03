@@ -66,10 +66,13 @@ COPY templates/ templates/
 # Touch all source files to invalidate cached compilation from stubs
 RUN find crates vendor -name "*.rs" -exec touch {} \;
 
+# Cache bust arg - pass --build-arg CACHE_BUST=$(date +%s) to force rebuild
+ARG CACHE_BUST=1
+
 # Build the actual application
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
+    --mount=type=cache,target=/app/target,id=winter-target-${CACHE_BUST} \
     cargo build --release \
     && cp target/release/winter /app/winter-bin
 
@@ -88,6 +91,7 @@ RUN apt-get update && apt-get install -y \
     mcpp \
     g++ \
     curl \
+    git \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -95,12 +99,18 @@ RUN apt-get update && apt-get install -y \
 RUN npm install -g @anthropic-ai/claude-code \
     && ln -sf "$(npm bin -g)/claude" /usr/local/bin/claude
 
+# Install Deno for custom tool sandboxing
+COPY --from=denoland/deno:bin-2.1.4 /deno /usr/local/bin/deno
+
 COPY --from=souffle-builder /opt/souffle/bin/souffle /usr/local/bin/
 COPY --from=builder /app/winter-bin /usr/local/bin/winter
 
 RUN useradd -m -s /bin/bash winter
 RUN mkdir -p /home/winter/.config/winter
 COPY config/mcp.json /home/winter/.config/winter/mcp.json
+# Create empty secrets file with proper permissions
+RUN echo '{"version":1,"secrets":{}}' > /home/winter/.config/winter/secrets.json \
+    && chmod 600 /home/winter/.config/winter/secrets.json
 RUN chown -R winter:winter /home/winter/.config
 
 USER winter
