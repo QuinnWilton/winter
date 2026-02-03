@@ -25,13 +25,13 @@ pub type JobExecutor =
 
 /// The job scheduler.
 pub struct Scheduler {
-    client: AtprotoClient,
+    client: Arc<AtprotoClient>,
     jobs: Arc<RwLock<Vec<Job>>>,
 }
 
 impl Scheduler {
-    /// Create a new scheduler.
-    pub fn new(client: AtprotoClient) -> Self {
+    /// Create a new scheduler with a shared client.
+    pub fn new(client: Arc<AtprotoClient>) -> Self {
         Self {
             client,
             jobs: Arc::new(RwLock::new(Vec::new())),
@@ -307,17 +307,17 @@ impl Scheduler {
     /// Take the first due job and mark it as running.
     ///
     /// Returns `None` if no jobs are due.
+    /// This operation is atomic - the job is marked as running while holding the lock.
     pub async fn take_due_job(&self) -> Option<Job> {
-        let job = {
-            let jobs = self.jobs.read().await;
-            jobs.iter().find(|j| j.is_due()).cloned()
-        };
+        let mut jobs = self.jobs.write().await;
 
-        if let Some(ref job) = job {
-            self.update_job_status(&job.rkey, JobStatus::Running).await;
+        // Find and claim the first due job atomically
+        if let Some(job) = jobs.iter_mut().find(|j| j.is_due()) {
+            job.status = JobStatus::Running;
+            Some(job.clone())
+        } else {
+            None
         }
-
-        job
     }
 
     /// Sleep until the next job is due.
