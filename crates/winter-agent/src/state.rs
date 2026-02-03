@@ -1,5 +1,7 @@
 //! Daemon state management for Winter.
 
+use std::sync::Arc;
+
 use chrono::Utc;
 use winter_atproto::{AtprotoClient, DaemonState, STATE_COLLECTION, STATE_KEY};
 
@@ -7,12 +9,12 @@ use crate::AgentError;
 
 /// Manages Winter's daemon state record.
 pub struct StateManager {
-    client: AtprotoClient,
+    client: Arc<AtprotoClient>,
 }
 
 impl StateManager {
-    /// Create a new state manager.
-    pub fn new(client: AtprotoClient) -> Self {
+    /// Create a new state manager with a shared client.
+    pub fn new(client: Arc<AtprotoClient>) -> Self {
         Self { client }
     }
 
@@ -30,6 +32,7 @@ impl StateManager {
                 let state = DaemonState {
                     notification_cursor: None,
                     dm_cursor: None,
+                    followers: Vec::new(),
                     created_at: now,
                     last_updated: now,
                 };
@@ -64,6 +67,20 @@ impl StateManager {
     pub async fn set_dm_cursor(&self, cursor: Option<String>) -> Result<(), AgentError> {
         let mut state = self.load().await?;
         state.dm_cursor = cursor;
+        state.last_updated = Utc::now();
+        self.update(&state).await
+    }
+
+    /// Get the followers list.
+    pub async fn get_followers(&self) -> Result<Vec<String>, AgentError> {
+        let state = self.load().await?;
+        Ok(state.followers)
+    }
+
+    /// Set the followers list.
+    pub async fn set_followers(&self, followers: Vec<String>) -> Result<(), AgentError> {
+        let mut state = self.load().await?;
+        state.followers = followers;
         state.last_updated = Utc::now();
         self.update(&state).await
     }

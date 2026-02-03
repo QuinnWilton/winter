@@ -1,18 +1,34 @@
 //! Agent context for Claude prompts.
 
-use winter_atproto::{Identity, Thought};
+use winter_atproto::Facet;
+use winter_atproto::{Directive, Identity, Thought};
 
 /// Context assembled for a Claude prompt.
 #[derive(Debug, Clone)]
 pub struct AgentContext {
     /// Current identity.
     pub identity: Identity,
+    /// Active directives (identity components).
+    pub directives: Vec<Directive>,
     /// Recent thoughts (limited, not all).
     pub recent_thoughts: Vec<Thought>,
     /// Rule heads for querying (e.g., "mutual_follow(X, Y)").
     pub rule_heads: Vec<String>,
+    /// Summary of custom tools available.
+    pub custom_tools: Vec<CustomToolSummary>,
     /// Trigger for this context (notification, job, etc.).
     pub trigger: Option<ContextTrigger>,
+}
+
+/// Summary of a custom tool for prompt context.
+#[derive(Debug, Clone)]
+pub struct CustomToolSummary {
+    /// Tool name.
+    pub name: String,
+    /// Tool description.
+    pub description: String,
+    /// Whether the tool is approved.
+    pub approved: bool,
 }
 
 /// Reference to a post for threading.
@@ -43,6 +59,8 @@ pub enum ContextTrigger {
         /// Root post reference (for threading context).
         /// The original post that started the thread.
         root: Option<PostRef>,
+        /// Rich text facets (mentions, links, tags).
+        facets: Vec<Facet>,
     },
     /// A direct message.
     DirectMessage {
@@ -56,6 +74,8 @@ pub enum ContextTrigger {
         sender_handle: String,
         /// Message text.
         text: String,
+        /// Rich text facets (mentions, links, tags).
+        facets: Vec<Facet>,
     },
     /// A scheduled job.
     Job { id: String, name: String },
@@ -63,15 +83,84 @@ pub enum ContextTrigger {
     Awaken,
 }
 
+/// Scope for filtering thoughts by conversation context.
+///
+/// When multiple workers process notifications concurrently, thoughts need to be
+/// filtered by conversation scope to prevent cross-contamination.
+#[derive(Debug, Clone)]
+pub enum ConversationScope {
+    /// A thread on Bluesky, identified by root post URI.
+    Thread { root_uri: String },
+    /// A direct message conversation.
+    DirectMessage { convo_id: String },
+    /// A scheduled job execution.
+    Job { name: String },
+    /// Global context (awaken cycles) - matches thoughts with no trigger.
+    Global,
+}
+
+impl ContextTrigger {
+    /// Extract the conversation scope for thought filtering.
+    pub fn conversation_scope(&self) -> ConversationScope {
+        match self {
+            ContextTrigger::Notification { root, uri, .. } => {
+                // Use root URI if available, otherwise the post is its own root
+                let root_uri = root
+                    .as_ref()
+                    .map(|r| r.uri.clone())
+                    .unwrap_or_else(|| uri.clone());
+                ConversationScope::Thread { root_uri }
+            }
+            ContextTrigger::DirectMessage { convo_id, .. } => ConversationScope::DirectMessage {
+                convo_id: convo_id.clone(),
+            },
+            ContextTrigger::Job { name, .. } => ConversationScope::Job { name: name.clone() },
+            ContextTrigger::Awaken => ConversationScope::Global,
+        }
+    }
+
+    /// Generate trigger string for thought records.
+    ///
+    /// Format includes root URI for notifications to enable thread-scoped filtering:
+    /// - Notification: `notification:{uri}:root={root_uri}`
+    /// - DM: `dm:{convo_id}:{message_id}`
+    /// - Job: `job:{name}`
+    /// - Awaken: None (global thoughts)
+    pub fn trigger_string(&self) -> Option<String> {
+        match self {
+            ContextTrigger::Notification { uri, root, .. } => {
+                // Enhanced format: include root URI for thread continuity
+                let root_uri = root.as_ref().map(|r| &r.uri).unwrap_or(uri);
+                Some(format!("notification:{}:root={}", uri, root_uri))
+            }
+            ContextTrigger::DirectMessage {
+                convo_id,
+                message_id,
+                ..
+            } => Some(format!("dm:{}:{}", convo_id, message_id)),
+            ContextTrigger::Job { name, .. } => Some(format!("job:{}", name)),
+            ContextTrigger::Awaken => None,
+        }
+    }
+}
+
 impl AgentContext {
     /// Create a new context.
     pub fn new(identity: Identity) -> Self {
         Self {
             identity,
+            directives: Vec::new(),
             recent_thoughts: Vec::new(),
             rule_heads: Vec::new(),
+            custom_tools: Vec::new(),
             trigger: None,
         }
+    }
+
+    /// Add directives.
+    pub fn with_directives(mut self, directives: Vec<Directive>) -> Self {
+        self.directives = directives;
+        self
     }
 
     /// Add recent thoughts.
@@ -83,6 +172,12 @@ impl AgentContext {
     /// Add rule heads (e.g., "mutual_follow(X, Y)") for querying.
     pub fn with_rule_heads(mut self, heads: Vec<String>) -> Self {
         self.rule_heads = heads;
+        self
+    }
+
+    /// Add custom tool summaries.
+    pub fn with_custom_tools(mut self, tools: Vec<CustomToolSummary>) -> Self {
+        self.custom_tools = tools;
         self
     }
 

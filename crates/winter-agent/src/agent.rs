@@ -33,6 +33,9 @@ impl Agent {
             ToolPermission::mcp("winter", "follow_user").to_cli_format(),
             ToolPermission::mcp("winter", "get_timeline").to_cli_format(),
             ToolPermission::mcp("winter", "get_notifications").to_cli_format(),
+            ToolPermission::mcp("winter", "search_posts").to_cli_format(),
+            ToolPermission::mcp("winter", "search_users").to_cli_format(),
+            ToolPermission::mcp("winter", "get_thread_context").to_cli_format(),
             // Winter MCP tools - Facts
             ToolPermission::mcp("winter", "create_fact").to_cli_format(),
             ToolPermission::mcp("winter", "update_fact").to_cli_format(),
@@ -58,7 +61,30 @@ impl Agent {
             // Winter MCP tools - Self
             ToolPermission::mcp("winter", "record_thought").to_cli_format(),
             ToolPermission::mcp("winter", "get_identity").to_cli_format(),
-            ToolPermission::mcp("winter", "update_identity").to_cli_format(),
+            // Winter MCP tools - Directives
+            ToolPermission::mcp("winter", "create_directive").to_cli_format(),
+            ToolPermission::mcp("winter", "update_directive").to_cli_format(),
+            ToolPermission::mcp("winter", "deactivate_directive").to_cli_format(),
+            ToolPermission::mcp("winter", "list_directives").to_cli_format(),
+            // Winter MCP tools - Custom Tools
+            ToolPermission::mcp("winter", "create_custom_tool").to_cli_format(),
+            ToolPermission::mcp("winter", "update_custom_tool").to_cli_format(),
+            ToolPermission::mcp("winter", "list_custom_tools").to_cli_format(),
+            ToolPermission::mcp("winter", "get_custom_tool").to_cli_format(),
+            ToolPermission::mcp("winter", "run_custom_tool").to_cli_format(),
+            ToolPermission::mcp("winter", "delete_custom_tool").to_cli_format(),
+            ToolPermission::mcp("winter", "request_secret").to_cli_format(),
+            ToolPermission::mcp("winter", "list_secrets").to_cli_format(),
+            // Winter MCP tools - PDS Raw Access
+            ToolPermission::mcp("winter", "pds_list_records").to_cli_format(),
+            ToolPermission::mcp("winter", "pds_get_record").to_cli_format(),
+            ToolPermission::mcp("winter", "pds_put_record").to_cli_format(),
+            ToolPermission::mcp("winter", "pds_delete_record").to_cli_format(),
+            // Winter MCP tools - Fact Declarations
+            ToolPermission::mcp("winter", "create_fact_declaration").to_cli_format(),
+            ToolPermission::mcp("winter", "update_fact_declaration").to_cli_format(),
+            ToolPermission::mcp("winter", "delete_fact_declaration").to_cli_format(),
+            ToolPermission::mcp("winter", "list_fact_declarations").to_cli_format(),
             // Built-in Claude Code tools
             "Read".to_string(),
             "WebFetch".to_string(),
