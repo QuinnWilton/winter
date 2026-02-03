@@ -73,6 +73,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Filter by tag"
                     },
+                    "search": {
+                        "type": "string",
+                        "description": "Filter by title or content (case-insensitive substring)"
+                    },
                     "limit": {
                         "type": "integer",
                         "description": "Maximum number of notes to return (default 20)"
@@ -181,6 +185,7 @@ pub async fn get_note(state: &ToolState, arguments: &HashMap<String, Value>) -> 
 pub async fn list_notes(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
     let category_filter = arguments.get("category").and_then(|v| v.as_str());
     let tag_filter = arguments.get("tag").and_then(|v| v.as_str());
+    let search_filter = arguments.get("search").and_then(|v| v.as_str());
     let limit = arguments
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -234,6 +239,15 @@ pub async fn list_notes(state: &ToolState, arguments: &HashMap<String, Value>) -
                 && !item.value.tags.contains(&tag.to_string())
             {
                 return false;
+            }
+            // Filter by title or content (case-insensitive substring)
+            if let Some(search) = search_filter {
+                let search_lower = search.to_lowercase();
+                if !item.value.title.to_lowercase().contains(&search_lower)
+                    && !item.value.content.to_lowercase().contains(&search_lower)
+                {
+                    return false;
+                }
             }
             true
         })

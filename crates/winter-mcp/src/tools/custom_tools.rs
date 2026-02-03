@@ -117,7 +117,21 @@ pub fn definitions() -> Vec<ToolDefinition> {
             description: "List all custom tools with their approval status.".to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Filter by tool name (case-insensitive substring)"
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "approved", "outdated"],
+                        "description": "Filter by approval status"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of tools to return"
+                    }
+                }
             }),
         },
         ToolDefinition {
@@ -537,8 +551,12 @@ pub async fn update_custom_tool(
 
 pub async fn list_custom_tools(
     state: &ToolState,
-    _arguments: &HashMap<String, Value>,
+    arguments: &HashMap<String, Value>,
 ) -> CallToolResult {
+    let name_filter = arguments.get("name").and_then(|v| v.as_str());
+    let status_filter = arguments.get("status").and_then(|v| v.as_str());
+    let limit = arguments.get("limit").and_then(|v| v.as_u64());
+
     let tools = match state
         .atproto
         .list_all_records::<CustomTool>(TOOL_COLLECTION)
@@ -551,6 +569,13 @@ pub async fn list_custom_tools(
     let mut formatted = Vec::new();
 
     for item in tools {
+        // Filter by name (case-insensitive substring)
+        if let Some(name) = name_filter {
+            if !item.value.name.to_lowercase().contains(&name.to_lowercase()) {
+                continue;
+            }
+        }
+
         let rkey = item.uri.split('/').next_back().unwrap_or("");
         let approval = get_approval(state, rkey).await;
         let approved = is_approved(&approval, item.value.version);
@@ -558,10 +583,24 @@ pub async fn list_custom_tools(
         let status = if approved {
             "approved"
         } else if approval.is_some() {
-            "outdated_approval" // Approval exists but version doesn't match
+            "outdated" // Approval exists but version doesn't match
         } else {
             "pending"
         };
+
+        // Filter by status
+        if let Some(filter) = status_filter {
+            if status != filter {
+                continue;
+            }
+        }
+
+        // Apply limit
+        if let Some(lim) = limit {
+            if formatted.len() >= lim as usize {
+                break;
+            }
+        }
 
         formatted.push(json!({
             "rkey": rkey,

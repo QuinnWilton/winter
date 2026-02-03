@@ -68,6 +68,14 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "status": {
                         "type": "string",
                         "description": "Filter by status (pending, running, completed, failed)"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Filter by job name (case-insensitive substring)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of jobs to return"
                     }
                 }
             }),
@@ -226,6 +234,8 @@ pub async fn schedule_recurring(
 
 pub async fn list_jobs(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
     let status_filter = arguments.get("status").and_then(|v| v.as_str());
+    let name_filter = arguments.get("name").and_then(|v| v.as_str());
+    let limit = arguments.get("limit").and_then(|v| v.as_u64());
 
     // Try cache first, fall back to HTTP
     let jobs = if let Some(ref cache) = state.cache {
@@ -256,6 +266,7 @@ pub async fn list_jobs(state: &ToolState, arguments: &HashMap<String, Value>) ->
     let formatted: Vec<Value> = jobs
         .into_iter()
         .filter(|item| {
+            // Filter by status
             if let Some(filter) = status_filter {
                 let status_str = match &item.value.status {
                     JobStatus::Pending => "pending",
@@ -263,11 +274,19 @@ pub async fn list_jobs(state: &ToolState, arguments: &HashMap<String, Value>) ->
                     JobStatus::Completed => "completed",
                     JobStatus::Failed { .. } => "failed",
                 };
-                status_str == filter
-            } else {
-                true
+                if status_str != filter {
+                    return false;
+                }
             }
+            // Filter by name (case-insensitive substring)
+            if let Some(name) = name_filter {
+                if !item.value.name.to_lowercase().contains(&name.to_lowercase()) {
+                    return false;
+                }
+            }
+            true
         })
+        .take(limit.unwrap_or(usize::MAX as u64) as usize)
         .map(|item| {
             let rkey = item.uri.split('/').next_back().unwrap_or("");
             let schedule_desc = match &item.value.schedule {
