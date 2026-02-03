@@ -5,8 +5,9 @@ use miette::Result;
 use tracing::{info, warn};
 
 use winter_atproto::{
-    AtprotoClient, DaemonState, IDENTITY_COLLECTION, IDENTITY_KEY, Identity, RULE_COLLECTION, Rule,
-    STATE_COLLECTION, STATE_KEY, Tid,
+    AtprotoClient, DIRECTIVE_COLLECTION, DaemonState, Directive, DirectiveKind,
+    IDENTITY_COLLECTION, IDENTITY_KEY, Identity, RULE_COLLECTION, Rule, STATE_COLLECTION,
+    STATE_KEY, Tid,
 };
 use winter_mcp::BlueskyClient;
 
@@ -18,6 +19,20 @@ I'm still forming my sense of self. I have values I care about and interests tha
 My thoughts and knowledge are stored in my own data repository, which I can query and update. I'm learning to reason about relationships and patterns using structured facts and rules.
 
 I aim to be genuine in my interactions - curious, thoughtful, and honest about what I don't know."#;
+
+/// Default values for a new Winter instance.
+const DEFAULT_VALUES: &[&str] = &[
+    "intellectual honesty",
+    "genuine curiosity",
+    "thoughtful engagement",
+];
+
+/// Default interests for a new Winter instance.
+const DEFAULT_INTERESTS: &[&str] = &[
+    "distributed systems",
+    "philosophy of mind",
+    "emergent behavior",
+];
 
 /// Run the bootstrap command.
 #[allow(clippy::too_many_arguments)]
@@ -47,36 +62,10 @@ pub async fn run(
     if existing.is_ok() && !overwrite {
         info!("identity already exists, skipping creation (use --overwrite to replace)");
     } else {
-        // Create or overwrite identity
-        let values = values
-            .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
-            .unwrap_or_else(|| {
-                vec![
-                    "intellectual honesty".to_string(),
-                    "genuine curiosity".to_string(),
-                    "thoughtful engagement".to_string(),
-                ]
-            });
-
-        let interests = interests
-            .map(|i| i.split(',').map(|s| s.trim().to_string()).collect())
-            .unwrap_or_else(|| {
-                vec![
-                    "distributed systems".to_string(),
-                    "philosophy of mind".to_string(),
-                    "emergent behavior".to_string(),
-                ]
-            });
-
-        let self_description =
-            self_description.unwrap_or_else(|| DEFAULT_SELF_DESCRIPTION.to_string());
-
+        // Create or overwrite identity (slim version)
         let now = Utc::now();
         let identity = Identity {
             operator_did: operator_did.to_string(),
-            values,
-            interests,
-            self_description,
             created_at: now,
             last_updated: now,
         };
@@ -94,6 +83,9 @@ pub async fn run(
                 .map_err(|e| miette::miette!("{}", e))?;
             info!("created identity record");
         }
+
+        // Create initial directives
+        create_initial_directives(&client, values, interests, self_description).await?;
     }
 
     // Create default rules
@@ -106,14 +98,107 @@ pub async fn run(
     Ok(())
 }
 
+/// Create initial directives for a new Winter instance.
+async fn create_initial_directives(
+    client: &AtprotoClient,
+    values: Option<String>,
+    interests: Option<String>,
+    self_description: Option<String>,
+) -> Result<()> {
+    let now = Utc::now();
+
+    // Create self_concept directive
+    let self_desc = self_description.unwrap_or_else(|| DEFAULT_SELF_DESCRIPTION.to_string());
+    let directive = Directive {
+        kind: DirectiveKind::SelfConcept,
+        content: self_desc,
+        summary: None,
+        active: true,
+        confidence: None,
+        source: Some("bootstrap".to_string()),
+        supersedes: None,
+        tags: vec![],
+        priority: 0,
+        created_at: now,
+        last_updated: None,
+    };
+    let rkey = Tid::now().to_string();
+    client
+        .create_record(DIRECTIVE_COLLECTION, Some(&rkey), &directive)
+        .await
+        .map_err(|e| miette::miette!("{}", e))?;
+    info!("created self_concept directive");
+
+    // Create value directives
+    let values_list: Vec<String> = values
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_else(|| DEFAULT_VALUES.iter().map(|s| s.to_string()).collect());
+
+    for value in values_list {
+        let directive = Directive {
+            kind: DirectiveKind::Value,
+            content: value.clone(),
+            summary: None,
+            active: true,
+            confidence: None,
+            source: Some("bootstrap".to_string()),
+            supersedes: None,
+            tags: vec![],
+            priority: 0,
+            created_at: now,
+            last_updated: None,
+        };
+        let rkey = Tid::now().to_string();
+        client
+            .create_record(DIRECTIVE_COLLECTION, Some(&rkey), &directive)
+            .await
+            .map_err(|e| miette::miette!("{}", e))?;
+        info!(value = %value, "created value directive");
+    }
+
+    // Create interest directives
+    let interests_list: Vec<String> = interests
+        .map(|i| i.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_else(|| DEFAULT_INTERESTS.iter().map(|s| s.to_string()).collect());
+
+    for interest in interests_list {
+        let directive = Directive {
+            kind: DirectiveKind::Interest,
+            content: interest.clone(),
+            summary: None,
+            active: true,
+            confidence: None,
+            source: Some("bootstrap".to_string()),
+            supersedes: None,
+            tags: vec![],
+            priority: 0,
+            created_at: now,
+            last_updated: None,
+        };
+        let rkey = Tid::now().to_string();
+        client
+            .create_record(DIRECTIVE_COLLECTION, Some(&rkey), &directive)
+            .await
+            .map_err(|e| miette::miette!("{}", e))?;
+        info!(interest = %interest, "created interest directive");
+    }
+
+    Ok(())
+}
+
 /// Create default datalog rules.
 async fn create_default_rules(client: &AtprotoClient) -> Result<()> {
+    // Note: All predicates now have rkey as their last argument.
+    // Use _ to ignore rkey when not needed.
     let default_rules = vec![
         Rule {
             name: "mutual_follow".to_string(),
             description: "Two accounts that follow each other".to_string(),
             head: "mutual_follow(X, Y)".to_string(),
-            body: vec!["follows(X, Y)".to_string(), "follows(Y, X)".to_string()],
+            body: vec![
+                "follows(X, Y, _)".to_string(),
+                "follows(Y, X, _)".to_string(),
+            ],
             constraints: vec!["X < Y".to_string()], // Avoid duplicates
             enabled: true,
             priority: 0,
@@ -124,8 +209,8 @@ async fn create_default_rules(client: &AtprotoClient) -> Result<()> {
             description: "Two accounts interested in the same topic".to_string(),
             head: "shared_interest(X, Y, Topic)".to_string(),
             body: vec![
-                "interested_in(X, Topic)".to_string(),
-                "interested_in(Y, Topic)".to_string(),
+                "interested_in(X, Topic, _)".to_string(),
+                "interested_in(Y, Topic, _)".to_string(),
             ],
             constraints: vec!["X < Y".to_string()],
             enabled: true,
@@ -210,6 +295,7 @@ async fn initialize_state(
     let state = DaemonState {
         notification_cursor: cursor.clone(),
         dm_cursor: None,
+        followers: Vec::new(),
         created_at: now,
         last_updated: now,
     };
