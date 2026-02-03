@@ -11,6 +11,7 @@ use futures_util::StreamExt;
 use iroh_car::CarReader;
 use serde::Deserialize;
 use tokio::sync::watch;
+use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, trace, warn};
 
@@ -102,6 +103,8 @@ impl FirehoseClient {
 
         info!("firehose connected");
 
+        const READ_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {
@@ -110,25 +113,29 @@ impl FirehoseClient {
                         return Ok(());
                     }
                 }
-                msg = read.next() => {
-                    match msg {
-                        Some(Ok(Message::Binary(data))) => {
+                result = timeout(READ_TIMEOUT, read.next()) => {
+                    match result {
+                        Ok(Some(Ok(Message::Binary(data)))) => {
                             if let Err(e) = self.handle_message(&data).await {
                                 warn!(error = %e, "failed to handle firehose message");
                             }
                         }
-                        Some(Ok(Message::Close(_))) => {
+                        Ok(Some(Ok(Message::Close(_)))) => {
                             info!("firehose connection closed by server");
                             return Err(AtprotoError::WebSocket("connection closed".to_string()));
                         }
-                        Some(Ok(_)) => {
+                        Ok(Some(Ok(_))) => {
                             // Ignore other message types (text, ping, pong)
                         }
-                        Some(Err(e)) => {
+                        Ok(Some(Err(e))) => {
                             return Err(AtprotoError::WebSocket(format!("read error: {}", e)));
                         }
-                        None => {
+                        Ok(None) => {
                             return Err(AtprotoError::WebSocket("stream ended".to_string()));
+                        }
+                        Err(_) => {
+                            warn!("firehose read timeout after {}s - connection may be stale", READ_TIMEOUT.as_secs());
+                            return Err(AtprotoError::WebSocket("read timeout".to_string()));
                         }
                     }
                 }

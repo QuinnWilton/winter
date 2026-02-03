@@ -8,10 +8,58 @@ use serde::{Serialize, de::DeserializeOwned};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+use serde::Deserialize;
+
 use crate::{
     AtprotoError, CreateRecordResponse, GetRecordResponse, ListRecordItem, ListRecordsResponse,
     Session,
 };
+
+/// A single write operation for batch writes via `com.atproto.repo.applyWrites`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "$type")]
+pub enum WriteOp {
+    #[serde(rename = "com.atproto.repo.applyWrites#create")]
+    Create {
+        collection: String,
+        rkey: String,
+        value: serde_json::Value,
+    },
+    #[serde(rename = "com.atproto.repo.applyWrites#update")]
+    Update {
+        collection: String,
+        rkey: String,
+        value: serde_json::Value,
+    },
+    #[serde(rename = "com.atproto.repo.applyWrites#delete")]
+    Delete { collection: String, rkey: String },
+}
+
+/// Response from `com.atproto.repo.applyWrites`.
+#[derive(Debug, Deserialize)]
+pub struct ApplyWritesResponse {
+    pub commit: CommitInfo,
+    pub results: Vec<WriteResult>,
+}
+
+/// Commit info returned from batch writes.
+#[derive(Debug, Deserialize)]
+pub struct CommitInfo {
+    pub cid: String,
+    pub rev: String,
+}
+
+/// Result of a single write operation in a batch.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "$type")]
+pub enum WriteResult {
+    #[serde(rename = "com.atproto.repo.applyWrites#createResult")]
+    Create { uri: String, cid: String },
+    #[serde(rename = "com.atproto.repo.applyWrites#updateResult")]
+    Update { uri: String, cid: String },
+    #[serde(rename = "com.atproto.repo.applyWrites#deleteResult")]
+    Delete {},
+}
 
 /// Client for interacting with an ATProto PDS.
 pub struct AtprotoClient {
@@ -575,6 +623,110 @@ impl AtprotoClient {
             }
 
             return Ok(());
+        }
+
+        unreachable!()
+    }
+
+    /// Apply multiple write operations atomically.
+    ///
+    /// This uses `com.atproto.repo.applyWrites` to batch multiple create, update,
+    /// or delete operations into a single transaction.
+    pub async fn apply_writes(&self, writes: Vec<WriteOp>) -> Result<ApplyWritesResponse, AtprotoError> {
+        if writes.is_empty() {
+            return Err(AtprotoError::InvalidResponse(
+                "apply_writes requires at least one write operation".to_string(),
+            ));
+        }
+
+        let did = self
+            .did()
+            .await
+            .ok_or_else(|| AtprotoError::Auth("not authenticated".to_string()))?;
+
+        // Prepare writes with $type field in values
+        let prepared_writes: Vec<serde_json::Value> = writes
+            .into_iter()
+            .map(|op| {
+                match op {
+                    WriteOp::Create { collection, rkey, mut value } => {
+                        // Add $type to the value if it's an object
+                        if let serde_json::Value::Object(ref mut map) = value {
+                            map.insert(
+                                "$type".to_string(),
+                                serde_json::Value::String(collection.clone()),
+                            );
+                        }
+                        serde_json::json!({
+                            "$type": "com.atproto.repo.applyWrites#create",
+                            "collection": collection,
+                            "rkey": rkey,
+                            "value": value
+                        })
+                    }
+                    WriteOp::Update { collection, rkey, mut value } => {
+                        if let serde_json::Value::Object(ref mut map) = value {
+                            map.insert(
+                                "$type".to_string(),
+                                serde_json::Value::String(collection.clone()),
+                            );
+                        }
+                        serde_json::json!({
+                            "$type": "com.atproto.repo.applyWrites#update",
+                            "collection": collection,
+                            "rkey": rkey,
+                            "value": value
+                        })
+                    }
+                    WriteOp::Delete { collection, rkey } => {
+                        serde_json::json!({
+                            "$type": "com.atproto.repo.applyWrites#delete",
+                            "collection": collection,
+                            "rkey": rkey
+                        })
+                    }
+                }
+            })
+            .collect();
+
+        #[derive(Serialize)]
+        struct ApplyWritesRequest {
+            repo: String,
+            writes: Vec<serde_json::Value>,
+        }
+
+        let url = format!("{}/xrpc/com.atproto.repo.applyWrites", self.pds_url);
+
+        let request_body = ApplyWritesRequest {
+            repo: did,
+            writes: prepared_writes,
+        };
+
+        debug!(count = request_body.writes.len(), "applying batch writes");
+
+        for attempt in 0..2 {
+            let token = self.access_token().await?;
+
+            let response = self
+                .http
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .json(&request_body)
+                .send()
+                .await?;
+
+            let result = self.handle_response(response).await;
+
+            // Retry once on expired token
+            if attempt == 0 {
+                if let Err(ref e) = result {
+                    if Self::is_expired_token_error(e) && self.try_refresh().await {
+                        continue;
+                    }
+                }
+            }
+
+            return result;
         }
 
         unreachable!()

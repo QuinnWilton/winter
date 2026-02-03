@@ -26,7 +26,7 @@ pub use cache::{
 // Re-export FactDeclaration types explicitly for clarity
 pub use types::{FactDeclArg, FactDeclaration};
 pub use car::{CarParseResult, parse_car};
-pub use client::AtprotoClient;
+pub use client::{ApplyWritesResponse, AtprotoClient, CommitInfo, WriteOp, WriteResult};
 pub use error::AtprotoError;
 pub use firehose::{DEFAULT_FIREHOSE_URL, FirehoseClient};
 pub use records::*;
