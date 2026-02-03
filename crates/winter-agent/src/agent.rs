@@ -36,13 +36,22 @@ impl Agent {
             ToolPermission::mcp("winter", "search_posts").to_cli_format(),
             ToolPermission::mcp("winter", "search_users").to_cli_format(),
             ToolPermission::mcp("winter", "get_thread_context").to_cli_format(),
+            ToolPermission::mcp("winter", "mute_user").to_cli_format(),
+            ToolPermission::mcp("winter", "unmute_user").to_cli_format(),
+            ToolPermission::mcp("winter", "block_user").to_cli_format(),
+            ToolPermission::mcp("winter", "unblock_user").to_cli_format(),
+            ToolPermission::mcp("winter", "mute_thread").to_cli_format(),
+            ToolPermission::mcp("winter", "unmute_thread").to_cli_format(),
             // Winter MCP tools - Facts
             ToolPermission::mcp("winter", "create_fact").to_cli_format(),
+            ToolPermission::mcp("winter", "create_facts").to_cli_format(),
             ToolPermission::mcp("winter", "update_fact").to_cli_format(),
             ToolPermission::mcp("winter", "delete_fact").to_cli_format(),
             ToolPermission::mcp("winter", "query_facts").to_cli_format(),
+            ToolPermission::mcp("winter", "list_predicates").to_cli_format(),
             // Winter MCP tools - Rules
             ToolPermission::mcp("winter", "create_rule").to_cli_format(),
+            ToolPermission::mcp("winter", "create_rules").to_cli_format(),
             ToolPermission::mcp("winter", "list_rules").to_cli_format(),
             ToolPermission::mcp("winter", "toggle_rule").to_cli_format(),
             // Winter MCP tools - Notes
@@ -53,16 +62,22 @@ impl Agent {
             ToolPermission::mcp("winter", "publish_blog_post").to_cli_format(),
             ToolPermission::mcp("winter", "list_blog_posts").to_cli_format(),
             ToolPermission::mcp("winter", "update_blog_post").to_cli_format(),
+            ToolPermission::mcp("winter", "get_blog_post").to_cli_format(),
             // Winter MCP tools - Jobs
             ToolPermission::mcp("winter", "schedule_job").to_cli_format(),
             ToolPermission::mcp("winter", "schedule_recurring").to_cli_format(),
             ToolPermission::mcp("winter", "list_jobs").to_cli_format(),
             ToolPermission::mcp("winter", "cancel_job").to_cli_format(),
-            // Winter MCP tools - Self
+            ToolPermission::mcp("winter", "get_job").to_cli_format(),
+            // Winter MCP tools - Thoughts
             ToolPermission::mcp("winter", "record_thought").to_cli_format(),
+            ToolPermission::mcp("winter", "list_thoughts").to_cli_format(),
+            ToolPermission::mcp("winter", "get_thought").to_cli_format(),
+            // Winter MCP tools - Identity
             ToolPermission::mcp("winter", "get_identity").to_cli_format(),
             // Winter MCP tools - Directives
             ToolPermission::mcp("winter", "create_directive").to_cli_format(),
+            ToolPermission::mcp("winter", "create_directives").to_cli_format(),
             ToolPermission::mcp("winter", "update_directive").to_cli_format(),
             ToolPermission::mcp("winter", "deactivate_directive").to_cli_format(),
             ToolPermission::mcp("winter", "list_directives").to_cli_format(),
@@ -82,6 +97,7 @@ impl Agent {
             ToolPermission::mcp("winter", "pds_delete_record").to_cli_format(),
             // Winter MCP tools - Fact Declarations
             ToolPermission::mcp("winter", "create_fact_declaration").to_cli_format(),
+            ToolPermission::mcp("winter", "create_fact_declarations").to_cli_format(),
             ToolPermission::mcp("winter", "update_fact_declaration").to_cli_format(),
             ToolPermission::mcp("winter", "delete_fact_declaration").to_cli_format(),
             ToolPermission::mcp("winter", "list_fact_declarations").to_cli_format(),
