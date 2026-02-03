@@ -1358,6 +1358,48 @@ impl BlueskyClient {
 
         Ok(())
     }
+
+    /// Mute a thread by its root post URI.
+    ///
+    /// Muted threads won't generate notifications for new replies.
+    pub async fn mute_thread(&self, root_uri: &str) -> Result<(), BlueskyError> {
+        self.agent
+            .api
+            .app
+            .bsky
+            .graph
+            .mute_thread(
+                atrium_api::app::bsky::graph::mute_thread::InputData {
+                    root: root_uri.to_string(),
+                }
+                .into(),
+            )
+            .await
+            .map_err(|e| BlueskyError::Api(format!("failed to mute thread: {}", e)))?;
+
+        debug!(root = %root_uri, "muted thread");
+        Ok(())
+    }
+
+    /// Unmute a previously muted thread.
+    pub async fn unmute_thread(&self, root_uri: &str) -> Result<(), BlueskyError> {
+        self.agent
+            .api
+            .app
+            .bsky
+            .graph
+            .unmute_thread(
+                atrium_api::app::bsky::graph::unmute_thread::InputData {
+                    root: root_uri.to_string(),
+                }
+                .into(),
+            )
+            .await
+            .map_err(|e| BlueskyError::Api(format!("failed to unmute thread: {}", e)))?;
+
+        debug!(root = %root_uri, "unmuted thread");
+        Ok(())
+    }
 }
 
 /// Convert atrium facets to our Facet type.

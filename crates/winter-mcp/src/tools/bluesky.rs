@@ -293,6 +293,34 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["block_uri"]
             }),
         },
+        ToolDefinition {
+            name: "mute_thread".to_string(),
+            description: "Mute a Bluesky thread. Muted threads won't generate notifications for new replies.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "root_uri": {
+                        "type": "string",
+                        "description": "AT URI of the thread root post"
+                    }
+                },
+                "required": ["root_uri"]
+            }),
+        },
+        ToolDefinition {
+            name: "unmute_thread".to_string(),
+            description: "Unmute a previously muted Bluesky thread.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "root_uri": {
+                        "type": "string",
+                        "description": "AT URI of the thread root post"
+                    }
+                },
+                "required": ["root_uri"]
+            }),
+        },
     ]
 }
 
@@ -807,5 +835,49 @@ pub async fn unblock_user(state: &ToolState, arguments: &HashMap<String, Value>)
             .to_string(),
         ),
         Err(e) => CallToolResult::error(format!("Failed to unblock user: {}", e)),
+    }
+}
+
+pub async fn mute_thread(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let root_uri = match arguments.get("root_uri").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return CallToolResult::error("Missing required parameter: root_uri"),
+    };
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.mute_thread(root_uri).await {
+        Ok(()) => CallToolResult::success(
+            json!({
+                "muted_thread": root_uri
+            })
+            .to_string(),
+        ),
+        Err(e) => CallToolResult::error(format!("Failed to mute thread: {}", e)),
+    }
+}
+
+pub async fn unmute_thread(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let root_uri = match arguments.get("root_uri").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return CallToolResult::error("Missing required parameter: root_uri"),
+    };
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.unmute_thread(root_uri).await {
+        Ok(()) => CallToolResult::success(
+            json!({
+                "unmuted_thread": root_uri
+            })
+            .to_string(),
+        ),
+        Err(e) => CallToolResult::error(format!("Failed to unmute thread: {}", e)),
     }
 }
