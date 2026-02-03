@@ -184,10 +184,14 @@ Winter uses these environment variables:
 | `WINTER_PDS_URL` | URL of your PDS | Required |
 | `WINTER_HANDLE` | Winter's Bluesky handle | Required |
 | `WINTER_APP_PASSWORD` | App password for the account | Required |
-| `WINTER_OPERATOR_DID` | DID of the human operator (for bootstrap) | Required |
-| `WINTER_POLL_INTERVAL` | Notification poll interval (seconds) | 30 |
+| `WINTER_OPERATOR_DID` | DID of the human operator (bootstrap) | Required |
+| `CLAUDE_CODE_OAUTH_TOKEN` | OAuth token for Claude Code | Required (daemon) |
+| `WINTER_WEB_URL` | Public URL of web UI (approval links) | Required (custom tools) |
+| `WINTER_POLL_INTERVAL` | Notification poll interval (seconds) | 5 |
 | `WINTER_AWAKEN_INTERVAL` | Autonomous awaken cycle (seconds) | 3600 |
-| `WINTER_WEB_PORT` | Port for the observation web UI | 8080 |
+| `WINTER_FIREHOSE_URL` | WebSocket URL for firehose | `wss://bsky.network` |
+| `WINTER_SECRETS_PATH` | Path to secrets JSON file | `~/.config/winter/secrets.json` |
+| `RUST_LOG` | Logging configuration | `winter=info` |
 
 ### Bootstrap Identity
 
@@ -320,42 +324,65 @@ docker compose up -d
 
 ### Systemd Service
 
-Create `/etc/systemd/system/winter.service`:
+The repository includes pre-configured systemd service files in `docker/`:
+- `winter.service` - Main daemon (notification polling, scheduler)
+- `winter-web.service` - Web UI for observation and tool approval
 
-```ini
-[Unit]
-Description=Winter Autonomous Agent
-After=network.target docker.service
-Wants=docker.service
+#### Automated Setup
 
-[Service]
-Type=simple
-User=winter
-Group=winter
-ExecStart=/usr/local/bin/winter daemon \
-  --pds-url https://razorgirl.diy \
-  --handle winter.razorgirl.diy
-EnvironmentFile=/etc/winter/env
-Restart=always
-RestartSec=10
+Use the included install script:
 
-[Install]
-WantedBy=multi-user.target
+```bash
+sudo ./docker/install.sh
 ```
 
-Create `/etc/winter/env`:
+This creates the `winter` user, sets up `/opt/winter`, initializes the secrets file, and installs the service files.
+
+#### Manual Setup
+
+1. Create the winter user and directory:
 ```bash
-APP_PASSWORD=xxxx-xxxx-xxxx-xxxx
-POLL_INTERVAL=30
-AWAKEN_INTERVAL=3600
+sudo useradd -r -s /sbin/nologin -d /opt/winter winter
+sudo mkdir -p /opt/winter
+sudo chown winter:winter /opt/winter
 ```
 
-Enable and start:
+2. Initialize the secrets file:
 ```bash
+sudo -u winter bash -c 'echo "{}" > /opt/winter/secrets.json'
+sudo chmod 600 /opt/winter/secrets.json
+```
+
+3. Create the environment file:
+```bash
+sudo cp docker/.env.example /opt/winter/.env
+sudo chown winter:winter /opt/winter/.env
+sudo chmod 600 /opt/winter/.env
+sudo vim /opt/winter/.env  # Configure your credentials
+```
+
+4. Install the service files:
+```bash
+sudo cp docker/winter.service /etc/systemd/system/
+sudo cp docker/winter-web.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable winter
+```
+
+5. Enable and start (web first, then daemon):
+```bash
+sudo systemctl enable winter-web winter
+sudo systemctl start winter-web
 sudo systemctl start winter
 ```
+
+#### Verify Services
+
+```bash
+sudo systemctl status winter-web winter
+journalctl -u winter -u winter-web -f
+```
+
+The web service must start before the daemon because the daemon depends on it for approval link URLs.
 
 ## Verification
 
