@@ -33,6 +33,11 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "trigger": {
                         "type": "string",
                         "description": "What triggered this thought (optional)"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Tags for categorization and querying (optional, max 20 tags, max 64 chars each)"
                     }
                 },
                 "required": ["kind", "content"]
@@ -40,7 +45,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "list_thoughts".to_string(),
-            description: "List recent thoughts with optional filtering by kind.".to_string(),
+            description: "List recent thoughts with optional filtering by kind or tag.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -48,6 +53,18 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "enum": ["insight", "question", "plan", "reflection", "error", "response", "tool_call"],
                         "description": "Filter by thought kind"
+                    },
+                    "tag": {
+                        "type": "string",
+                        "description": "Filter by tag (exact match)"
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "Filter by content (case-insensitive substring)"
+                    },
+                    "trigger": {
+                        "type": "string",
+                        "description": "Filter by trigger (case-insensitive substring)"
                     },
                     "limit": {
                         "type": "integer",
@@ -92,6 +109,17 @@ pub async fn record_thought(
         .and_then(|v| v.as_str())
         .map(String::from);
 
+    let tags: Vec<String> = arguments
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Parse the kind
     let kind = match kind_str {
         "insight" => ThoughtKind::Insight,
@@ -111,6 +139,7 @@ pub async fn record_thought(
         kind,
         content: content.to_string(),
         trigger,
+        tags,
         duration_ms: None,
         created_at: Utc::now(),
     };
@@ -159,6 +188,9 @@ pub async fn list_thoughts(
     arguments: &HashMap<String, Value>,
 ) -> CallToolResult {
     let kind_filter = arguments.get("kind").and_then(|v| v.as_str());
+    let tag_filter = arguments.get("tag").and_then(|v| v.as_str());
+    let search_filter = arguments.get("search").and_then(|v| v.as_str());
+    let trigger_filter = arguments.get("trigger").and_then(|v| v.as_str());
     let limit = arguments
         .get("limit")
         .and_then(|v| v.as_u64())
@@ -201,11 +233,33 @@ pub async fn list_thoughts(
     let formatted: Vec<serde_json::Value> = thoughts
         .into_iter()
         .filter(|item| {
+            // Filter by kind
             if let Some(filter) = kind_filter {
-                thought_kind_to_str(&item.value.kind) == filter
-            } else {
-                true
+                if thought_kind_to_str(&item.value.kind) != filter {
+                    return false;
+                }
             }
+            // Filter by tag (exact match)
+            if let Some(tag) = tag_filter {
+                if !item.value.tags.contains(&tag.to_string()) {
+                    return false;
+                }
+            }
+            // Filter by content (case-insensitive substring)
+            if let Some(search) = search_filter {
+                if !item.value.content.to_lowercase().contains(&search.to_lowercase()) {
+                    return false;
+                }
+            }
+            // Filter by trigger (case-insensitive substring)
+            if let Some(trigger) = trigger_filter {
+                let trigger_lower = trigger.to_lowercase();
+                match &item.value.trigger {
+                    Some(t) if t.to_lowercase().contains(&trigger_lower) => {}
+                    _ => return false,
+                }
+            }
+            true
         })
         .take(limit)
         .map(|item| {
@@ -221,6 +275,7 @@ pub async fn list_thoughts(
                 "kind": thought_kind_to_str(&item.value.kind),
                 "content": preview,
                 "trigger": item.value.trigger,
+                "tags": item.value.tags,
                 "created_at": item.value.created_at.to_rfc3339()
             })
         })
@@ -254,6 +309,7 @@ pub async fn get_thought(state: &ToolState, arguments: &HashMap<String, Value>) 
                     "kind": thought_kind_to_str(&thought.kind),
                     "content": thought.content,
                     "trigger": thought.trigger,
+                    "tags": thought.tags,
                     "duration_ms": thought.duration_ms,
                     "created_at": thought.created_at.to_rfc3339()
                 })
