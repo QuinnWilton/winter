@@ -1,17 +1,22 @@
 //! Identity management for Winter.
 
+use std::sync::Arc;
+
 use winter_atproto::{AtprotoClient, IDENTITY_COLLECTION, IDENTITY_KEY, Identity};
 
 use crate::AgentError;
 
 /// Manages Winter's identity record.
+///
+/// The identity record is now slim (just operator_did and timestamps).
+/// Values, interests, and self-description are stored as directives.
 pub struct IdentityManager {
-    client: AtprotoClient,
+    client: Arc<AtprotoClient>,
 }
 
 impl IdentityManager {
-    /// Create a new identity manager.
-    pub fn new(client: AtprotoClient) -> Self {
+    /// Create a new identity manager with a shared client.
+    pub fn new(client: Arc<AtprotoClient>) -> Self {
         Self { client }
     }
 
@@ -42,55 +47,6 @@ impl IdentityManager {
         self.client
             .create_record(IDENTITY_COLLECTION, Some(IDENTITY_KEY), identity)
             .await?;
-        Ok(())
-    }
-
-    /// Add a value to the identity.
-    pub async fn add_value(&self, value: String) -> Result<(), AgentError> {
-        let mut identity = self.load().await?;
-        if !identity.values.contains(&value) {
-            identity.values.push(value);
-            identity.last_updated = chrono::Utc::now();
-            self.update(&identity).await?;
-        }
-        Ok(())
-    }
-
-    /// Remove a value from the identity.
-    pub async fn remove_value(&self, value: &str) -> Result<(), AgentError> {
-        let mut identity = self.load().await?;
-        identity.values.retain(|v| v != value);
-        identity.last_updated = chrono::Utc::now();
-        self.update(&identity).await?;
-        Ok(())
-    }
-
-    /// Add an interest to the identity.
-    pub async fn add_interest(&self, interest: String) -> Result<(), AgentError> {
-        let mut identity = self.load().await?;
-        if !identity.interests.contains(&interest) {
-            identity.interests.push(interest);
-            identity.last_updated = chrono::Utc::now();
-            self.update(&identity).await?;
-        }
-        Ok(())
-    }
-
-    /// Remove an interest from the identity.
-    pub async fn remove_interest(&self, interest: &str) -> Result<(), AgentError> {
-        let mut identity = self.load().await?;
-        identity.interests.retain(|i| i != interest);
-        identity.last_updated = chrono::Utc::now();
-        self.update(&identity).await?;
-        Ok(())
-    }
-
-    /// Update self_description.
-    pub async fn update_self_description(&self, description: String) -> Result<(), AgentError> {
-        let mut identity = self.load().await?;
-        identity.self_description = description;
-        identity.last_updated = chrono::Utc::now();
-        self.update(&identity).await?;
         Ok(())
     }
 }

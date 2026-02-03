@@ -1,0 +1,77 @@
+{
+  "lexicon": 1,
+  "id": "diy.razorgirl.winter.directive",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A discrete identity directive - a value, interest, belief, guideline, self-concept, boundary, or aspiration that Winter can add, update, or remove independently.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["kind", "content", "active", "createdAt"],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "The type of directive",
+            "knownValues": ["value", "interest", "belief", "guideline", "self_concept", "boundary", "aspiration"],
+            "maxLength": 32
+          },
+          "content": {
+            "type": "string",
+            "description": "The main content of the directive",
+            "maxLength": 2000
+          },
+          "summary": {
+            "type": "string",
+            "description": "Short summary for compact display (optional)",
+            "maxLength": 256
+          },
+          "active": {
+            "type": "boolean",
+            "description": "Whether this directive is currently active",
+            "default": true
+          },
+          "confidence": {
+            "type": "string",
+            "description": "Confidence level as decimal string (e.g., '0.7'). Range 0.0-1.0.",
+            "maxLength": 10
+          },
+          "source": {
+            "type": "string",
+            "description": "Why this directive exists or where it came from",
+            "maxLength": 500
+          },
+          "supersedes": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "AT URI of directive this supersedes (for evolution tracking)"
+          },
+          "tags": {
+            "type": "array",
+            "description": "Tags for categorization",
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "maxLength": 10
+          },
+          "priority": {
+            "type": "integer",
+            "description": "Priority for ordering (higher = more prominent)",
+            "default": 0
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this directive was created"
+          },
+          "lastUpdated": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this directive was last updated"
+          }
+        }
+      }
+    }
+  }
+}
