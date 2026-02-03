@@ -9,7 +9,7 @@ use chrono::Utc;
 use serde_json::{Value, json};
 
 use crate::protocol::{CallToolResult, ToolDefinition};
-use winter_atproto::{FactDeclArg, FactDeclaration, Tid};
+use winter_atproto::{FactDeclArg, FactDeclaration, Tid, WriteOp, WriteResult};
 
 use super::ToolState;
 
@@ -82,6 +82,52 @@ create_fact_declaration(
             }),
         },
         ToolDefinition {
+            name: "create_fact_declarations".to_string(),
+            description: "Create multiple fact declarations in a single atomic transaction. All declarations are created together or none are.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "declarations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "predicate": {
+                                    "type": "string",
+                                    "description": "The predicate name (max 64 chars)"
+                                },
+                                "args": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": { "type": "string" },
+                                            "type": { "type": "string" },
+                                            "description": { "type": "string" }
+                                        },
+                                        "required": ["name"]
+                                    },
+                                    "description": "Argument definitions (max 10)"
+                                },
+                                "description": {
+                                    "type": "string",
+                                    "description": "Human-readable description (max 1024 chars)"
+                                },
+                                "tags": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Tags for categorization (max 20)"
+                                }
+                            },
+                            "required": ["predicate", "args", "description"]
+                        },
+                        "description": "Array of declarations to create"
+                    }
+                },
+                "required": ["declarations"]
+            }),
+        },
+        ToolDefinition {
             name: "update_fact_declaration".to_string(),
             description: "Update an existing fact declaration. Only provided fields will be changed.".to_string(),
             input_schema: json!({
@@ -140,6 +186,14 @@ create_fact_declaration(
                     "tag": {
                         "type": "string",
                         "description": "Filter by tag (optional)"
+                    },
+                    "predicate": {
+                        "type": "string",
+                        "description": "Filter by predicate name (case-insensitive substring)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of declarations to return"
                     }
                 }
             }),
@@ -236,6 +290,152 @@ pub async fn create_fact_declaration(
             )
         }
         Err(e) => CallToolResult::error(format!("Failed to create fact declaration: {}", e)),
+    }
+}
+
+pub async fn create_fact_declarations(
+    state: &ToolState,
+    arguments: &HashMap<String, Value>,
+) -> CallToolResult {
+    let decls_array = match arguments.get("declarations").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return CallToolResult::error("Missing required parameter: declarations"),
+    };
+
+    if decls_array.is_empty() {
+        return CallToolResult::error("declarations array cannot be empty");
+    }
+
+    // Validate and parse all declarations first
+    let mut validated: Vec<(String, FactDeclaration)> = Vec::with_capacity(decls_array.len());
+    let now = Utc::now();
+
+    for (i, decl_val) in decls_array.iter().enumerate() {
+        let obj = match decl_val.as_object() {
+            Some(o) => o,
+            None => return CallToolResult::error(format!("declarations[{}]: expected object", i)),
+        };
+
+        let predicate = match obj.get("predicate").and_then(|v| v.as_str()) {
+            Some(p) => {
+                if p.len() > 64 {
+                    return CallToolResult::error(format!(
+                        "declarations[{}]: predicate name too long: {} chars (max 64)",
+                        i, p.len()
+                    ));
+                }
+                p.to_string()
+            }
+            None => return CallToolResult::error(format!("declarations[{}]: missing predicate", i)),
+        };
+
+        let args = match obj.get("args").and_then(|v| v.as_array()) {
+            Some(arr) => {
+                if arr.len() > 10 {
+                    return CallToolResult::error(format!(
+                        "declarations[{}]: too many arguments: {} (max 10)",
+                        i, arr.len()
+                    ));
+                }
+                match parse_args(arr) {
+                    Ok(args) => args,
+                    Err(e) => {
+                        // Extract error message from CallToolResult
+                        if let Some(crate::protocol::ToolContent::Text { text }) = e.content.first() {
+                            return CallToolResult::error(format!("declarations[{}].{}", i, text));
+                        }
+                        return CallToolResult::error(format!("declarations[{}]: invalid args", i));
+                    }
+                }
+            }
+            None => return CallToolResult::error(format!("declarations[{}]: missing args", i)),
+        };
+
+        let description = match obj.get("description").and_then(|v| v.as_str()) {
+            Some(d) => {
+                if d.len() > 1024 {
+                    d[..1024].to_string()
+                } else {
+                    d.to_string()
+                }
+            }
+            None => return CallToolResult::error(format!("declarations[{}]: missing description", i)),
+        };
+
+        let tags: Vec<String> = obj
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .take(20)
+                    .map(|s| if s.len() > 64 { s[..64].to_string() } else { s })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let declaration = FactDeclaration {
+            predicate,
+            args,
+            description,
+            tags,
+            created_at: now,
+            last_updated: None,
+        };
+
+        let rkey = Tid::now().to_string();
+        validated.push((rkey, declaration));
+    }
+
+    // Build WriteOp list
+    let writes: Vec<WriteOp> = validated
+        .iter()
+        .map(|(rkey, decl)| WriteOp::Create {
+            collection: DECLARATION_COLLECTION.to_string(),
+            rkey: rkey.clone(),
+            value: serde_json::to_value(decl).unwrap(),
+        })
+        .collect();
+
+    // Execute batch write
+    match state.atproto.apply_writes(writes).await {
+        Ok(response) => {
+            // Update cache for each created record
+            for ((rkey, decl), result) in validated.iter().zip(response.results.iter()) {
+                if let WriteResult::Create { cid, .. } = result {
+                    if let Some(cache) = &state.cache {
+                        cache.upsert_declaration(rkey.clone(), decl.clone(), cid.clone());
+                    }
+                }
+            }
+
+            let results: Vec<Value> = validated
+                .iter()
+                .zip(response.results.iter())
+                .map(|((rkey, decl), result)| {
+                    if let WriteResult::Create { uri, cid } = result {
+                        json!({
+                            "rkey": rkey,
+                            "uri": uri,
+                            "cid": cid,
+                            "predicate": decl.predicate,
+                            "arity": decl.args.len()
+                        })
+                    } else {
+                        json!({ "rkey": rkey, "error": "unexpected result type" })
+                    }
+                })
+                .collect();
+
+            CallToolResult::success(
+                json!({
+                    "created": validated.len(),
+                    "results": results
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => CallToolResult::error(format!("Batch write failed: {}", e)),
     }
 }
 
@@ -367,6 +567,8 @@ pub async fn list_fact_declarations(
     arguments: &HashMap<String, Value>,
 ) -> CallToolResult {
     let tag_filter = arguments.get("tag").and_then(|v| v.as_str());
+    let predicate_filter = arguments.get("predicate").and_then(|v| v.as_str());
+    let limit = arguments.get("limit").and_then(|v| v.as_u64());
 
     // List all declarations
     let declarations = match state
@@ -386,11 +588,19 @@ pub async fn list_fact_declarations(
         .filter(|r| {
             // Filter by tag if specified
             if let Some(tag) = tag_filter {
-                r.value.tags.contains(&tag.to_string())
-            } else {
-                true
+                if !r.value.tags.contains(&tag.to_string()) {
+                    return false;
+                }
             }
+            // Filter by predicate name (case-insensitive substring)
+            if let Some(pred) = predicate_filter {
+                if !r.value.predicate.to_lowercase().contains(&pred.to_lowercase()) {
+                    return false;
+                }
+            }
+            true
         })
+        .take(limit.unwrap_or(usize::MAX as u64) as usize)
         .map(|r| {
             // Extract rkey from URI (at://did/collection/rkey)
             let rkey = r.uri.rsplit('/').next().unwrap_or("").to_string();

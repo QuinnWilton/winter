@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::protocol::{CallToolResult, ToolDefinition};
-use winter_atproto::{Fact, ListRecordItem, Rule, SyncState, Tid};
+use winter_atproto::{Fact, ListRecordItem, Rule, SyncState, Tid, WriteOp, WriteResult};
 use winter_datalog::{DerivedFactGenerator, FactExtractor, RuleCompiler, SouffleExecutor};
 
 use super::ToolState;
@@ -46,6 +46,44 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["predicate", "args"]
+            }),
+        },
+        ToolDefinition {
+            name: "create_facts".to_string(),
+            description: "Create multiple facts in a single atomic transaction. All facts are created together or none are. Use DIDs for account references, never handles.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "facts": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "predicate": {
+                                    "type": "string",
+                                    "description": "The predicate name"
+                                },
+                                "args": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Arguments to the predicate"
+                                },
+                                "confidence": {
+                                    "type": "number",
+                                    "description": "Confidence level 0.0-1.0 (default 1.0)"
+                                },
+                                "tags": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Optional tags for categorization"
+                                }
+                            },
+                            "required": ["predicate", "args"]
+                        },
+                        "description": "Array of facts to create"
+                    }
+                },
+                "required": ["facts"]
             }),
         },
         ToolDefinition {
@@ -172,8 +210,12 @@ For each predicate, shows:
 - Example usage pattern"#.to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {},
-                "required": []
+                "properties": {
+                    "search": {
+                        "type": "string",
+                        "description": "Filter predicate names (case-insensitive substring)"
+                    }
+                }
             }),
         },
     ]
@@ -250,6 +292,128 @@ pub async fn create_fact(state: &ToolState, arguments: &HashMap<String, Value>) 
             )
         }
         Err(e) => CallToolResult::error(format!("Failed to create fact: {}", e)),
+    }
+}
+
+pub async fn create_facts(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let facts_array = match arguments.get("facts").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return CallToolResult::error("Missing required parameter: facts"),
+    };
+
+    if facts_array.is_empty() {
+        return CallToolResult::error("facts array cannot be empty");
+    }
+
+    // Validate and parse all facts first
+    let mut validated: Vec<(String, Fact)> = Vec::with_capacity(facts_array.len());
+    let now = Utc::now();
+
+    for (i, fact_val) in facts_array.iter().enumerate() {
+        let obj = match fact_val.as_object() {
+            Some(o) => o,
+            None => return CallToolResult::error(format!("facts[{}]: expected object", i)),
+        };
+
+        let predicate = match obj.get("predicate").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => return CallToolResult::error(format!("facts[{}]: missing predicate", i)),
+        };
+
+        // Check if this predicate is derived
+        if DerivedFactGenerator::is_derived(predicate) {
+            return CallToolResult::error(format!(
+                "facts[{}]: cannot create derived fact. '{}' is automatically generated from PDS records.",
+                i, predicate
+            ));
+        }
+
+        let args: Vec<String> = match obj.get("args").and_then(|v| v.as_array()) {
+            Some(a) => match parse_string_array(a, &format!("facts[{}].args", i)) {
+                Ok(args) => args,
+                Err(e) => return e,
+            },
+            None => return CallToolResult::error(format!("facts[{}]: missing args", i)),
+        };
+
+        let confidence = obj
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .map(|c| c.clamp(0.0, 1.0));
+
+        let tags: Vec<String> = obj
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let fact = Fact {
+            predicate: predicate.to_string(),
+            args,
+            confidence,
+            source: None,
+            supersedes: None,
+            tags,
+            created_at: now,
+        };
+
+        let rkey = Tid::now().to_string();
+        validated.push((rkey, fact));
+    }
+
+    // Build WriteOp list
+    let writes: Vec<WriteOp> = validated
+        .iter()
+        .map(|(rkey, fact)| WriteOp::Create {
+            collection: FACT_COLLECTION.to_string(),
+            rkey: rkey.clone(),
+            value: serde_json::to_value(fact).unwrap(),
+        })
+        .collect();
+
+    // Execute batch write
+    match state.atproto.apply_writes(writes).await {
+        Ok(response) => {
+            // Update cache for each created record
+            for ((rkey, fact), result) in validated.iter().zip(response.results.iter()) {
+                if let WriteResult::Create { cid, .. } = result {
+                    if let Some(cache) = &state.cache {
+                        cache.upsert_fact(rkey.clone(), fact.clone(), cid.clone());
+                    }
+                }
+            }
+
+            let results: Vec<Value> = validated
+                .iter()
+                .zip(response.results.iter())
+                .map(|((rkey, fact), result)| {
+                    if let WriteResult::Create { uri, cid } = result {
+                        json!({
+                            "rkey": rkey,
+                            "uri": uri,
+                            "cid": cid,
+                            "predicate": fact.predicate,
+                            "args": fact.args
+                        })
+                    } else {
+                        json!({ "rkey": rkey, "error": "unexpected result type" })
+                    }
+                })
+                .collect();
+
+            CallToolResult::success(
+                json!({
+                    "created": validated.len(),
+                    "results": results
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => CallToolResult::error(format!("Batch write failed: {}", e)),
     }
 }
 
@@ -698,13 +862,21 @@ pub async fn query_facts(state: &ToolState, arguments: &HashMap<String, Value>) 
     )
 }
 
-pub async fn list_predicates(state: &ToolState) -> CallToolResult {
+pub async fn list_predicates(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let search_filter = arguments.get("search").and_then(|v| v.as_str());
     let mut user_predicates: Vec<Value> = Vec::new();
     let mut derived_predicates: Vec<Value> = Vec::new();
     let mut metadata_predicates: Vec<Value> = Vec::new();
 
     // Get derived predicates with full info from DerivedFactGenerator
     for (name, info) in DerivedFactGenerator::predicate_info() {
+        // Apply search filter to derived predicates
+        if let Some(search) = search_filter {
+            if !name.to_lowercase().contains(&search.to_lowercase()) {
+                continue;
+            }
+        }
+
         let signature = format!("{}({})", name, info.args.join(", "));
         let all_signature = format!("_all_{}({})", name, info.args.join(", "));
 
@@ -727,6 +899,13 @@ pub async fn list_predicates(state: &ToolState) -> CallToolResult {
         ("_created_at", 2, "rkey, timestamp"),
     ];
     for (name, arity, args) in meta {
+        // Apply search filter to metadata predicates
+        if let Some(search) = search_filter {
+            if !name.to_lowercase().contains(&search.to_lowercase()) {
+                continue;
+            }
+        }
+
         metadata_predicates.push(json!({
             "name": name,
             "arity": arity,
@@ -755,6 +934,12 @@ pub async fn list_predicates(state: &ToolState) -> CallToolResult {
             // Skip derived predicates (listed separately)
             if DerivedFactGenerator::is_derived(&pred) {
                 continue;
+            }
+            // Apply search filter to user predicates
+            if let Some(search) = search_filter {
+                if !pred.to_lowercase().contains(&search.to_lowercase()) {
+                    continue;
+                }
             }
             user_predicates.push(json!({
                 "name": pred,

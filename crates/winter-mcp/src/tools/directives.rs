@@ -9,7 +9,7 @@ use chrono::Utc;
 use serde_json::{Value, json};
 
 use crate::protocol::{CallToolResult, ToolDefinition};
-use winter_atproto::{Directive, DirectiveKind, Tid};
+use winter_atproto::{Directive, DirectiveKind, Tid, WriteOp, WriteResult};
 
 use super::ToolState;
 
@@ -69,6 +69,56 @@ Kinds:
                     }
                 },
                 "required": ["kind", "content"]
+            }),
+        },
+        ToolDefinition {
+            name: "create_directives".to_string(),
+            description: "Create multiple identity directives in a single atomic transaction. All directives are created together or none are.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "directives": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["value", "interest", "belief", "guideline", "self_concept", "boundary", "aspiration"],
+                                    "description": "The type of directive"
+                                },
+                                "content": {
+                                    "type": "string",
+                                    "description": "The main content (max 2000 chars)"
+                                },
+                                "summary": {
+                                    "type": "string",
+                                    "description": "Short summary (optional, max 256 chars)"
+                                },
+                                "confidence": {
+                                    "type": "number",
+                                    "description": "Confidence level 0.0-1.0 (optional)"
+                                },
+                                "source": {
+                                    "type": "string",
+                                    "description": "Why this directive exists (optional)"
+                                },
+                                "tags": {
+                                    "type": "array",
+                                    "items": { "type": "string" },
+                                    "description": "Tags for categorization (optional)"
+                                },
+                                "priority": {
+                                    "type": "integer",
+                                    "description": "Priority for ordering (default 0)"
+                                }
+                            },
+                            "required": ["kind", "content"]
+                        },
+                        "description": "Array of directives to create"
+                    }
+                },
+                "required": ["directives"]
             }),
         },
         ToolDefinition {
@@ -138,6 +188,18 @@ Kinds:
                     "include_inactive": {
                         "type": "boolean",
                         "description": "Include inactive (soft-deleted) directives (default false)"
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "Filter by content (case-insensitive substring)"
+                    },
+                    "tag": {
+                        "type": "string",
+                        "description": "Filter by tag"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of directives to return"
                     }
                 }
             }),
@@ -272,6 +334,165 @@ pub async fn create_directive(
             )
         }
         Err(e) => CallToolResult::error(format!("Failed to create directive: {}", e)),
+    }
+}
+
+pub async fn create_directives(
+    state: &ToolState,
+    arguments: &HashMap<String, Value>,
+) -> CallToolResult {
+    let directives_array = match arguments.get("directives").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return CallToolResult::error("Missing required parameter: directives"),
+    };
+
+    if directives_array.is_empty() {
+        return CallToolResult::error("directives array cannot be empty");
+    }
+
+    // Validate and parse all directives first
+    let mut validated: Vec<(String, Directive, String)> = Vec::with_capacity(directives_array.len());
+    let now = Utc::now();
+
+    for (i, dir_val) in directives_array.iter().enumerate() {
+        let obj = match dir_val.as_object() {
+            Some(o) => o,
+            None => return CallToolResult::error(format!("directives[{}]: expected object", i)),
+        };
+
+        let kind_str = match obj.get("kind").and_then(|v| v.as_str()) {
+            Some(k) => k,
+            None => return CallToolResult::error(format!("directives[{}]: missing kind", i)),
+        };
+
+        let kind = match parse_directive_kind(kind_str) {
+            Some(k) => k,
+            None => {
+                return CallToolResult::error(format!(
+                    "directives[{}]: invalid kind '{}'. Must be one of: value, interest, belief, guideline, self_concept, boundary, aspiration",
+                    i, kind_str
+                ));
+            }
+        };
+
+        let content = match obj.get("content").and_then(|v| v.as_str()) {
+            Some(c) => c.to_string(),
+            None => return CallToolResult::error(format!("directives[{}]: missing content", i)),
+        };
+
+        if content.len() > 2000 {
+            return CallToolResult::error(format!(
+                "directives[{}]: content too long: {} chars (max 2000)",
+                i, content.len()
+            ));
+        }
+
+        let summary = obj.get("summary").and_then(|v| v.as_str()).map(|s| {
+            if s.len() > 256 {
+                s[..256].to_string()
+            } else {
+                s.to_string()
+            }
+        });
+
+        let confidence = obj
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .map(|c| c.clamp(0.0, 1.0));
+
+        let source = obj.get("source").and_then(|v| v.as_str()).map(|s| {
+            if s.len() > 500 {
+                s[..500].to_string()
+            } else {
+                s.to_string()
+            }
+        });
+
+        let tags: Vec<String> = obj
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .take(10)
+                    .map(|s| if s.len() > 64 { s[..64].to_string() } else { s })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let priority = obj
+            .get("priority")
+            .and_then(|v| v.as_i64())
+            .map(|p| p as i32)
+            .unwrap_or(0);
+
+        let directive = Directive {
+            kind,
+            content,
+            summary,
+            active: true,
+            confidence,
+            source,
+            supersedes: None,
+            tags,
+            priority,
+            created_at: now,
+            last_updated: None,
+        };
+
+        let rkey = Tid::now().to_string();
+        validated.push((rkey, directive, kind_str.to_string()));
+    }
+
+    // Build WriteOp list
+    let writes: Vec<WriteOp> = validated
+        .iter()
+        .map(|(rkey, directive, _)| WriteOp::Create {
+            collection: DIRECTIVE_COLLECTION.to_string(),
+            rkey: rkey.clone(),
+            value: serde_json::to_value(directive).unwrap(),
+        })
+        .collect();
+
+    // Execute batch write
+    match state.atproto.apply_writes(writes).await {
+        Ok(response) => {
+            // Update cache for each created record
+            for ((rkey, directive, _), result) in validated.iter().zip(response.results.iter()) {
+                if let WriteResult::Create { cid, .. } = result {
+                    if let Some(cache) = &state.cache {
+                        cache.upsert_directive(rkey.clone(), directive.clone(), cid.clone());
+                    }
+                }
+            }
+
+            let results: Vec<Value> = validated
+                .iter()
+                .zip(response.results.iter())
+                .map(|((rkey, directive, kind_str), result)| {
+                    if let WriteResult::Create { uri, cid } = result {
+                        json!({
+                            "rkey": rkey,
+                            "uri": uri,
+                            "cid": cid,
+                            "kind": kind_str,
+                            "content": directive.content
+                        })
+                    } else {
+                        json!({ "rkey": rkey, "error": "unexpected result type" })
+                    }
+                })
+                .collect();
+
+            CallToolResult::success(
+                json!({
+                    "created": validated.len(),
+                    "results": results
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => CallToolResult::error(format!("Batch write failed: {}", e)),
     }
 }
 
@@ -463,6 +684,10 @@ pub async fn list_directives(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let search_filter = arguments.get("search").and_then(|v| v.as_str());
+    let tag_filter = arguments.get("tag").and_then(|v| v.as_str());
+    let limit = arguments.get("limit").and_then(|v| v.as_u64());
+
     // List all directives
     let directives = match state
         .atproto
@@ -487,8 +712,21 @@ pub async fn list_directives(
                     return false;
                 }
             }
+            // Filter by content (case-insensitive substring)
+            if let Some(search) = search_filter {
+                if !r.value.content.to_lowercase().contains(&search.to_lowercase()) {
+                    return false;
+                }
+            }
+            // Filter by tag
+            if let Some(tag) = tag_filter {
+                if !r.value.tags.contains(&tag.to_string()) {
+                    return false;
+                }
+            }
             true
         })
+        .take(limit.unwrap_or(usize::MAX as u64) as usize)
         .map(|r| {
             // Extract rkey from URI (at://did/collection/rkey)
             let rkey = r.uri.rsplit('/').next().unwrap_or("").to_string();
