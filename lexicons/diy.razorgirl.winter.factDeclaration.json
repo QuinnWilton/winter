@@ -1,0 +1,78 @@
+{
+  "lexicon": 1,
+  "id": "diy.razorgirl.winter.factDeclaration",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Schema declaration for a fact predicate.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["predicate", "args", "description", "createdAt"],
+        "properties": {
+          "predicate": {
+            "type": "string",
+            "description": "The predicate name",
+            "maxLength": 64
+          },
+          "args": {
+            "type": "array",
+            "description": "Argument definitions for the predicate",
+            "items": {
+              "type": "ref",
+              "ref": "#arg"
+            },
+            "maxLength": 10
+          },
+          "description": {
+            "type": "string",
+            "description": "Human-readable description of what this predicate represents",
+            "maxLength": 1024
+          },
+          "tags": {
+            "type": "array",
+            "description": "Tags for categorization",
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "maxLength": 20
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this declaration was created"
+          },
+          "lastUpdated": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this declaration was last updated"
+          }
+        }
+      }
+    },
+    "arg": {
+      "type": "object",
+      "description": "Argument definition for a predicate",
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Argument name",
+          "maxLength": 64
+        },
+        "type": {
+          "type": "string",
+          "description": "Argument type (default: symbol)",
+          "maxLength": 32,
+          "default": "symbol"
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of this argument",
+          "maxLength": 256
+        }
+      }
+    }
+  }
+}

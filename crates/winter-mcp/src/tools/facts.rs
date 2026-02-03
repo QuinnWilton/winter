@@ -8,7 +8,7 @@ use tracing::debug;
 
 use crate::protocol::{CallToolResult, ToolDefinition};
 use winter_atproto::{Fact, ListRecordItem, Rule, SyncState, Tid};
-use winter_datalog::{FactExtractor, RuleCompiler, SouffleExecutor};
+use winter_datalog::{DerivedFactGenerator, FactExtractor, RuleCompiler, SouffleExecutor};
 
 use super::ToolState;
 
@@ -100,38 +100,80 @@ pub fn definitions() -> Vec<ToolDefinition> {
 
 ## Available Relations
 
-**User predicates** (current facts only):
-- `follows(A, B)`, `interested_in(A, B)`, etc.
+**User predicates** (current facts, with rkey at end):
+- `follows(A, B, Rkey)`, `interested_in(A, B, Rkey)`, etc.
 
-**Historical predicates** (all facts with rkey):
-- `_all_follows(Rkey, A, B)` - includes superseded facts
+**Historical predicates** (all facts with rkey at end):
+- `_all_follows(A, B, Rkey)` - includes superseded facts
 
 **Metadata relations**:
 - `_fact(Rkey, Predicate, Cid)` - base relation for all facts
 - `_confidence(Rkey, Value)` - only facts with confidence ≠ 1.0
 - `_source(Rkey, SourceCid)` - only facts with source set
 - `_supersedes(NewRkey, OldRkey)` - supersession chain
+- `_created_at(Rkey, Timestamp)` - when each fact was created (ISO8601)
 
 ## Example Queries
 
-- Current follows: `follows(X, Y)`
-- All historical follows: `_all_follows(Rkey, X, Y)`
+- Current follows: `follows(X, Y, _)` or `follows(X, Y, R)` to get rkey
+- All historical follows: `_all_follows(X, Y, Rkey)`
 - Find what a fact superseded: `_supersedes(NewRkey, OldRkey)`
-- Low-confidence facts: `_all_follows(Rkey, X, Y), _confidence(Rkey, C), C < 0.8`
-- Facts with sources: `_fact(Rkey, _, _), _source(Rkey, Src)`"#.to_string(),
+- Low-confidence facts: `_all_follows(X, Y, R), _confidence(R, C), C < 0.8`
+- Facts with sources: `_fact(Rkey, _, _), _source(Rkey, Src)`
+
+**Temporal queries**:
+- Facts after a date: `_all_follows(X, Y, R), _created_at(R, T), T > "2026-01-15T00:00:00Z"`
+- Recent facts: `_fact(R, P, _), _created_at(R, T), T > "2026-01-01T00:00:00Z"`
+
+**Ephemeral facts** (extra_facts parameter):
+Inject runtime context without persisting to the PDS. Useful for thread state, time-based reasoning, etc.
+Example: `extra_facts: ["thread_depth(\"at://...\", \"7\")", "my_reply_count(\"at://...\", \"4\")"]`
+
+**Ad-hoc declarations** (extra_declarations parameter):
+Declare predicates at query time for predicates not yet stored.
+Example: `extra_declarations: ["my_pred(arg1: symbol, arg2: symbol)"]`"#.to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The query predicate to evaluate (e.g., 'follows(X, Y)' for current facts, '_all_follows(Rkey, X, Y)' for historical)"
+                        "description": "The query predicate to evaluate (e.g., 'follows(X, Y, _)' for current facts, '_all_follows(X, Y, Rkey)' for historical)"
                     },
                     "extra_rules": {
                         "type": "string",
                         "description": "Optional ad-hoc rules to include in the query (Soufflé syntax)"
+                    },
+                    "extra_facts": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional ephemeral facts to inject at query time (e.g., [\"thread_depth(\\\"uri\\\", \\\"5\\\")\"]). Not persisted."
+                    },
+                    "extra_declarations": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional ad-hoc predicate declarations (e.g., [\"my_pred(arg1: symbol, arg2: symbol)\"]). For predicates not yet stored."
                     }
                 },
                 "required": ["query"]
+            }),
+        },
+        ToolDefinition {
+            name: "list_predicates".to_string(),
+            description: r#"List all available predicates with their arities.
+
+Shows three categories:
+- **User predicates**: From your facts in the PDS (e.g., `thread_completed(arg0, arg1, arg2)`)
+- **Derived predicates**: Auto-generated from records (e.g., `follows`, `has_note`)
+- **Metadata predicates**: System predicates for querying fact metadata
+
+For each predicate, shows:
+- Name and arity
+- The `_all_` variant (includes rkey for historical queries)
+- Example usage pattern"#.to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
             }),
         },
     ]
@@ -142,6 +184,14 @@ pub async fn create_fact(state: &ToolState, arguments: &HashMap<String, Value>) 
         Some(p) => p,
         None => return CallToolResult::error("Missing required parameter: predicate"),
     };
+
+    // Check if this predicate is derived (automatically generated from PDS records)
+    if DerivedFactGenerator::is_derived(predicate) {
+        return CallToolResult::error(format!(
+            "Cannot create derived fact. '{}' is automatically generated from PDS records.",
+            predicate
+        ));
+    }
 
     let args: Vec<String> = match arguments.get("args").and_then(|v| v.as_array()) {
         Some(a) => match parse_string_array(a, "args") {
@@ -183,16 +233,22 @@ pub async fn create_fact(state: &ToolState, arguments: &HashMap<String, Value>) 
         .create_record(FACT_COLLECTION, Some(&rkey), &fact)
         .await
     {
-        Ok(response) => CallToolResult::success(
-            json!({
-                "rkey": rkey,
-                "uri": response.uri,
-                "cid": response.cid,
-                "predicate": predicate,
-                "args": fact.args
-            })
-            .to_string(),
-        ),
+        Ok(response) => {
+            // Update cache so subsequent queries see the change immediately
+            if let Some(cache) = &state.cache {
+                cache.upsert_fact(rkey.clone(), fact.clone(), response.cid.clone());
+            }
+            CallToolResult::success(
+                json!({
+                    "rkey": rkey,
+                    "uri": response.uri,
+                    "cid": response.cid,
+                    "predicate": predicate,
+                    "args": fact.args
+                })
+                .to_string(),
+            )
+        }
         Err(e) => CallToolResult::error(format!("Failed to create fact: {}", e)),
     }
 }
@@ -217,14 +273,24 @@ pub async fn update_fact(state: &ToolState, arguments: &HashMap<String, Value>) 
     };
 
     // Get the old fact to get its CID for the supersedes reference
-    let old_cid = match state
+    let old_record = match state
         .atproto
         .get_record::<Fact>(FACT_COLLECTION, rkey)
         .await
     {
-        Ok(record) => record.cid,
+        Ok(record) => record,
         Err(e) => return CallToolResult::error(format!("Failed to get existing fact: {}", e)),
     };
+
+    // Check if the old fact's predicate is derived (automatically generated from PDS records)
+    if DerivedFactGenerator::is_derived(&old_record.value.predicate) {
+        return CallToolResult::error(format!(
+            "Cannot update derived fact. '{}' is automatically generated from PDS records.",
+            old_record.value.predicate
+        ));
+    }
+
+    let old_cid = old_record.cid;
 
     let confidence = arguments
         .get("confidence")
@@ -260,6 +326,10 @@ pub async fn update_fact(state: &ToolState, arguments: &HashMap<String, Value>) 
         .await
     {
         Ok(response) => {
+            // Update cache with the new fact
+            if let Some(cache) = &state.cache {
+                cache.upsert_fact(new_rkey.clone(), fact.clone(), response.cid.clone());
+            }
             // Old fact is preserved for historical queries.
             // The supersedes reference in the new fact links them.
             CallToolResult::success(
@@ -283,14 +353,38 @@ pub async fn delete_fact(state: &ToolState, arguments: &HashMap<String, Value>) 
         None => return CallToolResult::error("Missing required parameter: rkey"),
     };
 
+    // First, fetch the fact to check if it's a derived predicate
+    let fact = match state
+        .atproto
+        .get_record::<Fact>(FACT_COLLECTION, rkey)
+        .await
+    {
+        Ok(record) => record.value,
+        Err(e) => return CallToolResult::error(format!("Failed to get fact: {}", e)),
+    };
+
+    // Check if this predicate is derived (automatically generated from PDS records)
+    if DerivedFactGenerator::is_derived(&fact.predicate) {
+        return CallToolResult::error(format!(
+            "Cannot delete derived fact. '{}' is automatically generated from PDS records.",
+            fact.predicate
+        ));
+    }
+
     match state.atproto.delete_record(FACT_COLLECTION, rkey).await {
-        Ok(()) => CallToolResult::success(
-            json!({
-                "deleted": true,
-                "rkey": rkey
-            })
-            .to_string(),
-        ),
+        Ok(()) => {
+            // Remove from cache
+            if let Some(cache) = &state.cache {
+                cache.delete_fact(rkey);
+            }
+            CallToolResult::success(
+                json!({
+                    "deleted": true,
+                    "rkey": rkey
+                })
+                .to_string(),
+            )
+        }
         Err(e) => CallToolResult::error(format!("Failed to delete fact: {}", e)),
     }
 }
@@ -299,7 +393,10 @@ pub async fn delete_fact(state: &ToolState, arguments: &HashMap<String, Value>) 
 const MAX_QUERY_LENGTH: usize = 4096;
 
 /// Patterns that could indicate shell injection attempts.
-const FORBIDDEN_PATTERNS: &[&str] = &["$(", "`", "&&", "||", ";", "|", ">", "<", "\n", "\r"];
+/// Note: > and < are allowed because they're valid datalog comparison operators.
+/// Note: \n and \r are allowed because queries are written to a file, not interpolated
+/// into shell commands, and multi-line rules/declarations are common.
+const FORBIDDEN_PATTERNS: &[&str] = &["$(", "`", "&&", "||", ";", "|"];
 
 pub async fn query_facts(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
     let query = match arguments.get("query").and_then(|v| v.as_str()) {
@@ -347,12 +444,112 @@ pub async fn query_facts(state: &ToolState, arguments: &HashMap<String, Value>) 
         }
     }
 
-    // Try to use DatalogCache for efficient incremental queries
+    // Parse and validate extra_facts if provided
+    let extra_facts: Option<Vec<String>> = arguments
+        .get("extra_facts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
+
+    // Validate extra_facts if provided
+    if let Some(ref facts) = extra_facts {
+        let total_len: usize = facts.iter().map(|f| f.len()).sum();
+        if total_len > MAX_QUERY_LENGTH {
+            return CallToolResult::error(format!(
+                "Extra facts too long: {} chars (max {})",
+                total_len, MAX_QUERY_LENGTH
+            ));
+        }
+        for fact in facts {
+            for pattern in FORBIDDEN_PATTERNS {
+                if fact.contains(pattern) {
+                    return CallToolResult::error(format!(
+                        "Extra fact contains forbidden pattern: {:?}",
+                        pattern
+                    ));
+                }
+            }
+        }
+    }
+
+    // Parse and validate extra_declarations if provided
+    let extra_declarations: Option<Vec<String>> = arguments
+        .get("extra_declarations")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        });
+
+    // Validate extra_declarations if provided
+    if let Some(ref decls) = extra_declarations {
+        let total_len: usize = decls.iter().map(|d| d.len()).sum();
+        if total_len > MAX_QUERY_LENGTH {
+            return CallToolResult::error(format!(
+                "Extra declarations too long: {} chars (max {})",
+                total_len, MAX_QUERY_LENGTH
+            ));
+        }
+        for decl in decls {
+            for pattern in FORBIDDEN_PATTERNS {
+                if decl.contains(pattern) {
+                    return CallToolResult::error(format!(
+                        "Extra declaration contains forbidden pattern: {:?}",
+                        pattern
+                    ));
+                }
+            }
+        }
+    }
+
+    // Try to use DatalogCoordinator for serialized access (preferred)
+    if let Some(ref coordinator) = state.datalog_coordinator {
+        debug!("using DatalogCoordinator for query_facts");
+
+        // Execute query through the coordinator (serializes TSV access)
+        let tuples = match coordinator
+            .query_with_facts_and_declarations(
+                query,
+                extra_rules,
+                extra_facts.as_deref(),
+                extra_declarations.as_deref(),
+            )
+            .await
+        {
+            Ok(tuples) => tuples,
+            Err(e) => return CallToolResult::error(format!("Failed to execute query: {}", e)),
+        };
+
+        let results: Vec<Value> = tuples.into_iter().map(|tuple| json!(tuple)).collect();
+
+        return CallToolResult::success(
+            json!({
+                "query": query,
+                "results": results,
+                "count": results.len()
+            })
+            .to_string(),
+        );
+    }
+
+    // Fall back to direct DatalogCache access (single-process scenarios)
     if let Some(ref datalog_cache) = state.datalog_cache {
         debug!("using DatalogCache for query_facts");
 
         // Execute query using the cached datalog state
-        let tuples = match datalog_cache.execute_query(query, extra_rules).await {
+        let tuples = match datalog_cache
+            .execute_query_with_facts_and_declarations(
+                query,
+                extra_rules,
+                extra_facts.as_deref(),
+                extra_declarations.as_deref(),
+            )
+            .await
+        {
             Ok(tuples) => tuples,
             Err(e) => return CallToolResult::error(format!("Failed to execute query: {}", e)),
         };
@@ -454,23 +651,27 @@ pub async fn query_facts(state: &ToolState, arguments: &HashMap<String, Value>) 
         Err(e) => return CallToolResult::error(format!("Failed to compile rules: {}", e)),
     }
 
-    // Add extra ad-hoc rules if provided
+    // Generate declarations for ad-hoc rule heads BEFORE adding the rules
     if let Some(extra) = extra_rules {
+        let heads = RuleCompiler::parse_extra_rules_heads(extra);
+        for (name, arity) in heads {
+            if !declared_predicates.contains(&name) {
+                let params: Vec<String> = (0..arity)
+                    .map(|i| format!("arg{}: symbol", i))
+                    .collect();
+                program.push_str(&format!(".decl {}({})\n", name, params.join(", ")));
+                declared_predicates.insert(name);
+            }
+        }
+
         program.push_str("// Ad-hoc rules\n");
         program.push_str(extra);
         program.push_str("\n\n");
     }
 
-    // Parse the query to extract predicate name and arity
-    let (query_pred, query_arity) = parse_query_predicate(query);
-
-    // Generate output declaration for the query predicate
-    // Skip .decl if predicate was already declared by input facts or rules
-    program.push_str(&RuleCompiler::generate_output_declaration(
-        &query_pred,
-        query_arity,
-        Some(&declared_predicates),
-    ));
+    // Generate wrapper rule that properly handles constants as filters
+    let (wrapper, _result_arity) = generate_query_wrapper(query, Some(&declared_predicates));
+    program.push_str(&wrapper);
 
     debug!(program = %program, "Generated Soufflé program");
 
@@ -497,27 +698,279 @@ pub async fn query_facts(state: &ToolState, arguments: &HashMap<String, Value>) 
     )
 }
 
-/// Parse a query predicate to extract the name and arity.
-/// e.g., "mutual_follow(X, Y)" -> ("mutual_follow", 2)
-fn parse_query_predicate(query: &str) -> (String, usize) {
-    if let Some(paren_idx) = query.find('(') {
-        let name = query[..paren_idx].trim().to_string();
-        let args_part = &query[paren_idx..];
+pub async fn list_predicates(state: &ToolState) -> CallToolResult {
+    let mut user_predicates: Vec<Value> = Vec::new();
+    let mut derived_predicates: Vec<Value> = Vec::new();
+    let mut metadata_predicates: Vec<Value> = Vec::new();
 
-        // Count arguments by counting commas + 1
-        let arity = if args_part.contains(',') {
-            args_part.matches(',').count() + 1
-        } else if args_part.contains("()") || args_part.trim() == "()" {
-            0
-        } else {
-            1
-        };
+    // Get derived predicates with full info from DerivedFactGenerator
+    for (name, info) in DerivedFactGenerator::predicate_info() {
+        let signature = format!("{}({})", name, info.args.join(", "));
+        let all_signature = format!("_all_{}({})", name, info.args.join(", "));
 
-        (name, arity)
-    } else {
-        // No parentheses, assume it's just a predicate name with arity 0
-        (query.trim().to_string(), 0)
+        derived_predicates.push(json!({
+            "name": name,
+            "arity": info.arity,
+            "signature": signature,
+            "all_signature": all_signature,
+            "description": info.description,
+            "note": if name == "is_followed_by" { "No rkey (from external API)" } else { "Last arg is rkey" },
+        }));
     }
+
+    // Metadata predicates (fixed arities)
+    let meta = vec![
+        ("_fact", 3, "rkey, predicate, cid"),
+        ("_confidence", 2, "rkey, value"),
+        ("_source", 2, "rkey, source_cid"),
+        ("_supersedes", 2, "new_rkey, old_rkey"),
+        ("_created_at", 2, "rkey, timestamp"),
+    ];
+    for (name, arity, args) in meta {
+        metadata_predicates.push(json!({
+            "name": name,
+            "arity": arity,
+            "signature": format!("{}({})", name, args),
+        }));
+    }
+
+    // Get user predicates by querying _fact relation
+    let fact_results = if let Some(ref coordinator) = state.datalog_coordinator {
+        coordinator.query("_fact(R, P, C)", None).await.ok()
+    } else if let Some(ref datalog_cache) = state.datalog_cache {
+        datalog_cache.execute_query("_fact(R, P, C)", None).await.ok()
+    } else {
+        None
+    };
+
+    if let Some(results) = fact_results {
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for row in &results {
+            if row.len() >= 2 {
+                seen.insert(row[1].clone());
+            }
+        }
+
+        for pred in seen {
+            // Skip derived predicates (listed separately)
+            if DerivedFactGenerator::is_derived(&pred) {
+                continue;
+            }
+            user_predicates.push(json!({
+                "name": pred,
+                "tip": format!("To check arity, query: {}(A, B, ...) or check {}.facts TSV file", pred, pred),
+            }));
+        }
+    }
+
+    CallToolResult::success(
+        json!({
+            "user_predicates": user_predicates,
+            "derived_predicates": derived_predicates,
+            "metadata_predicates": metadata_predicates,
+            "usage_notes": {
+                "current_facts": "Use predicate(args..., Rkey) for current (non-superseded) facts - rkey is last arg",
+                "historical_facts": "Use _all_predicate(args..., Rkey) to include superseded facts - same format",
+                "rkey_wildcard": "Use _ for rkey if you don't need it: follows(X, Y, _)",
+                "arity_check": "If unsure of arity, query: predicate(A, B, ..., R) with enough variables"
+            }
+        })
+        .to_string(),
+    )
+}
+
+/// Represents a query argument - either a variable or a constant.
+#[derive(Debug, Clone, PartialEq)]
+enum QueryArg {
+    Variable(String),
+    Constant(String),
+}
+
+/// Parsed query with predicate name and arguments.
+#[derive(Debug)]
+struct ParsedQuery {
+    #[allow(dead_code)]
+    name: String,
+    args: Vec<QueryArg>,
+}
+
+impl ParsedQuery {
+    /// Get the variables in this query (for use in result predicate).
+    fn variables(&self) -> Vec<&str> {
+        self.args
+            .iter()
+            .filter_map(|arg| match arg {
+                QueryArg::Variable(v) => Some(v.as_str()),
+                QueryArg::Constant(_) => None,
+            })
+            .collect()
+    }
+
+    /// Get the arity (number of arguments).
+    fn arity(&self) -> usize {
+        self.args.len()
+    }
+}
+
+/// Parse a query to extract predicate name and typed arguments.
+/// e.g., "should_engage(\"did:plc:abc\")" -> ParsedQuery { name: "should_engage", args: [Constant("\"did:plc:abc\"")] }
+/// e.g., "follows(X, Y)" -> ParsedQuery { name: "follows", args: [Variable("X"), Variable("Y")] }
+fn parse_query(query: &str) -> Option<ParsedQuery> {
+    let paren_idx = query.find('(')?;
+    let name = query[..paren_idx].trim().to_string();
+
+    let close_paren = query.rfind(')')?;
+    let args_str = &query[paren_idx + 1..close_paren];
+
+    if args_str.trim().is_empty() {
+        return Some(ParsedQuery {
+            name,
+            args: vec![],
+        });
+    }
+
+    // Parse arguments, handling quoted strings and nested parens
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_string = false;
+    let mut depth = 0;
+
+    for c in args_str.chars() {
+        match c {
+            '"' if depth == 0 => {
+                in_string = !in_string;
+                current.push(c);
+            }
+            '(' => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if !in_string && depth == 0 => {
+                let arg = current.trim().to_string();
+                if !arg.is_empty() {
+                    args.push(parse_single_arg(&arg));
+                }
+                current.clear();
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+
+    // Don't forget the last argument
+    let arg = current.trim().to_string();
+    if !arg.is_empty() {
+        args.push(parse_single_arg(&arg));
+    }
+
+    Some(ParsedQuery { name, args })
+}
+
+/// Parse a single argument to determine if it's a variable or constant.
+fn parse_single_arg(arg: &str) -> QueryArg {
+    let arg = arg.trim();
+    if arg.starts_with('"') && arg.ends_with('"') {
+        // String constant
+        QueryArg::Constant(arg.to_string())
+    } else if arg
+        .chars()
+        .next()
+        .map(|c| c.is_uppercase() || c == '_')
+        .unwrap_or(false)
+    {
+        // Starts with uppercase or underscore = variable in Datalog convention
+        QueryArg::Variable(arg.to_string())
+    } else {
+        // Numeric constant or other literal
+        QueryArg::Constant(arg.to_string())
+    }
+}
+
+/// Generate a wrapper rule and output declaration for a query.
+/// This ensures constants in the query are properly used as filters.
+fn generate_query_wrapper(
+    query: &str,
+    declared_predicates: Option<&std::collections::HashSet<String>>,
+) -> (String, usize) {
+    let parsed = match parse_query(query) {
+        Some(p) => p,
+        None => {
+            // Fallback: treat as nullary predicate
+            return (
+                format!(
+                    ".decl _query_result()\n.output _query_result\n_query_result() :- {}.\n",
+                    query
+                ),
+                0,
+            );
+        }
+    };
+
+    let variables = parsed.variables();
+    let result_arity = if variables.is_empty() {
+        // No variables - but if there are constants, return them so user sees what matched
+        parsed.arity()
+    } else {
+        variables.len()
+    };
+
+    // Build the result predicate declaration
+    let decl = if result_arity > 0 {
+        let params: Vec<String> = (0..result_arity)
+            .map(|i| format!("arg{}: symbol", i))
+            .collect();
+        format!(".decl _query_result({})\n", params.join(", "))
+    } else {
+        ".decl _query_result()\n".to_string()
+    };
+
+    // Build the wrapper rule head
+    let head_args = if variables.is_empty() {
+        // All constants - include them in the output
+        parsed
+            .args
+            .iter()
+            .map(|a| match a {
+                QueryArg::Constant(c) => c.as_str(),
+                QueryArg::Variable(v) => v.as_str(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        variables.join(", ")
+    };
+
+    let head = if head_args.is_empty() {
+        "_query_result()".to_string()
+    } else {
+        format!("_query_result({})", head_args)
+    };
+
+    // Check if the base predicate needs declaration (for direct predicate queries without rules)
+    let base_decl = if let Some(declared) = declared_predicates {
+        if !declared.contains(&parsed.name) && parsed.arity() > 0 {
+            let params: Vec<String> = (0..parsed.arity())
+                .map(|i| format!("arg{}: symbol", i))
+                .collect();
+            format!(".decl {}({})\n", parsed.name, params.join(", "))
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let wrapper = format!(
+        "{}{}.output _query_result\n{} :- {}.\n",
+        base_decl, decl, head, query
+    );
+
+    (wrapper, result_arity)
 }
 
 /// Parse a JSON array into a Vec<String>, returning an error if any element is not a string.
@@ -585,38 +1038,113 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_query_predicate_binary() {
-        let (name, arity) = parse_query_predicate("mutual_follow(X, Y)");
-        assert_eq!(name, "mutual_follow");
+    fn test_parse_query_with_variables() {
+        let parsed = parse_query("mutual_follow(X, Y)").unwrap();
+        assert_eq!(parsed.name, "mutual_follow");
+        assert_eq!(parsed.arity(), 2);
+        assert_eq!(
+            parsed.args,
+            vec![
+                QueryArg::Variable("X".to_string()),
+                QueryArg::Variable("Y".to_string())
+            ]
+        );
+        assert_eq!(parsed.variables(), vec!["X", "Y"]);
+    }
+
+    #[test]
+    fn test_parse_query_with_constant() {
+        let parsed = parse_query(r#"should_engage("did:plc:abc")"#).unwrap();
+        assert_eq!(parsed.name, "should_engage");
+        assert_eq!(parsed.arity(), 1);
+        assert_eq!(
+            parsed.args,
+            vec![QueryArg::Constant(r#""did:plc:abc""#.to_string())]
+        );
+        assert!(parsed.variables().is_empty());
+    }
+
+    #[test]
+    fn test_parse_query_mixed_args() {
+        let parsed = parse_query(r#"follows(X, "did:plc:abc")"#).unwrap();
+        assert_eq!(parsed.name, "follows");
+        assert_eq!(parsed.arity(), 2);
+        assert_eq!(
+            parsed.args,
+            vec![
+                QueryArg::Variable("X".to_string()),
+                QueryArg::Constant(r#""did:plc:abc""#.to_string())
+            ]
+        );
+        assert_eq!(parsed.variables(), vec!["X"]);
+    }
+
+    #[test]
+    fn test_parse_query_nullary() {
+        let parsed = parse_query("has_data()").unwrap();
+        assert_eq!(parsed.name, "has_data");
+        assert_eq!(parsed.arity(), 0);
+        assert!(parsed.args.is_empty());
+    }
+
+    #[test]
+    fn test_parse_query_underscore_variable() {
+        let parsed = parse_query("foo(_X, Y)").unwrap();
+        assert_eq!(
+            parsed.args,
+            vec![
+                QueryArg::Variable("_X".to_string()),
+                QueryArg::Variable("Y".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_query_numeric_constant() {
+        let parsed = parse_query("age(X, 42)").unwrap();
+        assert_eq!(
+            parsed.args,
+            vec![
+                QueryArg::Variable("X".to_string()),
+                QueryArg::Constant("42".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_generate_query_wrapper_all_variables() {
+        let (wrapper, arity) = generate_query_wrapper("follows(X, Y)", None);
         assert_eq!(arity, 2);
+        assert!(wrapper.contains(".decl _query_result(arg0: symbol, arg1: symbol)"));
+        assert!(wrapper.contains(".output _query_result"));
+        assert!(wrapper.contains("_query_result(X, Y) :- follows(X, Y)."));
     }
 
     #[test]
-    fn test_parse_query_predicate_unary() {
-        let (name, arity) = parse_query_predicate("is_active(X)");
-        assert_eq!(name, "is_active");
+    fn test_generate_query_wrapper_with_constant() {
+        let (wrapper, arity) = generate_query_wrapper(r#"should_engage("did:plc:abc")"#, None);
+        // When all args are constants, we still output them so user sees what matched
         assert_eq!(arity, 1);
+        assert!(wrapper.contains(".decl _query_result(arg0: symbol)"));
+        assert!(wrapper.contains(".output _query_result"));
+        assert!(wrapper.contains(r#"_query_result("did:plc:abc") :- should_engage("did:plc:abc")."#));
     }
 
     #[test]
-    fn test_parse_query_predicate_nullary() {
-        let (name, arity) = parse_query_predicate("has_data()");
-        assert_eq!(name, "has_data");
+    fn test_generate_query_wrapper_mixed() {
+        let (wrapper, arity) = generate_query_wrapper(r#"follows(X, "did:plc:abc")"#, None);
+        // Only variables in output
+        assert_eq!(arity, 1);
+        assert!(wrapper.contains(".decl _query_result(arg0: symbol)"));
+        assert!(wrapper.contains(r#"_query_result(X) :- follows(X, "did:plc:abc")."#));
+    }
+
+    #[test]
+    fn test_generate_query_wrapper_nullary() {
+        let (wrapper, arity) = generate_query_wrapper("has_data()", None);
         assert_eq!(arity, 0);
-    }
-
-    #[test]
-    fn test_parse_query_predicate_no_parens() {
-        let (name, arity) = parse_query_predicate("some_fact");
-        assert_eq!(name, "some_fact");
-        assert_eq!(arity, 0);
-    }
-
-    #[test]
-    fn test_parse_query_predicate_ternary() {
-        let (name, arity) = parse_query_predicate("relationship(A, B, C)");
-        assert_eq!(name, "relationship");
-        assert_eq!(arity, 3);
+        assert!(wrapper.contains(".decl _query_result()"));
+        assert!(wrapper.contains("_query_result() :- has_data()."));
     }
 
     #[test]
@@ -666,6 +1194,14 @@ mod tests {
         assert!(FORBIDDEN_PATTERNS.contains(&"`"));
         assert!(FORBIDDEN_PATTERNS.contains(&";"));
         assert!(FORBIDDEN_PATTERNS.contains(&"|"));
+
+        // > and < are intentionally allowed for datalog comparisons
+        assert!(!FORBIDDEN_PATTERNS.contains(&">"));
+        assert!(!FORBIDDEN_PATTERNS.contains(&"<"));
+
+        // \n and \r are intentionally allowed for multi-line rules
+        assert!(!FORBIDDEN_PATTERNS.contains(&"\n"));
+        assert!(!FORBIDDEN_PATTERNS.contains(&"\r"));
     }
 
     #[test]
