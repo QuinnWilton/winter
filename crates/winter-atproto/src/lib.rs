@@ -20,7 +20,11 @@ mod records;
 pub mod sync;
 mod types;
 
-pub use cache::{CacheUpdate, CachedRecord, FirehoseCommit, FirehoseOp, RepoCache, SyncState};
+pub use cache::{
+    CacheUpdate, CachedRecord, FirehoseCommit, FirehoseOp, RepoCache, ScopeFilter, SyncState,
+};
+// Re-export FactDeclaration types explicitly for clarity
+pub use types::{FactDeclArg, FactDeclaration};
 pub use car::{CarParseResult, parse_car};
 pub use client::AtprotoClient;
 pub use error::AtprotoError;

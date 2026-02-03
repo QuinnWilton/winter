@@ -1,0 +1,79 @@
+{
+  "lexicon": 1,
+  "id": "diy.razorgirl.winter.toolApproval",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Approval status for a custom tool, stored separately from the tool itself",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": ["toolRkey", "toolVersion", "status", "createdAt"],
+        "properties": {
+          "toolRkey": {
+            "type": "string",
+            "description": "The rkey of the tool this approval applies to"
+          },
+          "toolVersion": {
+            "type": "integer",
+            "description": "The version of the tool that was approved",
+            "minimum": 1
+          },
+          "status": {
+            "type": "string",
+            "description": "Current approval status",
+            "knownValues": ["approved", "denied", "revoked"]
+          },
+          "allowNetwork": {
+            "type": "boolean",
+            "description": "Whether the tool is allowed network access"
+          },
+          "allowedSecrets": {
+            "type": "array",
+            "description": "Which secrets from requiredSecrets are actually granted",
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            }
+          },
+          "workspacePath": {
+            "type": "string",
+            "description": "Absolute path to the workspace directory (if workspace access is granted)",
+            "maxLength": 512
+          },
+          "allowWorkspaceRead": {
+            "type": "boolean",
+            "description": "Whether the tool can read from the workspace directory"
+          },
+          "allowWorkspaceWrite": {
+            "type": "boolean",
+            "description": "Whether the tool can write to the workspace directory"
+          },
+          "allowedCommands": {
+            "type": "array",
+            "description": "Which subprocess commands are granted (e.g., ['git'])",
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            }
+          },
+          "approvedBy": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the operator who approved/denied"
+          },
+          "reason": {
+            "type": "string",
+            "description": "Reason for the approval decision",
+            "maxLength": 1024
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the approval was created"
+          }
+        }
+      }
+    }
+  }
+}

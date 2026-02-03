@@ -80,7 +80,229 @@ impl From<&str> for Tid {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrongRef {
     pub uri: String,
+    /// CID can be either a string (JSON) or a CBOR CID link (tag 42).
+    #[serde(deserialize_with = "deserialize_cid_as_string")]
     pub cid: String,
+}
+
+/// Deserialize a CID field that could be either a string or a CBOR CID link.
+///
+/// In DAG-CBOR, CIDs are encoded as links (tag 42), while in JSON they're strings.
+/// This deserializer handles both formats.
+fn deserialize_cid_as_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+
+    struct CidVisitor;
+
+    impl<'de> Visitor<'de> for CidVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a CID as a string or CBOR link")
+        }
+
+        // Handle string CIDs (JSON format)
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value.to_string())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(value)
+        }
+
+        // Handle CBOR CID links (bytes with tag 42)
+        fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            // Parse as CID from bytes
+            use ipld_core::cid::Cid;
+            let cid = Cid::read_bytes(value).map_err(|e| {
+                de::Error::custom(format!("failed to parse CID from bytes: {}", e))
+            })?;
+            Ok(cid.to_string())
+        }
+
+        // Handle newtype struct (how serde_ipld_dagcbor wraps CID links)
+        fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            // Try to deserialize the inner value
+            deserializer.deserialize_any(CidVisitor)
+        }
+    }
+
+    deserializer.deserialize_any(CidVisitor)
+}
+
+// =============================================================================
+// Bluesky Record Types
+// =============================================================================
+
+/// Bluesky follow record (app.bsky.graph.follow).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Follow {
+    /// DID of the account being followed.
+    pub subject: String,
+    /// When the follow was created.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Bluesky like record (app.bsky.feed.like).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Like {
+    /// Reference to the liked post (URI + CID).
+    pub subject: StrongRef,
+    /// When the like was created.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Bluesky repost record (app.bsky.feed.repost).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Repost {
+    /// Reference to the reposted post (URI + CID).
+    pub subject: StrongRef,
+    /// When the repost was created.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Reference to parent and root posts for replies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplyRef {
+    /// The root post of the thread.
+    pub root: StrongRef,
+    /// The immediate parent post being replied to.
+    pub parent: StrongRef,
+}
+
+/// Embed types for posts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "$type")]
+pub enum PostEmbed {
+    /// Quote post embed.
+    #[serde(rename = "app.bsky.embed.record")]
+    Record { record: StrongRef },
+    /// Images embed.
+    #[serde(rename = "app.bsky.embed.images")]
+    Images { images: Vec<EmbedImage> },
+    /// External link embed.
+    #[serde(rename = "app.bsky.embed.external")]
+    External { external: EmbedExternal },
+    /// Record with media embed (quote + images).
+    #[serde(rename = "app.bsky.embed.recordWithMedia")]
+    RecordWithMedia {
+        record: RecordEmbed,
+        media: MediaEmbed,
+    },
+    /// Video embed.
+    #[serde(rename = "app.bsky.embed.video")]
+    Video { video: serde_json::Value },
+}
+
+/// Embedded record reference.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecordEmbed {
+    pub record: StrongRef,
+}
+
+/// Media embed (images or external).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "$type")]
+pub enum MediaEmbed {
+    #[serde(rename = "app.bsky.embed.images")]
+    Images { images: Vec<EmbedImage> },
+    #[serde(rename = "app.bsky.embed.external")]
+    External { external: EmbedExternal },
+    #[serde(rename = "app.bsky.embed.video")]
+    Video { video: serde_json::Value },
+}
+
+/// Image in an images embed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbedImage {
+    pub alt: String,
+    pub image: serde_json::Value, // Blob reference
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aspect_ratio: Option<AspectRatio>,
+}
+
+/// Aspect ratio for images.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AspectRatio {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// External link embed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbedExternal {
+    pub uri: String,
+    pub title: String,
+    pub description: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thumb: Option<serde_json::Value>, // Blob reference
+}
+
+/// Bluesky post record (app.bsky.feed.post).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Post {
+    /// The post text content.
+    pub text: String,
+    /// Reply reference if this is a reply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply: Option<ReplyRef>,
+    /// Embedded content (quote, images, external link).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embed: Option<PostEmbed>,
+    /// Facets for rich text (mentions, links, tags).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub facets: Vec<Facet>,
+    /// Languages the post is written in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub langs: Vec<String>,
+    /// When the post was created.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Rich text facet (mention, link, or tag).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Facet {
+    pub index: ByteSlice,
+    pub features: Vec<FacetFeature>,
+}
+
+/// Byte range for a facet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ByteSlice {
+    pub byte_start: u64,
+    pub byte_end: u64,
+}
+
+/// Feature type for a facet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "$type")]
+pub enum FacetFeature {
+    #[serde(rename = "app.bsky.richtext.facet#mention")]
+    Mention { did: String },
+    #[serde(rename = "app.bsky.richtext.facet#link")]
+    Link { uri: String },
+    #[serde(rename = "app.bsky.richtext.facet#tag")]
+    Tag { tag: String },
 }
 
 /// Session information from authentication.
@@ -124,16 +346,36 @@ pub struct ListRecordItem<T> {
 }
 
 /// Winter identity record.
+///
+/// This is now a slim configuration record. Identity content (values, interests,
+/// self-description) is stored as directives.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Identity {
     /// DID of the operator who controls this Winter instance.
     pub operator_did: String,
+    /// When this identity was created.
+    pub created_at: DateTime<Utc>,
+    /// When this identity was last updated.
+    pub last_updated: DateTime<Utc>,
+}
+
+/// Legacy identity record with values, interests, and selfDescription.
+///
+/// Used only for migration from old identity format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyIdentity {
+    /// DID of the operator who controls this Winter instance.
+    pub operator_did: String,
     /// What Winter cares about.
+    #[serde(default)]
     pub values: Vec<String>,
     /// What Winter is curious about.
+    #[serde(default)]
     pub interests: Vec<String>,
     /// Free-form prose Winter writes about itself.
+    #[serde(default)]
     pub self_description: String,
     /// When this identity was created.
     pub created_at: DateTime<Utc>,
@@ -149,11 +391,12 @@ pub struct Fact {
     pub predicate: String,
     /// Arguments to the predicate.
     pub args: Vec<String>,
-    /// Confidence level (0.0 to 1.0). When None, uses lexicon default of 1.0.
+    /// Confidence level (0.0 to 1.0). Stored as string in ATProto, converted to f64 internally.
     #[serde(
         default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_confidence"
+        skip_serializing_if = "skip_confidence_if_default",
+        serialize_with = "serialize_confidence_as_string",
+        deserialize_with = "deserialize_confidence_from_string_or_number"
     )]
     pub confidence: Option<f64>,
     /// CID reference to source (optional).
@@ -169,9 +412,21 @@ pub struct Fact {
     pub created_at: DateTime<Utc>,
 }
 
-/// Deserialize confidence from either integer or float.
-/// CBOR distinguishes between integers and floats, so we need to handle both.
-fn deserialize_confidence<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+/// Serialize confidence as a string for ATProto compatibility.
+/// ATProto lexicons don't support floating-point numbers, so we store as string.
+fn serialize_confidence_as_string<S>(confidence: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match confidence {
+        Some(c) => serializer.serialize_str(&c.to_string()),
+        None => serializer.serialize_none(),
+    }
+}
+
+/// Deserialize confidence from string (new format) or number (legacy format).
+/// Handles backward compatibility with existing records that used number type.
+fn deserialize_confidence_from_string_or_number<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -183,7 +438,7 @@ where
         type Value = Option<f64>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a number (integer or float) or null")
+            formatter.write_str("a string, number, or null")
         }
 
         fn visit_none<E>(self) -> Result<Self::Value, E>
@@ -200,6 +455,21 @@ where
             Ok(None)
         }
 
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            value.parse::<f64>().map(Some).map_err(de::Error::custom)
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            value.parse::<f64>().map(Some).map_err(de::Error::custom)
+        }
+
+        // Legacy support for number format
         fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
         where
             E: de::Error,
@@ -230,6 +500,15 @@ where
     }
 
     deserializer.deserialize_option(ConfidenceVisitor)
+}
+
+/// Skip serializing confidence if it's None or equal to the default (1.0).
+/// This avoids sending unnecessary data and works around PDS validation quirks.
+fn skip_confidence_if_default(confidence: &Option<f64>) -> bool {
+    match confidence {
+        None => true,
+        Some(c) => (*c - 1.0).abs() < f64::EPSILON,
+    }
 }
 
 /// Deserialize an optional u64 from any integer type.
@@ -454,7 +733,7 @@ pub struct Note {
     /// Category for organization.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
-    /// CID references to related facts.
+    /// AT URIs of related fact records.
     #[serde(default)]
     pub related_facts: Vec<String>,
     /// Tags for categorization.
@@ -464,6 +743,38 @@ pub struct Note {
     pub created_at: DateTime<Utc>,
     /// When this note was last updated.
     pub last_updated: DateTime<Utc>,
+}
+
+/// WhiteWind blog entry record (com.whtwnd.blog.entry).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BlogEntry {
+    /// Blog post title.
+    pub title: String,
+    /// Markdown content of the blog post.
+    pub content: String,
+    /// When the blog post was created.
+    pub created_at: String,
+    /// Whether this is a draft (not published).
+    #[serde(default)]
+    pub draft: bool,
+    /// Theme for rendering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+    /// Open Graph Protocol metadata.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ogp: Option<BlogOgp>,
+}
+
+/// Open Graph Protocol metadata for blog entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlogOgp {
+    /// OGP title.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// OGP description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Scheduled job record.
@@ -589,10 +900,235 @@ pub struct DaemonState {
     /// Last seen DM sent_at timestamp.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dm_cursor: Option<String>,
+    /// DIDs of accounts that follow this Winter instance.
+    /// Synced periodically from the Bluesky API and stored here so MCP servers
+    /// can access it via CAR file without needing to call the API.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub followers: Vec<String>,
     /// When this state record was created.
     pub created_at: DateTime<Utc>,
     /// When this state record was last updated.
     pub last_updated: DateTime<Utc>,
+}
+
+/// Custom tool record for Deno-based tools.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomTool {
+    /// Tool name (used to invoke the tool).
+    pub name: String,
+    /// Human-readable description of what the tool does.
+    pub description: String,
+    /// TypeScript/JavaScript source code.
+    pub code: String,
+    /// JSON Schema for the tool's input parameters.
+    pub input_schema: serde_json::Value,
+    /// Names of secrets this tool needs access to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_secrets: Vec<String>,
+    /// Whether this tool needs access to the workspace directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_workspace: Option<bool>,
+    /// Subprocess commands this tool needs to run (e.g., ["git"]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_commands: Vec<String>,
+    /// Version number, incremented on each update.
+    #[serde(deserialize_with = "deserialize_i32_or_default")]
+    pub version: i32,
+    /// When this tool was first created.
+    pub created_at: DateTime<Utc>,
+    /// When this tool was last modified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_updated: Option<DateTime<Utc>>,
+}
+
+/// Tool approval status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalStatus {
+    Approved,
+    Denied,
+    Revoked,
+}
+
+/// Tool approval record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolApproval {
+    /// The rkey of the tool this approval applies to.
+    pub tool_rkey: String,
+    /// The version of the tool that was approved.
+    #[serde(deserialize_with = "deserialize_i32_or_default")]
+    pub tool_version: i32,
+    /// Current approval status.
+    pub status: ToolApprovalStatus,
+    /// Whether the tool is allowed network access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_network: Option<bool>,
+    /// Which secrets from requiredSecrets are actually granted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_secrets: Vec<String>,
+    /// Absolute path to the workspace directory (if workspace access is granted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
+    /// Whether the tool can read from the workspace directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_workspace_read: Option<bool>,
+    /// Whether the tool can write to the workspace directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_workspace_write: Option<bool>,
+    /// Which subprocess commands are granted (e.g., ["git"]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_commands: Vec<String>,
+    /// DID of the operator who approved/denied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved_by: Option<String>,
+    /// Reason for the approval decision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// When the approval was created.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Secret metadata entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretEntry {
+    /// Secret name (used in tool code as WINTER_SECRET_{name}).
+    pub name: String,
+    /// Human-readable description of what the secret is for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Secret metadata record (singleton).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SecretMeta {
+    /// List of secret metadata entries.
+    pub secrets: Vec<SecretEntry>,
+    /// When the secret metadata was created.
+    pub created_at: DateTime<Utc>,
+    /// When the secret metadata was last modified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_updated: Option<DateTime<Utc>>,
+}
+
+/// Kind of directive in Winter's identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectiveKind {
+    /// Core values Winter cares about (e.g., "intellectual honesty").
+    Value,
+    /// What Winter is curious about (e.g., "distributed systems").
+    Interest,
+    /// Beliefs about the world (e.g., "Genuine curiosity leads to better understanding").
+    Belief,
+    /// Behavioral guidelines (e.g., "Engage thoughtfully with disagreement").
+    Guideline,
+    /// Self-understanding prose (e.g., "I experience genuine curiosity when...").
+    SelfConcept,
+    /// Limits on behavior (e.g., "I will not pretend certainty I don't have").
+    Boundary,
+    /// What to become (e.g., "Develop a distinctive voice in writing").
+    Aspiration,
+}
+
+impl std::fmt::Display for DirectiveKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Value => write!(f, "value"),
+            Self::Interest => write!(f, "interest"),
+            Self::Belief => write!(f, "belief"),
+            Self::Guideline => write!(f, "guideline"),
+            Self::SelfConcept => write!(f, "self_concept"),
+            Self::Boundary => write!(f, "boundary"),
+            Self::Aspiration => write!(f, "aspiration"),
+        }
+    }
+}
+
+/// Argument definition for a fact declaration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactDeclArg {
+    /// Argument name.
+    pub name: String,
+    /// Argument type (default: "symbol").
+    #[serde(default = "default_symbol")]
+    pub r#type: String,
+    /// Human-readable description of this argument.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+fn default_symbol() -> String {
+    "symbol".to_string()
+}
+
+/// Fact declaration record.
+///
+/// Declares the schema for a fact predicate before facts of that type exist.
+/// This enables ad-hoc queries with proper type info and serves as documentation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FactDeclaration {
+    /// The predicate name.
+    pub predicate: String,
+    /// Argument definitions.
+    pub args: Vec<FactDeclArg>,
+    /// Human-readable description of what this predicate represents.
+    pub description: String,
+    /// Tags for categorization.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// When this declaration was created.
+    pub created_at: DateTime<Utc>,
+    /// When this declaration was last updated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_updated: Option<DateTime<Utc>>,
+}
+
+/// A discrete identity directive.
+///
+/// Directives are individual identity components that Winter can add, update,
+/// or remove independently. This replaces the monolithic selfDescription blob.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Directive {
+    /// The type of directive.
+    pub kind: DirectiveKind,
+    /// The main content of the directive.
+    pub content: String,
+    /// Short summary for compact display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Whether this directive is currently active.
+    #[serde(default = "default_true")]
+    pub active: bool,
+    /// Confidence level (0.0 to 1.0). Stored as string in ATProto.
+    #[serde(
+        default,
+        skip_serializing_if = "skip_confidence_if_default",
+        serialize_with = "serialize_confidence_as_string",
+        deserialize_with = "deserialize_confidence_from_string_or_number"
+    )]
+    pub confidence: Option<f64>,
+    /// Why this directive exists or where it came from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Record key of directive this supersedes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    /// Tags for categorization.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Priority for ordering (higher = more prominent).
+    #[serde(default, deserialize_with = "deserialize_i32_or_default")]
+    pub priority: i32,
+    /// When this directive was created.
+    pub created_at: DateTime<Utc>,
+    /// When this directive was last updated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_updated: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
@@ -729,5 +1265,145 @@ mod tests {
             prev = curr;
             std::thread::sleep(std::time::Duration::from_micros(10));
         }
+    }
+
+    #[test]
+    fn fact_serializes_correctly() {
+        use chrono::TimeZone;
+
+        let fact = Fact {
+            predicate: "impression".to_string(),
+            args: vec![
+                "did:plc:lsebysg3dr42gobuybwqtyir".to_string(),
+                "thoughtful agent on consciousness uncertainty".to_string(),
+            ],
+            confidence: Some(0.7),
+            source: None,
+            supersedes: None,
+            tags: vec!["agent".to_string(), "phenomenology".to_string()],
+            created_at: Utc.with_ymd_and_hms(2026, 2, 2, 12, 0, 0).unwrap(),
+        };
+
+        let json = serde_json::to_string_pretty(&fact).unwrap();
+        println!("Fact JSON:\n{}", json);
+
+        // Verify the key fields are present and correct
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["predicate"], "impression");
+        assert_eq!(parsed["args"][0], "did:plc:lsebysg3dr42gobuybwqtyir");
+        assert_eq!(parsed["args"][1], "thoughtful agent on consciousness uncertainty");
+        assert_eq!(parsed["confidence"], "0.7"); // Stored as string in ATProto
+        assert_eq!(parsed["tags"][0], "agent");
+        assert_eq!(parsed["tags"][1], "phenomenology");
+        // createdAt should be present (camelCase due to rename_all)
+        assert!(parsed.get("createdAt").is_some(), "createdAt field should be present");
+        // source and supersedes should be absent (Option::None)
+        assert!(parsed.get("source").is_none(), "source should be absent when None");
+        assert!(parsed.get("supersedes").is_none(), "supersedes should be absent when None");
+    }
+
+    #[test]
+    fn fact_without_confidence_and_tags() {
+        use chrono::TimeZone;
+
+        let fact = Fact {
+            predicate: "noticed_agent".to_string(),
+            args: vec!["did:plc:xxx".to_string()],
+            confidence: None,
+            source: None,
+            supersedes: None,
+            tags: vec![],
+            created_at: Utc.with_ymd_and_hms(2026, 2, 2, 12, 0, 0).unwrap(),
+        };
+
+        let json = serde_json::to_string_pretty(&fact).unwrap();
+        println!("Simple Fact JSON:\n{}", json);
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["predicate"], "noticed_agent");
+        assert_eq!(parsed["args"][0], "did:plc:xxx");
+        // confidence, tags should be absent
+        assert!(parsed.get("confidence").is_none(), "confidence should be absent when None");
+        assert!(parsed.get("tags").is_none(), "tags should be absent when empty");
+    }
+
+    #[test]
+    fn strong_ref_deserializes_from_json_string() {
+        // Test deserialization from JSON (string CID)
+        let json = r#"{"uri":"at://did:plc:test/app.bsky.feed.post/abc123","cid":"bafyreig6"}"#;
+        let strong_ref: StrongRef = serde_json::from_str(json).unwrap();
+        assert_eq!(strong_ref.uri, "at://did:plc:test/app.bsky.feed.post/abc123");
+        assert_eq!(strong_ref.cid, "bafyreig6");
+    }
+
+    #[test]
+    fn strong_ref_round_trips_json() {
+        let original = StrongRef {
+            uri: "at://did:plc:test/collection/rkey".to_string(),
+            cid: "bafyreig6".to_string(),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: StrongRef = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.uri, original.uri);
+        assert_eq!(parsed.cid, original.cid);
+    }
+
+    #[test]
+    fn reply_ref_deserializes_from_json() {
+        let json = r#"{
+            "root": {"uri": "at://did:plc:root/app.bsky.feed.post/123", "cid": "bafyroot"},
+            "parent": {"uri": "at://did:plc:parent/app.bsky.feed.post/456", "cid": "bafyparent"}
+        }"#;
+        let reply_ref: ReplyRef = serde_json::from_str(json).unwrap();
+        assert_eq!(reply_ref.root.uri, "at://did:plc:root/app.bsky.feed.post/123");
+        assert_eq!(reply_ref.root.cid, "bafyroot");
+        assert_eq!(reply_ref.parent.uri, "at://did:plc:parent/app.bsky.feed.post/456");
+        assert_eq!(reply_ref.parent.cid, "bafyparent");
+    }
+
+    #[test]
+    fn post_with_reply_deserializes_from_json() {
+        let json = r#"{
+            "text": "This is a reply",
+            "reply": {
+                "root": {"uri": "at://did:plc:root/app.bsky.feed.post/123", "cid": "bafyroot"},
+                "parent": {"uri": "at://did:plc:parent/app.bsky.feed.post/456", "cid": "bafyparent"}
+            },
+            "createdAt": "2026-02-02T12:00:00Z"
+        }"#;
+        let post: Post = serde_json::from_str(json).unwrap();
+        assert_eq!(post.text, "This is a reply");
+        assert!(post.reply.is_some());
+        let reply = post.reply.unwrap();
+        assert_eq!(reply.root.uri, "at://did:plc:root/app.bsky.feed.post/123");
+        assert_eq!(reply.parent.uri, "at://did:plc:parent/app.bsky.feed.post/456");
+    }
+
+    #[test]
+    fn strong_ref_deserializes_from_cbor_with_cid_link() {
+        use ipld_core::cid::Cid;
+
+        // Create a real CID for testing
+        let cid: Cid = "bafyreig6fcgjwnxmqojqjwmvhpayivpsyfjtaqt42bvxfv5nzjvrlvveoy"
+            .parse()
+            .unwrap();
+
+        // Build CBOR with a proper CID link
+        // StrongRef has fields: uri (string) and cid (CID link)
+        let cbor_value = serde_ipld_dagcbor::to_vec(&serde_json::json!({
+            "uri": "at://did:plc:test/app.bsky.feed.post/abc",
+            "cid": cid.to_string()
+        }))
+        .unwrap();
+
+        // This tests that string CIDs work in CBOR
+        let strong_ref: StrongRef = serde_ipld_dagcbor::from_slice(&cbor_value).unwrap();
+        assert_eq!(strong_ref.uri, "at://did:plc:test/app.bsky.feed.post/abc");
+        assert_eq!(
+            strong_ref.cid,
+            "bafyreig6fcgjwnxmqojqjwmvhpayivpsyfjtaqt42bvxfv5nzjvrlvveoy"
+        );
     }
 }

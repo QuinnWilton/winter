@@ -25,21 +25,19 @@
             "maxLength": 10
           },
           "confidence": {
-            "type": "number",
-            "description": "Confidence level (0.0 to 1.0). Default is 1.0.",
-            "minimum": 0,
-            "maximum": 1,
-            "default": 1
+            "type": "string",
+            "description": "Confidence level as decimal string (e.g., '0.7'). Range 0.0-1.0, default 1.0.",
+            "maxLength": 10
           },
           "source": {
             "type": "string",
-            "description": "CID reference to source record (optional)",
-            "format": "cid"
+            "description": "AT URI of source record (optional)",
+            "format": "at-uri"
           },
           "supersedes": {
             "type": "string",
-            "description": "CID of fact this supersedes (for updates)",
-            "format": "cid"
+            "description": "AT URI of fact this supersedes (for updates)",
+            "format": "at-uri"
           },
           "tags": {
             "type": "array",

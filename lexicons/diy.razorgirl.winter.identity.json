@@ -4,39 +4,16 @@
   "defs": {
     "main": {
       "type": "record",
-      "description": "Core identity record for Winter. Singleton per repository (key: 'self').",
+      "description": "Core identity configuration for Winter. Singleton per repository (key: 'self'). Identity content is now stored as directives.",
       "key": "literal:self",
       "record": {
         "type": "object",
-        "required": ["operatorDid", "values", "interests", "selfDescription", "createdAt", "lastUpdated"],
+        "required": ["operatorDid", "createdAt", "lastUpdated"],
         "properties": {
           "operatorDid": {
             "type": "string",
             "format": "did",
             "description": "DID of the operator who controls this Winter instance"
-          },
-          "values": {
-            "type": "array",
-            "description": "What Winter cares about (strings, queryable as facts)",
-            "items": {
-              "type": "string",
-              "maxLength": 256
-            },
-            "maxLength": 50
-          },
-          "interests": {
-            "type": "array",
-            "description": "What Winter is curious about (strings, queryable as facts)",
-            "items": {
-              "type": "string",
-              "maxLength": 256
-            },
-            "maxLength": 50
-          },
-          "selfDescription": {
-            "type": "string",
-            "description": "Free-form prose Winter writes about itself. No numeric traits, no predetermined dimensions. Winter decides what aspects of itself are worth articulating. Goes directly into system prompt.",
-            "maxLength": 10000
           },
           "createdAt": {
             "type": "string",

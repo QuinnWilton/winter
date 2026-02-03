@@ -27,10 +27,10 @@
           },
           "relatedFacts": {
             "type": "array",
-            "description": "CID references to related facts",
+            "description": "AT URIs of related fact records",
             "items": {
               "type": "string",
-              "format": "cid"
+              "format": "at-uri"
             },
             "maxLength": 50
           },

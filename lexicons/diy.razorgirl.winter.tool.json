@@ -1,0 +1,73 @@
+{
+  "lexicon": 1,
+  "id": "diy.razorgirl.winter.tool",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A custom JavaScript/TypeScript tool that runs in a sandboxed Deno environment",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["name", "description", "code", "inputSchema", "version", "createdAt"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Tool name (used to invoke the tool)",
+            "maxLength": 64
+          },
+          "description": {
+            "type": "string",
+            "description": "Human-readable description of what the tool does",
+            "maxLength": 1024
+          },
+          "code": {
+            "type": "string",
+            "description": "TypeScript/JavaScript source code",
+            "maxLength": 65536
+          },
+          "inputSchema": {
+            "type": "object",
+            "description": "JSON Schema for the tool's input parameters"
+          },
+          "requiredSecrets": {
+            "type": "array",
+            "description": "Names of secrets this tool needs access to",
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "maxLength": 10
+          },
+          "requiresWorkspace": {
+            "type": "boolean",
+            "description": "Whether this tool needs access to the workspace directory"
+          },
+          "requiredCommands": {
+            "type": "array",
+            "description": "Subprocess commands this tool needs to run (e.g., ['git'])",
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "maxLength": 10
+          },
+          "version": {
+            "type": "integer",
+            "description": "Version number, incremented on each update",
+            "minimum": 1
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the tool was first created"
+          },
+          "lastUpdated": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the tool was last modified"
+          }
+        }
+      }
+    }
+  }
+}
