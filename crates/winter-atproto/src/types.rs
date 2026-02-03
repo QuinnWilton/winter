@@ -145,6 +145,19 @@ where
     deserializer.deserialize_any(CidVisitor)
 }
 
+/// Deserialize a field that may be null as the type's default value.
+///
+/// This handles cases where the PDS returns `null` for a Vec field instead of
+/// an empty array. The `#[serde(default)]` attribute only handles missing fields,
+/// not explicit null values.
+fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
+}
+
 // =============================================================================
 // Bluesky Record Types
 // =============================================================================
@@ -734,10 +747,10 @@ pub struct Note {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
     /// AT URIs of related fact records.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     pub related_facts: Vec<String>,
     /// Tags for categorization.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
     pub tags: Vec<String>,
     /// When this note was created.
     pub created_at: DateTime<Utc>,
@@ -840,6 +853,9 @@ pub struct Thought {
     /// What triggered this thought.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
+    /// Tags for categorization and querying.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// How long this thought took to generate (ms, flexible integer deserialization for CBOR).
     #[serde(
         default,
