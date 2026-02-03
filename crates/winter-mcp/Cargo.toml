@@ -30,8 +30,11 @@ winter-datalog = { workspace = true }
 bsky-sdk = { workspace = true }
 atrium-api = { workspace = true }
 
-# Temp files for datalog execution
+# Temp files for datalog execution and Deno sandboxing
 tempfile = { workspace = true }
+
+# Platform directories for secrets storage
+dirs = "5"
 
 [dev-dependencies]
 proptest = { workspace = true }

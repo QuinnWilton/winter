@@ -132,15 +132,21 @@ pub async fn create_note(state: &ToolState, arguments: &HashMap<String, Value>) 
         .create_record(NOTE_COLLECTION, Some(&rkey), &note)
         .await
     {
-        Ok(response) => CallToolResult::success(
-            json!({
-                "rkey": rkey,
-                "uri": response.uri,
-                "cid": response.cid,
-                "title": title
-            })
-            .to_string(),
-        ),
+        Ok(response) => {
+            // Update cache so subsequent queries see the change immediately
+            if let Some(cache) = &state.cache {
+                cache.upsert_note(rkey.clone(), note.clone(), response.cid.clone());
+            }
+            CallToolResult::success(
+                json!({
+                    "rkey": rkey,
+                    "uri": response.uri,
+                    "cid": response.cid,
+                    "title": title
+                })
+                .to_string(),
+            )
+        }
         Err(e) => CallToolResult::error(format!("Failed to create note: {}", e)),
     }
 }

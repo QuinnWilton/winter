@@ -86,6 +86,20 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["rkey"]
             }),
         },
+        ToolDefinition {
+            name: "get_job".to_string(),
+            description: "Get a job by its record key, including full instructions.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "rkey": {
+                        "type": "string",
+                        "description": "Record key of the job"
+                    }
+                },
+                "required": ["rkey"]
+            }),
+        },
     ]
 }
 
@@ -128,16 +142,22 @@ pub async fn schedule_job(state: &ToolState, arguments: &HashMap<String, Value>)
         .create_record(JOB_COLLECTION, Some(&rkey), &job)
         .await
     {
-        Ok(response) => CallToolResult::success(
-            json!({
-                "rkey": rkey,
-                "uri": response.uri,
-                "cid": response.cid,
-                "name": name,
-                "run_at": run_at.to_rfc3339()
-            })
-            .to_string(),
-        ),
+        Ok(response) => {
+            // Update cache so subsequent queries see the change immediately
+            if let Some(cache) = &state.cache {
+                cache.upsert_job(rkey.clone(), job.clone(), response.cid.clone());
+            }
+            CallToolResult::success(
+                json!({
+                    "rkey": rkey,
+                    "uri": response.uri,
+                    "cid": response.cid,
+                    "name": name,
+                    "run_at": run_at.to_rfc3339()
+                })
+                .to_string(),
+            )
+        }
         Err(e) => CallToolResult::error(format!("Failed to schedule job: {}", e)),
     }
 }
@@ -183,17 +203,23 @@ pub async fn schedule_recurring(
         .create_record(JOB_COLLECTION, Some(&rkey), &job)
         .await
     {
-        Ok(response) => CallToolResult::success(
-            json!({
-                "rkey": rkey,
-                "uri": response.uri,
-                "cid": response.cid,
-                "name": name,
-                "interval_seconds": interval,
-                "next_run": next_run.to_rfc3339()
-            })
-            .to_string(),
-        ),
+        Ok(response) => {
+            // Update cache so subsequent queries see the change immediately
+            if let Some(cache) = &state.cache {
+                cache.upsert_job(rkey.clone(), job.clone(), response.cid.clone());
+            }
+            CallToolResult::success(
+                json!({
+                    "rkey": rkey,
+                    "uri": response.uri,
+                    "cid": response.cid,
+                    "name": name,
+                    "interval_seconds": interval,
+                    "next_run": next_run.to_rfc3339()
+                })
+                .to_string(),
+            )
+        }
         Err(e) => CallToolResult::error(format!("Failed to schedule recurring job: {}", e)),
     }
 }
@@ -276,13 +302,52 @@ pub async fn cancel_job(state: &ToolState, arguments: &HashMap<String, Value>) -
     };
 
     match state.atproto.delete_record(JOB_COLLECTION, rkey).await {
-        Ok(()) => CallToolResult::success(
-            json!({
-                "cancelled": true,
-                "rkey": rkey
-            })
-            .to_string(),
-        ),
+        Ok(()) => {
+            // Remove from cache
+            if let Some(cache) = &state.cache {
+                cache.delete_job(rkey);
+            }
+            CallToolResult::success(
+                json!({
+                    "cancelled": true,
+                    "rkey": rkey
+                })
+                .to_string(),
+            )
+        }
         Err(e) => CallToolResult::error(format!("Failed to cancel job: {}", e)),
+    }
+}
+
+pub async fn get_job(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let rkey = match arguments.get("rkey").and_then(|v| v.as_str()) {
+        Some(r) => r,
+        None => return CallToolResult::error("Missing required parameter: rkey"),
+    };
+
+    match state.atproto.get_record::<Job>(JOB_COLLECTION, rkey).await {
+        Ok(record) => {
+            let job = record.value;
+            let schedule_desc = match &job.schedule {
+                JobSchedule::Once { at } => format!("once at {}", at.to_rfc3339()),
+                JobSchedule::Interval { seconds } => format!("every {} seconds", seconds),
+            };
+
+            CallToolResult::success(
+                json!({
+                    "rkey": rkey,
+                    "name": job.name,
+                    "instructions": job.instructions,
+                    "schedule": schedule_desc,
+                    "status": format!("{:?}", job.status).to_lowercase(),
+                    "next_run": job.next_run.map(|dt| dt.to_rfc3339()),
+                    "last_run": job.last_run.map(|dt| dt.to_rfc3339()),
+                    "failure_count": job.failure_count,
+                    "created_at": job.created_at.to_rfc3339()
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => CallToolResult::error(format!("Failed to get job: {}", e)),
     }
 }

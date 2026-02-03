@@ -141,17 +141,23 @@ pub async fn create_rule(state: &ToolState, arguments: &HashMap<String, Value>) 
         .create_record(RULE_COLLECTION, Some(&rkey), &rule)
         .await
     {
-        Ok(response) => CallToolResult::success(
-            json!({
-                "rkey": rkey,
-                "uri": response.uri,
-                "cid": response.cid,
-                "name": name,
-                "head": head,
-                "body": rule.body
-            })
-            .to_string(),
-        ),
+        Ok(response) => {
+            // Update cache so subsequent queries see the change immediately
+            if let Some(cache) = &state.cache {
+                cache.upsert_rule(rkey.clone(), rule.clone(), response.cid.clone());
+            }
+            CallToolResult::success(
+                json!({
+                    "rkey": rkey,
+                    "uri": response.uri,
+                    "cid": response.cid,
+                    "name": name,
+                    "head": head,
+                    "body": rule.body
+                })
+                .to_string(),
+            )
+        }
         Err(e) => CallToolResult::error(format!("Failed to create rule: {}", e)),
     }
 }
@@ -281,15 +287,21 @@ pub async fn toggle_rule(state: &ToolState, arguments: &HashMap<String, Value>) 
     rule.enabled = enabled;
 
     match state.atproto.put_record(RULE_COLLECTION, rkey, &rule).await {
-        Ok(response) => CallToolResult::success(
-            json!({
-                "rkey": rkey,
-                "uri": response.uri,
-                "enabled": enabled,
-                "name": rule.name
-            })
-            .to_string(),
-        ),
+        Ok(response) => {
+            // Update cache with the modified rule
+            if let Some(cache) = &state.cache {
+                cache.upsert_rule(rkey.to_string(), rule.clone(), response.cid.clone());
+            }
+            CallToolResult::success(
+                json!({
+                    "rkey": rkey,
+                    "uri": response.uri,
+                    "enabled": enabled,
+                    "name": rule.name
+                })
+                .to_string(),
+            )
+        }
         Err(e) => CallToolResult::error(format!("Failed to toggle rule: {}", e)),
     }
 }

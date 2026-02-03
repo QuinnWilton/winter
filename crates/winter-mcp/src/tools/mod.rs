@@ -2,10 +2,14 @@
 
 mod blog;
 mod bluesky;
+mod custom_tools;
+mod declarations;
+mod directives;
 mod facts;
 mod identity;
 mod jobs;
 mod notes;
+mod pds;
 mod rules;
 mod thoughts;
 
@@ -18,9 +22,11 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::warn;
 
 use crate::bluesky::BlueskyClient;
-use crate::protocol::{CallToolResult, ToolDefinition};
+use crate::deno::DenoExecutor;
+use crate::protocol::{CallToolResult, ToolContent, ToolDefinition};
+use crate::secrets::SecretManager;
 use winter_atproto::{AtprotoClient, RepoCache, Thought, ThoughtKind, Tid};
-use winter_datalog::DatalogCache;
+use winter_datalog::{DatalogCache, DatalogCoordinatorHandle};
 
 /// Collection name for thoughts.
 const THOUGHT_COLLECTION: &str = "diy.razorgirl.winter.thought";
@@ -36,8 +42,15 @@ pub struct ToolState {
     pub cache: Option<Arc<RepoCache>>,
     /// Datalog query cache for efficient query execution (optional).
     pub datalog_cache: Option<Arc<DatalogCache>>,
+    /// Handle to the datalog coordinator for serialized TSV access (optional).
+    /// When set, queries go through the coordinator instead of direct cache access.
+    pub datalog_coordinator: Option<DatalogCoordinatorHandle>,
     /// Channel for async thought recording (fire-and-forget).
     pub thought_tx: Option<mpsc::Sender<Thought>>,
+    /// Secret manager for custom tool secrets (optional).
+    pub secrets: Option<Arc<RwLock<SecretManager>>>,
+    /// Deno executor for custom tool sandboxing (optional).
+    pub deno: Option<DenoExecutor>,
 }
 
 /// Registry of available tools.
@@ -64,7 +77,10 @@ impl ToolRegistry {
                 bluesky: None,
                 cache: None,
                 datalog_cache: None,
+                datalog_coordinator: None,
                 thought_tx: Some(thought_tx),
+                secrets: None,
+                deno: None,
             })),
         }
     }
@@ -87,7 +103,10 @@ impl ToolRegistry {
                 bluesky: None,
                 cache: Some(cache),
                 datalog_cache: None,
+                datalog_coordinator: None,
                 thought_tx: Some(thought_tx),
+                secrets: None,
+                deno: None,
             })),
         }
     }
@@ -96,6 +115,12 @@ impl ToolRegistry {
     pub async fn set_datalog_cache(&self, datalog_cache: Arc<DatalogCache>) {
         let mut guard = self.state.write().await;
         guard.datalog_cache = Some(datalog_cache);
+    }
+
+    /// Set the datalog coordinator handle for serialized TSV access.
+    pub async fn set_datalog_coordinator(&self, coordinator: DatalogCoordinatorHandle) {
+        let mut guard = self.state.write().await;
+        guard.datalog_coordinator = Some(coordinator);
     }
 
     /// Set the cache asynchronously.
@@ -122,6 +147,18 @@ impl ToolRegistry {
     pub async fn set_bluesky(&self, client: BlueskyClient) {
         let mut guard = self.state.write().await;
         guard.bluesky = Some(client);
+    }
+
+    /// Set the secret manager for custom tools.
+    pub async fn set_secrets(&self, secrets: SecretManager) {
+        let mut guard = self.state.write().await;
+        guard.secrets = Some(Arc::new(RwLock::new(secrets)));
+    }
+
+    /// Set the Deno executor for custom tools.
+    pub async fn set_deno(&self, deno: DenoExecutor) {
+        let mut guard = self.state.write().await;
+        guard.deno = Some(deno);
     }
 
     /// Get all tool definitions.
@@ -152,6 +189,18 @@ impl ToolRegistry {
         // Blog tools
         defs.extend(blog::definitions());
 
+        // Custom tools
+        defs.extend(custom_tools::definitions());
+
+        // Directive tools
+        defs.extend(directives::definitions());
+
+        // Fact declaration tools
+        defs.extend(declarations::definitions());
+
+        // PDS raw access tools
+        defs.extend(pds::definitions());
+
         defs
     }
 
@@ -168,6 +217,20 @@ impl ToolRegistry {
             }
         } else {
             let state = self.state.read().await;
+
+            // Try custom tools first
+            if let Some(result) = custom_tools::dispatch(
+                &state,
+                state.secrets.as_ref(),
+                state.deno.as_ref(),
+                name,
+                arguments.clone(),
+            )
+            .await
+            {
+                return self.finalize_result(name, arguments, result).await;
+            }
+
             match name {
                 // Bluesky tools (read-only)
                 "post_to_bluesky" => bluesky::post_to_bluesky(&state, arguments).await,
@@ -179,12 +242,18 @@ impl ToolRegistry {
                 "get_timeline" => bluesky::get_timeline(&state, arguments).await,
                 "search_posts" => bluesky::search_posts(&state, arguments).await,
                 "search_users" => bluesky::search_users(&state, arguments).await,
+                "get_thread_context" => bluesky::get_thread_context(&state, arguments).await,
+                "mute_user" => bluesky::mute_user(&state, arguments).await,
+                "unmute_user" => bluesky::unmute_user(&state, arguments).await,
+                "block_user" => bluesky::block_user(&state, arguments).await,
+                "unblock_user" => bluesky::unblock_user(&state, arguments).await,
 
                 // Fact tools
                 "create_fact" => facts::create_fact(&state, arguments).await,
                 "update_fact" => facts::update_fact(&state, arguments).await,
                 "delete_fact" => facts::delete_fact(&state, arguments).await,
                 "query_facts" => facts::query_facts(&state, arguments).await,
+                "list_predicates" => facts::list_predicates(&state).await,
 
                 // Rule tools
                 "create_rule" => rules::create_rule(&state, arguments).await,
@@ -201,23 +270,62 @@ impl ToolRegistry {
                 "schedule_recurring" => jobs::schedule_recurring(&state, arguments).await,
                 "list_jobs" => jobs::list_jobs(&state, arguments).await,
                 "cancel_job" => jobs::cancel_job(&state, arguments).await,
+                "get_job" => jobs::get_job(&state, arguments).await,
 
                 // Identity tools
                 "get_identity" => identity::get_identity(&state, arguments).await,
-                "update_identity" => identity::update_identity(&state, arguments).await,
 
                 // Thought tools
                 "record_thought" => thoughts::record_thought(&state, arguments).await,
+                "list_thoughts" => thoughts::list_thoughts(&state, arguments).await,
+                "get_thought" => thoughts::get_thought(&state, arguments).await,
 
                 // Blog tools
                 "publish_blog_post" => blog::publish_blog_post(&state, arguments).await,
                 "update_blog_post" => blog::update_blog_post(&state, arguments).await,
                 "list_blog_posts" => blog::list_blog_posts(&state, arguments).await,
+                "get_blog_post" => blog::get_blog_post(&state, arguments).await,
+
+                // Directive tools
+                "create_directive" => directives::create_directive(&state, arguments).await,
+                "update_directive" => directives::update_directive(&state, arguments).await,
+                "deactivate_directive" => directives::deactivate_directive(&state, arguments).await,
+                "list_directives" => directives::list_directives(&state, arguments).await,
+
+                // PDS raw access tools
+                "pds_list_records" => pds::pds_list_records(&state, arguments).await,
+                "pds_get_record" => pds::pds_get_record(&state, arguments).await,
+                "pds_put_record" => pds::pds_put_record(&state, arguments).await,
+                "pds_delete_record" => pds::pds_delete_record(&state, arguments).await,
+
+                // Fact declaration tools
+                "create_fact_declaration" => {
+                    declarations::create_fact_declaration(&state, arguments).await
+                }
+                "update_fact_declaration" => {
+                    declarations::update_fact_declaration(&state, arguments).await
+                }
+                "delete_fact_declaration" => {
+                    declarations::delete_fact_declaration(&state, arguments).await
+                }
+                "list_fact_declarations" => {
+                    declarations::list_fact_declarations(&state, arguments).await
+                }
 
                 _ => CallToolResult::error(format!("Unknown tool: {}", name)),
             }
         };
 
+        self.finalize_result(name, arguments, result).await
+    }
+
+    /// Finalize a result by recording the tool call thought.
+    async fn finalize_result(
+        &self,
+        name: &str,
+        arguments: &HashMap<String, Value>,
+        result: CallToolResult,
+    ) -> CallToolResult {
         // Record a tool_call thought (skip for record_thought to avoid recursion)
         if name != "record_thought" {
             self.record_tool_call(name, arguments, &result).await;
@@ -238,19 +346,16 @@ impl ToolRegistry {
     ) {
         let is_error = result.is_error.unwrap_or(false);
 
-        // Format arguments concisely
-        let args_summary = format_arguments_summary(arguments);
+        // Format the tool call in structured format for web UI rendering
+        let content = format_tool_call_content(name, arguments, result, is_error);
 
-        let content = if is_error {
-            format!("Called {} [{}] - FAILED", name, args_summary)
-        } else {
-            format!("Called {} [{}]", name, args_summary)
-        };
-
+        // Use static trigger for tool calls - they're recorded for debugging
+        // but shouldn't appear in any conversation context (not relevant to
+        // notification handling, DM responses, or awaken reflections)
         let thought = Thought {
             kind: ThoughtKind::ToolCall,
             content,
-            trigger: None,
+            trigger: Some("internal:tool_call".to_string()),
             duration_ms: None,
             created_at: Utc::now(),
         };
@@ -264,6 +369,51 @@ impl ToolRegistry {
             }
         }
     }
+}
+
+/// Tools that should include their results in the thought.
+const TOOLS_WITH_RESULTS: &[&str] = &["query_facts", "list_rules", "list_notes", "list_jobs"];
+
+/// Format a tool call into structured content for web UI rendering.
+fn format_tool_call_content(
+    name: &str,
+    arguments: &HashMap<String, Value>,
+    result: &CallToolResult,
+    is_error: bool,
+) -> String {
+    let mut content = format!("Called {}", name);
+    if is_error {
+        content.push_str(" - FAILED");
+    }
+    content.push('\n');
+
+    // Pretty-print arguments as JSON
+    if !arguments.is_empty() {
+        let args_json = serde_json::to_value(arguments).unwrap_or(Value::Null);
+        if let Ok(pretty) = serde_json::to_string_pretty(&args_json) {
+            content.push_str("Args:\n");
+            content.push_str(&pretty);
+            content.push('\n');
+        }
+    }
+
+    // Include results for specific tools
+    if TOOLS_WITH_RESULTS.contains(&name) || is_error {
+        if let Some(ToolContent::Text { text }) = result.content.first() {
+            // Try to parse and pretty-print if it's JSON
+            if let Ok(json) = serde_json::from_str::<Value>(text) {
+                if let Ok(pretty) = serde_json::to_string_pretty(&json) {
+                    content.push_str("Result:\n");
+                    content.push_str(&pretty);
+                }
+            } else {
+                content.push_str("Result:\n");
+                content.push_str(text);
+            }
+        }
+    }
+
+    content
 }
 
 /// Background task that writes thoughts to the PDS.
@@ -281,6 +431,7 @@ async fn thought_writer_loop(client: Arc<AtprotoClient>, mut rx: mpsc::Receiver<
 
 /// Truncate a string to a maximum number of characters (not bytes).
 /// Safe for UTF-8 strings with multi-byte characters.
+#[cfg(test)]
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max_chars {
@@ -291,6 +442,7 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 }
 
 /// Format tool arguments into a concise summary string.
+#[cfg(test)]
 fn format_arguments_summary(arguments: &HashMap<String, Value>) -> String {
     if arguments.is_empty() {
         return String::new();
@@ -308,6 +460,7 @@ fn format_arguments_summary(arguments: &HashMap<String, Value>) -> String {
 }
 
 /// Format a single JSON value into a concise summary.
+#[cfg(test)]
 fn format_value_summary(v: &Value) -> String {
     match v {
         Value::String(s) => format!("\"{}\"", truncate_chars(s, 50)),

@@ -125,6 +125,20 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": []
             }),
         },
+        ToolDefinition {
+            name: "get_blog_post".to_string(),
+            description: "Get a blog post by its record key, including full content.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "rkey": {
+                        "type": "string",
+                        "description": "Record key of the blog post"
+                    }
+                },
+                "required": ["rkey"]
+            }),
+        },
     ]
 }
 
@@ -179,9 +193,27 @@ pub async fn publish_blog_post(
         .await
     {
         Ok(response) => {
-            // Construct the WhiteWind URL
+            // Update cache so subsequent queries see the change immediately
+            if let Some(cache) = &state.cache {
+                // Convert local BlogEntry to winter_atproto::BlogEntry
+                let atproto_entry = winter_atproto::BlogEntry {
+                    title: entry.title.clone(),
+                    content: entry.content.clone(),
+                    created_at: entry.created_at.clone(),
+                    draft: entry.draft,
+                    theme: entry.theme.clone(),
+                    ogp: entry.ogp.as_ref().map(|o| winter_atproto::BlogOgp {
+                        title: o.title.clone(),
+                        description: o.description.clone(),
+                    }),
+                };
+                cache.upsert_blog_entry(rkey.clone(), atproto_entry, response.cid.clone());
+            }
+
+            // Construct the WhiteWind and Greengale URLs
             let handle = state.atproto.handle().await.unwrap_or_default();
-            let url = format!("https://whtwnd.com/{}/{}", handle, rkey);
+            let whtwnd_url = format!("https://whtwnd.com/{}/{}", handle, rkey);
+            let greengale_url = format!("https://greengale.app/{}/{}", handle, rkey);
 
             CallToolResult::success(
                 json!({
@@ -190,7 +222,9 @@ pub async fn publish_blog_post(
                     "cid": response.cid,
                     "title": title,
                     "draft": draft,
-                    "url": url
+                    "url": whtwnd_url,
+                    "whtwnd_url": whtwnd_url,
+                    "greengale_url": greengale_url
                 })
                 .to_string(),
             )
@@ -249,8 +283,26 @@ pub async fn update_blog_post(
         .await
     {
         Ok(response) => {
+            // Update cache with the modified entry
+            if let Some(cache) = &state.cache {
+                // Convert local BlogEntry to winter_atproto::BlogEntry
+                let atproto_entry = winter_atproto::BlogEntry {
+                    title: entry.title.clone(),
+                    content: entry.content.clone(),
+                    created_at: entry.created_at.clone(),
+                    draft: entry.draft,
+                    theme: entry.theme.clone(),
+                    ogp: entry.ogp.as_ref().map(|o| winter_atproto::BlogOgp {
+                        title: o.title.clone(),
+                        description: o.description.clone(),
+                    }),
+                };
+                cache.upsert_blog_entry(rkey.to_string(), atproto_entry, response.cid.clone());
+            }
+
             let handle = state.atproto.handle().await.unwrap_or_default();
-            let url = format!("https://whtwnd.com/{}/{}", handle, rkey);
+            let whtwnd_url = format!("https://whtwnd.com/{}/{}", handle, rkey);
+            let greengale_url = format!("https://greengale.app/{}/{}", handle, rkey);
 
             CallToolResult::success(
                 json!({
@@ -259,7 +311,9 @@ pub async fn update_blog_post(
                     "cid": response.cid,
                     "title": entry.title,
                     "draft": entry.draft,
-                    "url": url
+                    "url": whtwnd_url,
+                    "whtwnd_url": whtwnd_url,
+                    "greengale_url": greengale_url
                 })
                 .to_string(),
             )
@@ -287,13 +341,16 @@ pub async fn list_blog_posts(
         .iter()
         .map(|item| {
             let rkey = item.uri.rsplit('/').next().unwrap_or("");
-            let url = format!("https://whtwnd.com/{}/{}", handle, rkey);
+            let whtwnd_url = format!("https://whtwnd.com/{}/{}", handle, rkey);
+            let greengale_url = format!("https://greengale.app/{}/{}", handle, rkey);
             json!({
                 "rkey": rkey,
                 "title": item.value.title,
                 "draft": item.value.draft,
                 "created_at": item.value.created_at,
-                "url": url
+                "url": whtwnd_url,
+                "whtwnd_url": whtwnd_url,
+                "greengale_url": greengale_url
             })
         })
         .collect();
@@ -305,4 +362,43 @@ pub async fn list_blog_posts(
         })
         .to_string(),
     )
+}
+
+pub async fn get_blog_post(
+    state: &ToolState,
+    arguments: &HashMap<String, Value>,
+) -> CallToolResult {
+    let rkey = match arguments.get("rkey").and_then(|v| v.as_str()) {
+        Some(r) => r,
+        None => return CallToolResult::error("Missing required parameter: rkey"),
+    };
+
+    match state
+        .atproto
+        .get_record::<BlogEntry>(BLOG_COLLECTION, rkey)
+        .await
+    {
+        Ok(record) => {
+            let handle = state.atproto.handle().await.unwrap_or_default();
+            let whtwnd_url = format!("https://whtwnd.com/{}/{}", handle, rkey);
+            let greengale_url = format!("https://greengale.app/{}/{}", handle, rkey);
+
+            CallToolResult::success(
+                json!({
+                    "rkey": rkey,
+                    "title": record.value.title,
+                    "content": record.value.content,
+                    "draft": record.value.draft,
+                    "theme": record.value.theme,
+                    "ogp": record.value.ogp,
+                    "created_at": record.value.created_at,
+                    "url": whtwnd_url,
+                    "whtwnd_url": whtwnd_url,
+                    "greengale_url": greengale_url
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => CallToolResult::error(format!("Failed to get blog post: {}", e)),
+    }
 }

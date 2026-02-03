@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use winter_atproto::Facet;
 
 /// Reference to a Bluesky post (needed for replies and threading).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +32,9 @@ pub struct BlueskyNotification {
     pub parent: Option<PostRef>,
     /// Root post reference (for threading replies)
     pub root: Option<PostRef>,
+    /// Rich text facets (mentions, links, tags)
+    #[serde(default)]
+    pub facets: Vec<Facet>,
 }
 
 /// Reason for a Bluesky notification.
@@ -106,6 +110,9 @@ pub struct DirectMessage {
     pub text: String,
     /// When the message was sent.
     pub sent_at: DateTime<Utc>,
+    /// Rich text facets (mentions, links, tags)
+    #[serde(default)]
+    pub facets: Vec<Facet>,
 }
 
 /// A post from the timeline (following feed).
@@ -171,4 +178,46 @@ pub struct SearchUser {
     pub description: Option<String>,
     /// Avatar URL
     pub avatar: Option<String>,
+}
+
+/// A post in a thread tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadPost {
+    /// AT URI of the post
+    pub uri: String,
+    /// Content hash
+    pub cid: String,
+    /// DID of the author
+    pub author_did: String,
+    /// Handle of the author
+    pub author_handle: String,
+    /// Post text content
+    pub text: Option<String>,
+    /// When the post was created
+    pub created_at: Option<String>,
+    /// Number of replies to this post
+    pub reply_count: Option<i64>,
+    /// Parent post URI if this is a reply
+    pub parent_uri: Option<String>,
+    /// Depth in the thread tree (0 = root)
+    pub depth: u32,
+}
+
+/// Full thread context with metadata and participation metrics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadContext {
+    /// The root post of the thread
+    pub root: ThreadPost,
+    /// All posts in the thread (flattened tree)
+    pub posts: Vec<ThreadPost>,
+    /// Unique participant DIDs
+    pub participants: Vec<String>,
+    /// Total number of replies in the thread
+    pub total_replies: usize,
+    /// Number of replies by the querying account
+    pub my_reply_count: usize,
+    /// Timestamp of the querying account's last reply
+    pub my_last_reply_at: Option<String>,
+    /// Number of posts added after the querying account's last reply
+    pub posts_since_my_last_reply: usize,
 }

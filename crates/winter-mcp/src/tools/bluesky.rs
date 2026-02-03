@@ -219,6 +219,80 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["query"]
             }),
         },
+        ToolDefinition {
+            name: "get_thread_context".to_string(),
+            description: "Get the full context of a Bluesky thread. Returns all posts in the thread tree, list of participants, and your participation metrics (reply count, last reply time, posts since your last reply). Use this before replying to a thread to understand the full conversation.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "uri": {
+                        "type": "string",
+                        "description": "AT URI of any post in the thread (typically the root or the post you're responding to)"
+                    },
+                    "depth": {
+                        "type": "integer",
+                        "description": "Maximum reply depth to fetch (default 6, max 1000)"
+                    }
+                },
+                "required": ["uri"]
+            }),
+        },
+        ToolDefinition {
+            name: "mute_user".to_string(),
+            description: "Mute a Bluesky user. Muted users won't appear in your timeline or notifications, but they can still see your posts and interact with you.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "did": {
+                        "type": "string",
+                        "description": "DID of the user to mute (e.g., did:plc:xxx)"
+                    }
+                },
+                "required": ["did"]
+            }),
+        },
+        ToolDefinition {
+            name: "unmute_user".to_string(),
+            description: "Unmute a previously muted Bluesky user.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "did": {
+                        "type": "string",
+                        "description": "DID of the user to unmute (e.g., did:plc:xxx)"
+                    }
+                },
+                "required": ["did"]
+            }),
+        },
+        ToolDefinition {
+            name: "block_user".to_string(),
+            description: "Block a Bluesky user. Blocked users cannot see your posts, mention you, or interact with you in any way. This is a stronger action than muting.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "did": {
+                        "type": "string",
+                        "description": "DID of the user to block (e.g., did:plc:xxx)"
+                    }
+                },
+                "required": ["did"]
+            }),
+        },
+        ToolDefinition {
+            name: "unblock_user".to_string(),
+            description: "Unblock a previously blocked Bluesky user.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "block_uri": {
+                        "type": "string",
+                        "description": "AT URI of the block record (returned when blocking)"
+                    }
+                },
+                "required": ["block_uri"]
+            }),
+        },
     ]
 }
 
@@ -582,5 +656,156 @@ pub async fn search_users(state: &ToolState, arguments: &HashMap<String, Value>)
             CallToolResult::success(serde_json::to_string(&response).unwrap_or_default())
         }
         Err(e) => CallToolResult::error(format!("Failed to search users: {}", e)),
+    }
+}
+
+pub async fn get_thread_context(
+    state: &ToolState,
+    arguments: &HashMap<String, Value>,
+) -> CallToolResult {
+    let uri = match arguments.get("uri").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return CallToolResult::error("Missing required parameter: uri"),
+    };
+
+    let depth = arguments
+        .get("depth")
+        .and_then(|v| v.as_u64())
+        .map(|d| d.min(1000) as u16);
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.get_post_thread(uri, depth).await {
+        Ok(context) => {
+            let posts: Vec<Value> = context
+                .posts
+                .iter()
+                .map(|p| {
+                    json!({
+                        "uri": p.uri,
+                        "cid": p.cid,
+                        "author_did": p.author_did,
+                        "author_handle": p.author_handle,
+                        "text": p.text,
+                        "created_at": p.created_at,
+                        "reply_count": p.reply_count,
+                        "parent_uri": p.parent_uri,
+                        "depth": p.depth
+                    })
+                })
+                .collect();
+
+            let response = json!({
+                "root": {
+                    "uri": context.root.uri,
+                    "cid": context.root.cid,
+                    "author_did": context.root.author_did,
+                    "author_handle": context.root.author_handle,
+                    "text": context.root.text,
+                    "created_at": context.root.created_at,
+                    "reply_count": context.root.reply_count
+                },
+                "posts": posts,
+                "participants": context.participants,
+                "total_replies": context.total_replies,
+                "my_reply_count": context.my_reply_count,
+                "my_last_reply_at": context.my_last_reply_at,
+                "posts_since_my_last_reply": context.posts_since_my_last_reply
+            });
+            CallToolResult::success(serde_json::to_string(&response).unwrap_or_default())
+        }
+        Err(e) => CallToolResult::error(format!("Failed to get thread context: {}", e)),
+    }
+}
+
+pub async fn mute_user(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let did = match arguments.get("did").and_then(|v| v.as_str()) {
+        Some(d) => d,
+        None => return CallToolResult::error("Missing required parameter: did"),
+    };
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.mute(did).await {
+        Ok(()) => CallToolResult::success(
+            json!({
+                "muted": did
+            })
+            .to_string(),
+        ),
+        Err(e) => CallToolResult::error(format!("Failed to mute user: {}", e)),
+    }
+}
+
+pub async fn unmute_user(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let did = match arguments.get("did").and_then(|v| v.as_str()) {
+        Some(d) => d,
+        None => return CallToolResult::error("Missing required parameter: did"),
+    };
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.unmute(did).await {
+        Ok(()) => CallToolResult::success(
+            json!({
+                "unmuted": did
+            })
+            .to_string(),
+        ),
+        Err(e) => CallToolResult::error(format!("Failed to unmute user: {}", e)),
+    }
+}
+
+pub async fn block_user(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let did = match arguments.get("did").and_then(|v| v.as_str()) {
+        Some(d) => d,
+        None => return CallToolResult::error("Missing required parameter: did"),
+    };
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.block(did).await {
+        Ok(block_uri) => CallToolResult::success(
+            json!({
+                "blocked": did,
+                "block_uri": block_uri
+            })
+            .to_string(),
+        ),
+        Err(e) => CallToolResult::error(format!("Failed to block user: {}", e)),
+    }
+}
+
+pub async fn unblock_user(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let block_uri = match arguments.get("block_uri").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return CallToolResult::error("Missing required parameter: block_uri"),
+    };
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.unblock(block_uri).await {
+        Ok(()) => CallToolResult::success(
+            json!({
+                "unblocked": block_uri
+            })
+            .to_string(),
+        ),
+        Err(e) => CallToolResult::error(format!("Failed to unblock user: {}", e)),
     }
 }

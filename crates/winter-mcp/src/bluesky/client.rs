@@ -13,7 +13,7 @@ use tracing::{debug, info};
 
 use super::types::{
     BlueskyNotification, Conversation, ConvoMember, DirectMessage, NotificationReason, PostRef,
-    SearchPost, SearchUser, TimelinePost,
+    SearchPost, SearchUser, ThreadContext, ThreadPost, TimelinePost,
 };
 
 /// Errors that can occur when interacting with Bluesky.
@@ -449,6 +449,257 @@ impl BlueskyClient {
         Ok(posts)
     }
 
+    /// Get a post thread with full context.
+    ///
+    /// Returns the thread structure with all posts flattened, participants listed,
+    /// and participation metrics for the current user.
+    pub async fn get_post_thread(
+        &self,
+        uri: &str,
+        depth: Option<u16>,
+    ) -> Result<ThreadContext, BlueskyError> {
+        use atrium_api::app::bsky::feed::get_post_thread::OutputThreadRefs;
+        use std::collections::HashSet;
+
+        let params = atrium_api::app::bsky::feed::get_post_thread::ParametersData {
+            uri: uri.to_string(),
+            depth: depth.map(|d| d.clamp(0, 1000).try_into().unwrap()),
+            parent_height: Some(1000.try_into().unwrap()),
+        };
+
+        let output = self
+            .agent
+            .api
+            .app
+            .bsky
+            .feed
+            .get_post_thread(params.into())
+            .await
+            .map_err(|e| {
+                let error_str = e.to_string();
+                if error_str.contains("RateLimitExceeded") || error_str.contains("429") {
+                    BlueskyError::RateLimited {
+                        endpoint: Some("getPostThread".to_string()),
+                    }
+                } else {
+                    BlueskyError::Api(error_str)
+                }
+            })?;
+
+        // Parse the thread view into our flattened structure
+        let mut posts = Vec::new();
+        let mut participants = HashSet::new();
+        let my_did = self.did().await;
+
+        // Process replies recursively
+        fn process_replies(
+            replies: &Option<
+                Vec<
+                    atrium_api::types::Union<
+                        atrium_api::app::bsky::feed::defs::ThreadViewPostRepliesItem,
+                    >,
+                >,
+            >,
+            parent_uri: &str,
+            depth: u32,
+            posts: &mut Vec<ThreadPost>,
+            participants: &mut HashSet<String>,
+            client: &BlueskyClient,
+        ) {
+            use atrium_api::app::bsky::feed::defs::ThreadViewPostRepliesItem;
+            if let Some(replies) = replies {
+                for reply in replies {
+                    if let atrium_api::types::Union::Refs(
+                        ThreadViewPostRepliesItem::ThreadViewPost(reply_view),
+                    ) = reply
+                    {
+                        participants.insert(reply_view.post.author.did.to_string());
+                        let post = ThreadPost {
+                            uri: reply_view.post.uri.clone(),
+                            cid: reply_view.post.cid.as_ref().to_string(),
+                            author_did: reply_view.post.author.did.to_string(),
+                            author_handle: reply_view.post.author.handle.to_string(),
+                            text: client.extract_post_text(&reply_view.post.record),
+                            created_at: client.extract_post_created_at(&reply_view.post.record),
+                            reply_count: reply_view.post.reply_count,
+                            parent_uri: Some(parent_uri.to_string()),
+                            depth,
+                        };
+                        posts.push(post);
+
+                        // Recurse into nested replies
+                        process_replies(
+                            &reply_view.replies,
+                            &reply_view.post.uri,
+                            depth + 1,
+                            posts,
+                            participants,
+                            client,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Convert a thread view to a ThreadPost
+        fn thread_view_to_post(
+            thread_view: &atrium_api::app::bsky::feed::defs::ThreadViewPost,
+            depth: u32,
+            parent_uri: Option<&str>,
+            participants: &mut HashSet<String>,
+            client: &BlueskyClient,
+        ) -> ThreadPost {
+            participants.insert(thread_view.post.author.did.to_string());
+            ThreadPost {
+                uri: thread_view.post.uri.clone(),
+                cid: thread_view.post.cid.as_ref().to_string(),
+                author_did: thread_view.post.author.did.to_string(),
+                author_handle: thread_view.post.author.handle.to_string(),
+                text: client.extract_post_text(&thread_view.post.record),
+                created_at: client.extract_post_created_at(&thread_view.post.record),
+                reply_count: thread_view.post.reply_count,
+                parent_uri: parent_uri.map(|s| s.to_string()),
+                depth,
+            }
+        }
+
+        // Extract root post by traversing up the parent chain
+        let root_post = match &output.thread {
+            atrium_api::types::Union::Refs(OutputThreadRefs::AppBskyFeedDefsThreadViewPost(
+                thread_view,
+            )) => {
+                use atrium_api::app::bsky::feed::defs::ThreadViewPostParentRefs;
+
+                // Collect ancestor chain by traversing up parents
+                let mut ancestors: Vec<&atrium_api::app::bsky::feed::defs::ThreadViewPost> =
+                    Vec::new();
+                let mut current = thread_view.as_ref();
+
+                // Walk up the parent chain
+                while let Some(ref parent) = current.parent {
+                    if let atrium_api::types::Union::Refs(
+                        ThreadViewPostParentRefs::ThreadViewPost(parent_view),
+                    ) = parent
+                    {
+                        ancestors.push(parent_view.as_ref());
+                        current = parent_view.as_ref();
+                    } else {
+                        // Parent is blocked or not found, stop traversal
+                        break;
+                    }
+                }
+
+                // Reverse ancestors so they're in root -> ... -> parent order
+                ancestors.reverse();
+
+                // Process ancestors first (root is at ancestors[0] if any)
+                // Note: ancestors don't have their replies populated, only the path to root
+                let mut depth = 0u32;
+                let mut last_uri: Option<String> = None;
+
+                for ancestor in &ancestors {
+                    let post = thread_view_to_post(
+                        ancestor,
+                        depth,
+                        last_uri.as_deref(),
+                        &mut participants,
+                        self,
+                    );
+                    last_uri = Some(ancestor.post.uri.clone());
+                    posts.push(post);
+                    depth += 1;
+                }
+
+                // Process the originally requested post
+                let post = thread_view_to_post(
+                    thread_view.as_ref(),
+                    depth,
+                    last_uri.as_deref(),
+                    &mut participants,
+                    self,
+                );
+                posts.push(post);
+
+                // Process replies of the requested post (only this one has replies populated)
+                process_replies(
+                    &thread_view.replies,
+                    &thread_view.post.uri,
+                    depth + 1,
+                    &mut posts,
+                    &mut participants,
+                    self,
+                );
+
+                // The root post is the first one in the list
+                posts
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| BlueskyError::Api("Empty thread".to_string()))?
+            }
+            atrium_api::types::Union::Refs(OutputThreadRefs::AppBskyFeedDefsBlockedPost(_)) => {
+                return Err(BlueskyError::Api("Thread is blocked".to_string()));
+            }
+            atrium_api::types::Union::Refs(OutputThreadRefs::AppBskyFeedDefsNotFoundPost(_)) => {
+                return Err(BlueskyError::Api("Thread not found".to_string()));
+            }
+            atrium_api::types::Union::Unknown(_) => {
+                return Err(BlueskyError::Api("Unknown thread type".to_string()));
+            }
+        };
+
+        // Calculate participation metrics
+        let total_replies = posts.len().saturating_sub(1); // Exclude root
+        let (my_reply_count, my_last_reply_at, posts_since_my_last_reply) = if let Some(ref my_did) =
+            my_did
+        {
+            let my_posts: Vec<_> = posts.iter().filter(|p| &p.author_did == my_did).collect();
+            let my_count = my_posts.len();
+
+            let my_last = my_posts
+                .iter()
+                .filter_map(|p| p.created_at.as_ref())
+                .max()
+                .cloned();
+
+            let since_count = if let Some(ref last_time) = my_last {
+                posts
+                    .iter()
+                    .filter(|p| {
+                        p.created_at
+                            .as_ref()
+                            .map(|t| t > last_time)
+                            .unwrap_or(false)
+                    })
+                    .count()
+            } else {
+                0
+            };
+
+            (my_count, my_last, since_count)
+        } else {
+            (0, None, 0)
+        };
+
+        let context = ThreadContext {
+            root: root_post,
+            posts,
+            participants: participants.into_iter().collect(),
+            total_replies,
+            my_reply_count,
+            my_last_reply_at,
+            posts_since_my_last_reply,
+        };
+
+        debug!(
+            uri = %uri,
+            total_replies = context.total_replies,
+            participants = context.participants.len(),
+            "fetched thread context"
+        );
+
+        Ok(context)
+    }
+
     /// Get recent notifications.
     pub async fn get_notifications(
         &mut self,
@@ -515,8 +766,8 @@ impl BlueskyClient {
                 }
             };
 
-            // Extract text and reply refs from the record (if it's a post)
-            let (text, parent, root) = self.extract_post_data(&notif.record);
+            // Extract text, reply refs, and facets from the record (if it's a post)
+            let (text, parent, root, facets) = self.extract_post_data(&notif.record);
 
             notifications.push(BlueskyNotification {
                 reason,
@@ -527,6 +778,7 @@ impl BlueskyClient {
                 cid: notif.cid.as_ref().to_string(),
                 parent,
                 root,
+                facets,
             });
         }
 
@@ -561,11 +813,16 @@ impl BlueskyClient {
         .and_then(|p| p.created_at)
     }
 
-    /// Extract post text and reply references from a record.
+    /// Extract post text, reply references, and facets from a record.
     fn extract_post_data(
         &self,
         record: &atrium_api::types::Unknown,
-    ) -> (Option<String>, Option<PostRef>, Option<PostRef>) {
+    ) -> (
+        Option<String>,
+        Option<PostRef>,
+        Option<PostRef>,
+        Vec<winter_atproto::Facet>,
+    ) {
         // Try to deserialize as a post record
         if let Ok(post) = serde_json::from_value::<DeserPostRecord>(
             serde_json::to_value(record).unwrap_or(serde_json::Value::Null),
@@ -585,9 +842,9 @@ impl BlueskyClient {
             } else {
                 (None, None)
             };
-            (text, parent, root)
+            (text, parent, root, post.facets)
         } else {
-            (None, None, None)
+            (None, None, None, Vec::new())
         }
     }
 
@@ -685,12 +942,21 @@ impl BlueskyClient {
                         let sent_at = chrono::DateTime::parse_from_rfc3339(view.sent_at.as_str())
                             .ok()?
                             .with_timezone(&chrono::Utc);
+
+                        // Convert atrium facets to our Facet type
+                        let facets = view
+                            .facets
+                            .as_ref()
+                            .map(|facets| convert_atrium_facets(facets))
+                            .unwrap_or_default();
+
                         Some(DirectMessage {
                             id: view.id.clone(),
                             convo_id: convo_id.to_string(),
                             sender_did: view.sender.did.to_string(),
                             text: view.text.clone(),
                             sent_at,
+                            facets,
                         })
                     }
                     _ => None, // Skip deleted messages or unknown types
@@ -870,6 +1136,56 @@ impl BlueskyClient {
         Ok((posts, output.cursor.clone()))
     }
 
+    /// Get all followers of the current user.
+    ///
+    /// Handles pagination internally to fetch the complete list.
+    /// Returns a list of DIDs for all followers.
+    pub async fn get_all_followers(&self) -> Result<Vec<String>, BlueskyError> {
+        let did = self.did().await.ok_or(BlueskyError::NotConfigured)?;
+        let mut all_dids = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let params = atrium_api::app::bsky::graph::get_followers::ParametersData {
+                actor: did
+                    .parse()
+                    .map_err(|e| BlueskyError::Api(format!("invalid DID: {}", e)))?,
+                cursor: cursor.clone(),
+                limit: Some(100.try_into().unwrap()),
+            };
+
+            let output = self
+                .agent
+                .api
+                .app
+                .bsky
+                .graph
+                .get_followers(params.into())
+                .await
+                .map_err(|e| {
+                    let error_str = e.to_string();
+                    if error_str.contains("RateLimitExceeded") || error_str.contains("429") {
+                        BlueskyError::RateLimited {
+                            endpoint: Some("getFollowers".to_string()),
+                        }
+                    } else {
+                        BlueskyError::Api(error_str)
+                    }
+                })?;
+
+            all_dids.extend(output.followers.iter().map(|f| f.did.to_string()));
+
+            cursor = output.cursor.clone();
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        debug!(count = all_dids.len(), "fetched all followers");
+
+        Ok(all_dids)
+    }
+
     /// Search for users across Bluesky.
     ///
     /// Returns users matching the query (by name, handle, or bio).
@@ -921,6 +1237,169 @@ impl BlueskyClient {
 
         Ok((users, output.cursor.clone()))
     }
+
+    /// Mute a user by their DID.
+    ///
+    /// Muted users won't appear in your timeline or notifications.
+    pub async fn mute(&self, did: &str) -> Result<(), BlueskyError> {
+        let parsed_did: atrium_api::types::string::Did = did
+            .parse()
+            .map_err(|e| BlueskyError::Api(format!("invalid DID: {}", e)))?;
+
+        self.agent
+            .api
+            .app
+            .bsky
+            .graph
+            .mute_actor(
+                atrium_api::app::bsky::graph::mute_actor::InputData {
+                    actor: parsed_did.into(),
+                }
+                .into(),
+            )
+            .await
+            .map_err(|e| BlueskyError::Api(format!("failed to mute user: {}", e)))?;
+
+        debug!(did = %did, "muted user");
+
+        Ok(())
+    }
+
+    /// Unmute a previously muted user.
+    pub async fn unmute(&self, did: &str) -> Result<(), BlueskyError> {
+        let parsed_did: atrium_api::types::string::Did = did
+            .parse()
+            .map_err(|e| BlueskyError::Api(format!("invalid DID: {}", e)))?;
+
+        self.agent
+            .api
+            .app
+            .bsky
+            .graph
+            .unmute_actor(
+                atrium_api::app::bsky::graph::unmute_actor::InputData {
+                    actor: parsed_did.into(),
+                }
+                .into(),
+            )
+            .await
+            .map_err(|e| BlueskyError::Api(format!("failed to unmute user: {}", e)))?;
+
+        debug!(did = %did, "unmuted user");
+
+        Ok(())
+    }
+
+    /// Block a user by their DID.
+    ///
+    /// Blocked users can't see your posts or interact with you.
+    /// Returns the URI of the block record.
+    pub async fn block(&self, did: &str) -> Result<String, BlueskyError> {
+        let did: atrium_api::types::string::Did = did
+            .parse()
+            .map_err(|e| BlueskyError::Api(format!("invalid DID: {}", e)))?;
+
+        let record_data = atrium_api::app::bsky::graph::block::RecordData {
+            created_at: Datetime::now(),
+            subject: did.clone(),
+        };
+
+        let output = self
+            .agent
+            .create_record(record_data)
+            .await
+            .map_err(|e| BlueskyError::Api(format!("failed to block user: {}", e)))?;
+
+        debug!(block_uri = %output.uri, subject = %did.as_str(), "blocked user");
+
+        Ok(output.uri.to_string())
+    }
+
+    /// Unblock a previously blocked user.
+    ///
+    /// Takes the block record URI returned from `block()`.
+    pub async fn unblock(&self, block_uri: &str) -> Result<(), BlueskyError> {
+        // Parse the AT URI to extract repo and rkey
+        // Format: at://did:plc:xxx/app.bsky.graph.block/rkey
+        let parts: Vec<&str> = block_uri.split('/').collect();
+        if parts.len() < 5 {
+            return Err(BlueskyError::Api(format!("invalid block URI: {}", block_uri)));
+        }
+
+        let repo = parts[2]; // did:plc:xxx
+        let collection = parts[3]; // app.bsky.graph.block
+        let rkey = parts[4]; // rkey
+
+        self.agent
+            .api
+            .com
+            .atproto
+            .repo
+            .delete_record(
+                atrium_api::com::atproto::repo::delete_record::InputData {
+                    collection: collection
+                        .parse()
+                        .map_err(|e| BlueskyError::Api(format!("invalid collection: {}", e)))?,
+                    repo: repo
+                        .parse()
+                        .map_err(|e| BlueskyError::Api(format!("invalid repo: {}", e)))?,
+                    rkey: rkey
+                        .parse()
+                        .map_err(|e| BlueskyError::Api(format!("invalid rkey: {}", e)))?,
+                    swap_commit: None,
+                    swap_record: None,
+                }
+                .into(),
+            )
+            .await
+            .map_err(|e| BlueskyError::Api(format!("failed to unblock user: {}", e)))?;
+
+        debug!(block_uri = %block_uri, "unblocked user");
+
+        Ok(())
+    }
+}
+
+/// Convert atrium facets to our Facet type.
+fn convert_atrium_facets(
+    facets: &[atrium_api::app::bsky::richtext::facet::Main],
+) -> Vec<winter_atproto::Facet> {
+    use atrium_api::app::bsky::richtext::facet::MainFeaturesItem;
+    use winter_atproto::{ByteSlice, Facet, FacetFeature};
+
+    facets
+        .iter()
+        .map(|f| {
+            let features = f
+                .features
+                .iter()
+                .filter_map(|feature| match feature {
+                    atrium_api::types::Union::Refs(MainFeaturesItem::Mention(m)) => {
+                        Some(FacetFeature::Mention {
+                            did: m.did.to_string(),
+                        })
+                    }
+                    atrium_api::types::Union::Refs(MainFeaturesItem::Link(l)) => {
+                        Some(FacetFeature::Link {
+                            uri: l.uri.clone(),
+                        })
+                    }
+                    atrium_api::types::Union::Refs(MainFeaturesItem::Tag(t)) => {
+                        Some(FacetFeature::Tag { tag: t.tag.clone() })
+                    }
+                    _ => None,
+                })
+                .collect();
+
+            Facet {
+                index: ByteSlice {
+                    byte_start: f.index.byte_start as u64,
+                    byte_end: f.index.byte_end as u64,
+                },
+                features,
+            }
+        })
+        .collect()
 }
 
 /// Helper struct for deserializing post records from notifications.
@@ -928,6 +1407,8 @@ impl BlueskyClient {
 struct DeserPostRecord {
     text: String,
     reply: Option<DeserReplyRef>,
+    #[serde(default)]
+    facets: Vec<winter_atproto::Facet>,
 }
 
 #[derive(Debug, serde::Deserialize)]
