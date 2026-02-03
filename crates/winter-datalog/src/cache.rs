@@ -21,6 +21,7 @@ use winter_atproto::{CacheUpdate, Fact, FactDeclaration, RepoCache, Rule, SyncSt
 
 use crate::derived::DerivedFactGenerator;
 use crate::error::DatalogError;
+use crate::validator::{validate_fact_against_declaration, ValidationError};
 use crate::{RuleCompiler, SouffleExecutor};
 
 /// Cached data for a single fact.
@@ -75,8 +76,12 @@ pub struct DatalogCache {
     /// Cached rules (for compilation).
     rules: RwLock<Vec<Rule>>,
 
-    /// Cached fact declarations (for query-time .decl generation).
+    /// Cached fact declarations (for query-time .decl generation), keyed by rkey.
     declarations: RwLock<HashMap<String, FactDeclaration>>,
+
+    /// Fact declarations indexed by predicate name for validation.
+    /// This is a secondary index maintained alongside `declarations`.
+    declarations_by_predicate: RwLock<HashMap<String, FactDeclaration>>,
 
     /// Cached base program (declarations + compiled rules).
     base_program: RwLock<Option<CachedProgram>>,
@@ -135,6 +140,7 @@ impl DatalogCache {
             superseded_cids: RwLock::new(HashSet::new()),
             rules: RwLock::new(Vec::new()),
             declarations: RwLock::new(HashMap::new()),
+            declarations_by_predicate: RwLock::new(HashMap::new()),
             base_program: RwLock::new(None),
             facts_generation: AtomicU64::new(0),
             rules_generation: AtomicU64::new(0),
@@ -430,12 +436,14 @@ impl DatalogCache {
             info!("all derived facts populated and marked dirty");
         }
 
-        // Populate fact declarations
+        // Populate fact declarations (both by rkey and by predicate)
         {
             let declarations_list = repo_cache.list_declarations();
             info!(count = declarations_list.len(), "populating fact declarations");
             let mut decls = self.declarations.write().await;
+            let mut decls_by_pred = self.declarations_by_predicate.write().await;
             for (rkey, cached) in declarations_list {
+                decls_by_pred.insert(cached.value.predicate.clone(), cached.value.clone());
                 decls.insert(rkey, cached.value);
             }
         }
@@ -555,18 +563,33 @@ impl DatalogCache {
             // Declaration records - store for query-time .decl generation
             CacheUpdate::DeclarationCreated { rkey, declaration }
             | CacheUpdate::DeclarationUpdated { rkey, declaration } => {
-                let mut decls = self.declarations.write().await;
-                decls.insert(rkey, declaration);
+                // Update both indexes
+                {
+                    let mut decls = self.declarations.write().await;
+                    let mut decls_by_pred = self.declarations_by_predicate.write().await;
+                    decls_by_pred.insert(declaration.predicate.clone(), declaration.clone());
+                    decls.insert(rkey, declaration);
+                }
                 // Invalidate base program since declarations changed
                 let mut prog = self.base_program.write().await;
                 *prog = None;
+                // Mark for full regen since validation rules may have changed
+                *self.full_regen_needed.write().await = true;
             }
             CacheUpdate::DeclarationDeleted { rkey } => {
-                let mut decls = self.declarations.write().await;
-                decls.remove(&rkey);
+                // Remove from both indexes
+                {
+                    let mut decls = self.declarations.write().await;
+                    let mut decls_by_pred = self.declarations_by_predicate.write().await;
+                    if let Some(removed) = decls.remove(&rkey) {
+                        decls_by_pred.remove(&removed.predicate);
+                    }
+                }
                 // Invalidate base program since declarations changed
                 let mut prog = self.base_program.write().await;
                 *prog = None;
+                // Mark for full regen since validation rules may have changed
+                *self.full_regen_needed.write().await = true;
             }
             // State updates - extract followers for is_followed_by predicate
             CacheUpdate::StateUpdated { state } => {
@@ -939,13 +962,14 @@ impl DatalogCache {
         if !dirty.is_empty() {
             debug!(predicates = ?dirty, "flushing dirty predicates");
 
-            // Get facts and arities
+            // Get facts, arities, and declarations for validation
             let facts = self.facts_by_rkey.read().await;
             let arities = self.predicate_arities.read().await;
+            let decls_by_pred = self.declarations_by_predicate.read().await;
 
             for predicate in dirty {
                 if let Some(&arity) = arities.get(&predicate) {
-                    self.regenerate_predicate_files(&predicate, arity, &facts)?;
+                    self.regenerate_predicate_files(&predicate, arity, &facts, &decls_by_pred)?;
                 }
             }
         }
@@ -960,11 +984,15 @@ impl DatalogCache {
     }
 
     /// Regenerate TSV files for a single predicate.
+    ///
+    /// Facts are validated against declarations if one exists for the predicate.
+    /// Invalid facts are skipped from TSV output and logged for investigation.
     fn regenerate_predicate_files(
         &self,
         predicate: &str,
         arity: usize,
         facts: &HashMap<String, CachedFactData>,
+        declarations_by_predicate: &HashMap<String, FactDeclaration>,
     ) -> Result<(), DatalogError> {
         // Current facts file (non-superseded only)
         let current_path = self.fact_dir.join(format!("{}.facts", predicate));
@@ -974,9 +1002,29 @@ impl DatalogCache {
         let all_path = self.fact_dir.join(format!("_all_{}.facts", predicate));
         let mut all_file = std::fs::File::create(&all_path)?;
 
+        // Validation errors file (append mode for incremental predicates)
+        let errors_path = self.fact_dir.join("_validation_error.facts");
+        let mut errors_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&errors_path)?;
+
         for (rkey, data) in facts.iter() {
             if data.fact.predicate != predicate {
                 continue;
+            }
+
+            // Validate against declaration if one exists
+            if let Some(error) = validate_fact_against_declaration(&data.fact, declarations_by_predicate) {
+                warn!(
+                    rkey = %rkey,
+                    predicate = %data.fact.predicate,
+                    error = %error,
+                    "skipping fact due to schema validation failure"
+                );
+                // Write to validation errors file for investigation
+                writeln!(errors_file, "{}\t{}\t{}", rkey, data.fact.predicate, error)?;
+                continue; // Skip writing to TSV
             }
 
             // Escape tabs and newlines in arguments to prevent TSV corruption
@@ -1002,9 +1050,15 @@ impl DatalogCache {
     }
 
     /// Regenerate all TSV files from scratch.
+    ///
+    /// Facts are validated against declarations. Invalid facts are:
+    /// - Still written to metadata files (_fact, _confidence, etc.)
+    /// - Skipped from predicate TSV files to prevent Soufflé errors
+    /// - Logged to _validation_error.facts for investigation
     async fn regenerate_all_files(&self) -> Result<(), DatalogError> {
         let facts = self.facts_by_rkey.read().await;
         let arities = self.predicate_arities.read().await;
+        let decls_by_pred = self.declarations_by_predicate.read().await;
 
         // Clear and regenerate metadata files
         let mut fact_file = std::fs::File::create(self.fact_dir.join("_fact.facts"))?;
@@ -1013,16 +1067,34 @@ impl DatalogCache {
         let mut supersedes_file = std::fs::File::create(self.fact_dir.join("_supersedes.facts"))?;
         let mut created_at_file = std::fs::File::create(self.fact_dir.join("_created_at.facts"))?;
 
+        // Clear validation errors file (we're doing full regen)
+        let mut errors_file = std::fs::File::create(self.fact_dir.join("_validation_error.facts"))?;
+
         // Group facts by predicate for efficient file writing
-        let mut by_predicate: HashMap<&str, Vec<(&str, &CachedFactData)>> = HashMap::new();
+        // Also track validation state per fact
+        let mut by_predicate: HashMap<&str, Vec<(&str, &CachedFactData, Option<ValidationError>)>> = HashMap::new();
 
         for (rkey, data) in facts.iter() {
+            // Validate against declaration
+            let validation_error = validate_fact_against_declaration(&data.fact, &decls_by_pred);
+
+            // Log validation errors
+            if let Some(ref error) = validation_error {
+                warn!(
+                    rkey = %rkey,
+                    predicate = %data.fact.predicate,
+                    error = %error,
+                    "fact fails schema validation"
+                );
+                writeln!(errors_file, "{}\t{}\t{}", rkey, data.fact.predicate, error)?;
+            }
+
             by_predicate
                 .entry(&data.fact.predicate)
                 .or_default()
-                .push((rkey.as_str(), data));
+                .push((rkey.as_str(), data, validation_error));
 
-            // Write metadata
+            // Write metadata (always, even for invalid facts - they still exist in PDS)
             writeln!(fact_file, "{}\t{}\t{}", rkey, data.fact.predicate, data.cid)?;
 
             if let Some(conf) = data.fact.confidence {
@@ -1047,7 +1119,7 @@ impl DatalogCache {
             writeln!(created_at_file, "{}\t{}", rkey, data.fact.created_at.to_rfc3339())?;
         }
 
-        // Write predicate files
+        // Write predicate files (skip invalid facts)
         for (predicate, facts_for_pred) in by_predicate {
             if let Some(&_arity) = arities.get(predicate) {
                 let current_path = self.fact_dir.join(format!("{}.facts", predicate));
@@ -1056,7 +1128,12 @@ impl DatalogCache {
                 let mut current_file = std::fs::File::create(&current_path)?;
                 let mut all_file = std::fs::File::create(&all_path)?;
 
-                for (rkey, data) in facts_for_pred {
+                for (rkey, data, validation_error) in facts_for_pred {
+                    // Skip invalid facts from predicate files
+                    if validation_error.is_some() {
+                        continue;
+                    }
+
                     // Escape tabs and newlines in arguments to prevent TSV corruption
                     let args: Vec<String> = data
                         .fact
@@ -1215,13 +1292,16 @@ pub fn generate_input_declarations_from_arities(
          .decl _supersedes(new_rkey: symbol, old_rkey: symbol)\n\
          .input _supersedes\n\n\
          .decl _created_at(rkey: symbol, timestamp: symbol)\n\
-         .input _created_at\n\n",
+         .input _created_at\n\n\
+         .decl _validation_error(rkey: symbol, predicate: symbol, error_msg: symbol)\n\
+         .input _validation_error\n\n",
     );
     declared_set.insert("_fact".to_string());
     declared_set.insert("_confidence".to_string());
     declared_set.insert("_source".to_string());
     declared_set.insert("_supersedes".to_string());
     declared_set.insert("_created_at".to_string());
+    declared_set.insert("_validation_error".to_string());
 
     // User predicates (current facts only) and _all_{predicate} (all facts with rkey at end)
     for (predicate, &arity) in arities {
@@ -2036,5 +2116,207 @@ test_result(Uri) :- thread_depth(Uri, D), D > "5", reply_cnt(Uri, C), C > "3"."#
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0][0], "at://test/thread");
+    }
+
+    #[tokio::test]
+    async fn test_fact_validation_conforming_fact() {
+        use winter_atproto::{FactDeclaration, FactDeclArg};
+
+        let cache = DatalogCache::new_temp().unwrap();
+
+        // Add a declaration for 2-arg predicate
+        let declaration = FactDeclaration {
+            predicate: "test_pred".to_string(),
+            args: vec![
+                FactDeclArg {
+                    name: "arg1".to_string(),
+                    r#type: "symbol".to_string(),
+                    description: Some("First argument".to_string()),
+                },
+                FactDeclArg {
+                    name: "arg2".to_string(),
+                    r#type: "symbol".to_string(),
+                    description: Some("Second argument".to_string()),
+                },
+            ],
+            description: "Test predicate".to_string(),
+            tags: vec![],
+            created_at: Utc::now(),
+            last_updated: None,
+        };
+
+        // Insert declaration
+        {
+            let mut decls = cache.declarations.write().await;
+            let mut decls_by_pred = cache.declarations_by_predicate.write().await;
+            decls_by_pred.insert(declaration.predicate.clone(), declaration.clone());
+            decls.insert("decl_rkey".to_string(), declaration);
+        }
+
+        // Add a conforming fact (2 args)
+        cache
+            .add_fact(
+                "rkey1".to_string(),
+                make_fact("test_pred", vec!["a", "b"]),
+                "cid1".to_string(),
+            )
+            .await;
+
+        // Flush to generate TSV
+        cache.flush_dirty_predicates().await.unwrap();
+
+        // Check that the fact appears in the TSV file
+        let tsv_path = cache.fact_dir.join("test_pred.facts");
+        let content = std::fs::read_to_string(&tsv_path).unwrap();
+        assert!(content.contains("a\tb\trkey1"), "conforming fact should be in TSV");
+
+        // Check that no validation errors were logged
+        let errors_path = cache.fact_dir.join("_validation_error.facts");
+        let errors = std::fs::read_to_string(&errors_path).unwrap_or_default();
+        assert!(!errors.contains("rkey1"), "conforming fact should not have validation errors");
+    }
+
+    #[tokio::test]
+    async fn test_fact_validation_non_conforming_fact() {
+        use winter_atproto::{FactDeclaration, FactDeclArg};
+
+        let cache = DatalogCache::new_temp().unwrap();
+
+        // Add a declaration for 2-arg predicate
+        let declaration = FactDeclaration {
+            predicate: "test_pred".to_string(),
+            args: vec![
+                FactDeclArg {
+                    name: "arg1".to_string(),
+                    r#type: "symbol".to_string(),
+                    description: Some("First argument".to_string()),
+                },
+                FactDeclArg {
+                    name: "arg2".to_string(),
+                    r#type: "symbol".to_string(),
+                    description: Some("Second argument".to_string()),
+                },
+            ],
+            description: "Test predicate".to_string(),
+            tags: vec![],
+            created_at: Utc::now(),
+            last_updated: None,
+        };
+
+        // Insert declaration
+        {
+            let mut decls = cache.declarations.write().await;
+            let mut decls_by_pred = cache.declarations_by_predicate.write().await;
+            decls_by_pred.insert(declaration.predicate.clone(), declaration.clone());
+            decls.insert("decl_rkey".to_string(), declaration);
+        }
+
+        // Add a non-conforming fact (3 args instead of 2)
+        cache
+            .add_fact(
+                "rkey_bad".to_string(),
+                make_fact("test_pred", vec!["a", "b", "c"]), // 3 args, declaration says 2
+                "cid_bad".to_string(),
+            )
+            .await;
+
+        // Flush to generate TSV
+        cache.flush_dirty_predicates().await.unwrap();
+
+        // Check that the bad fact does NOT appear in the TSV file
+        let tsv_path = cache.fact_dir.join("test_pred.facts");
+        let content = std::fs::read_to_string(&tsv_path).unwrap();
+        assert!(!content.contains("rkey_bad"), "non-conforming fact should NOT be in TSV");
+
+        // Check that validation error was logged
+        let errors_path = cache.fact_dir.join("_validation_error.facts");
+        let errors = std::fs::read_to_string(&errors_path).unwrap();
+        assert!(errors.contains("rkey_bad"), "non-conforming fact should have validation error");
+        assert!(errors.contains("test_pred"), "error should mention predicate name");
+        assert!(errors.contains("arity mismatch"), "error should describe the issue");
+    }
+
+    #[tokio::test]
+    async fn test_fact_validation_no_declaration_is_permissive() {
+        let cache = DatalogCache::new_temp().unwrap();
+
+        // Add a fact without any declaration
+        cache
+            .add_fact(
+                "rkey1".to_string(),
+                make_fact("undeclared_pred", vec!["a", "b", "c", "d"]),
+                "cid1".to_string(),
+            )
+            .await;
+
+        // Flush to generate TSV
+        cache.flush_dirty_predicates().await.unwrap();
+
+        // Check that the fact appears in TSV (permissive when no declaration)
+        let tsv_path = cache.fact_dir.join("undeclared_pred.facts");
+        let content = std::fs::read_to_string(&tsv_path).unwrap();
+        assert!(content.contains("rkey1"), "fact without declaration should be in TSV");
+
+        // Check that no validation errors were logged
+        let errors_path = cache.fact_dir.join("_validation_error.facts");
+        let errors = std::fs::read_to_string(&errors_path).unwrap_or_default();
+        assert!(!errors.contains("rkey1"), "undeclared fact should not have validation errors");
+    }
+
+    #[tokio::test]
+    async fn test_validation_error_queryable() {
+        use winter_atproto::{FactDeclaration, FactDeclArg};
+
+        let cache = DatalogCache::new_temp().unwrap();
+
+        // Add a declaration for 2-arg predicate
+        let declaration = FactDeclaration {
+            predicate: "validated_pred".to_string(),
+            args: vec![
+                FactDeclArg {
+                    name: "arg1".to_string(),
+                    r#type: "symbol".to_string(),
+                    description: Some("First argument".to_string()),
+                },
+                FactDeclArg {
+                    name: "arg2".to_string(),
+                    r#type: "symbol".to_string(),
+                    description: Some("Second argument".to_string()),
+                },
+            ],
+            description: "Test predicate".to_string(),
+            tags: vec![],
+            created_at: Utc::now(),
+            last_updated: None,
+        };
+
+        // Insert declaration
+        {
+            let mut decls = cache.declarations.write().await;
+            let mut decls_by_pred = cache.declarations_by_predicate.write().await;
+            decls_by_pred.insert(declaration.predicate.clone(), declaration.clone());
+            decls.insert("decl_rkey".to_string(), declaration);
+        }
+
+        // Add a non-conforming fact
+        cache
+            .add_fact(
+                "bad_fact".to_string(),
+                make_fact("validated_pred", vec!["a", "b", "c"]), // 3 args, declaration says 2
+                "cid_bad".to_string(),
+            )
+            .await;
+
+        // Query validation errors
+        let result = cache
+            .execute_query("_validation_error(R, P, E)", None)
+            .await
+            .unwrap();
+
+        // Should find the validation error
+        assert_eq!(result.len(), 1, "should have one validation error");
+        assert_eq!(result[0][0], "bad_fact", "rkey should match");
+        assert_eq!(result[0][1], "validated_pred", "predicate should match");
+        assert!(result[0][2].contains("arity mismatch"), "error message should describe the issue");
     }
 }

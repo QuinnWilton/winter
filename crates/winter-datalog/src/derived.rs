@@ -29,10 +29,26 @@ struct PostMeta {
     uri: String,
     /// Parent URI if this is a reply.
     reply_parent: Option<String>,
+    /// Parent CID if this is a reply.
+    reply_parent_cid: Option<String>,
     /// Root URI if this is a reply (the thread root).
     reply_root: Option<String>,
+    /// Root CID if this is a reply.
+    reply_root_cid: Option<String>,
     /// Quoted URI if this is a quote post.
     quote_uri: Option<String>,
+    /// Quoted CID if this is a quote post.
+    quote_cid: Option<String>,
+    /// When the post was created.
+    created_at: DateTime<Utc>,
+    /// Languages the post is written in.
+    langs: Vec<String>,
+    /// DIDs of accounts mentioned in the post.
+    mentions: Vec<String>,
+    /// External links in the post.
+    links: Vec<String>,
+    /// Hashtags in the post.
+    hashtags: Vec<String>,
 }
 
 /// Metadata about a note for derived facts.
@@ -63,6 +79,12 @@ struct ThoughtMeta {
     kind: String,
     /// What triggered this thought.
     trigger: Option<String>,
+    /// Tags for categorization.
+    tags: Vec<String>,
+    /// Duration in milliseconds (for tool_call thoughts).
+    duration_ms: Option<u64>,
+    /// Tool name (for tool_call thoughts only).
+    tool_name: Option<String>,
     /// When this thought was recorded.
     created_at: DateTime<Utc>,
 }
@@ -80,6 +102,37 @@ struct BlogMeta {
     created_at: String,
     /// Whether this is a draft.
     is_draft: bool,
+}
+
+/// Metadata about a like for derived facts.
+#[derive(Debug, Clone)]
+struct LikeMeta {
+    /// The liked post's URI.
+    post_uri: String,
+    /// The liked post's CID.
+    post_cid: String,
+    /// When the like was created.
+    created_at: DateTime<Utc>,
+}
+
+/// Metadata about a repost for derived facts.
+#[derive(Debug, Clone)]
+struct RepostMeta {
+    /// The reposted post's URI.
+    post_uri: String,
+    /// The reposted post's CID.
+    post_cid: String,
+    /// When the repost was created.
+    created_at: DateTime<Utc>,
+}
+
+/// Metadata about a follow for derived facts.
+#[derive(Debug, Clone)]
+struct FollowMeta {
+    /// The followed account's DID.
+    target_did: String,
+    /// When the follow was created.
+    created_at: DateTime<Utc>,
 }
 
 /// Information about a derived predicate.
@@ -106,12 +159,12 @@ pub struct DerivedFactGenerator {
     // =========================================================================
     // From Bluesky PDS records (firehose-synced)
     // =========================================================================
-    /// Follow records: rkey -> target DID.
-    follows: HashMap<String, String>,
-    /// Like records: rkey -> post URI.
-    likes: HashMap<String, String>,
-    /// Repost records: rkey -> post URI.
-    reposts: HashMap<String, String>,
+    /// Follow records: rkey -> follow metadata.
+    follows: HashMap<String, FollowMeta>,
+    /// Like records: rkey -> like metadata.
+    likes: HashMap<String, LikeMeta>,
+    /// Repost records: rkey -> repost metadata.
+    reposts: HashMap<String, RepostMeta>,
     /// Post records: rkey -> post metadata.
     posts: HashMap<String, PostMeta>,
 
@@ -175,14 +228,34 @@ impl DerivedFactGenerator {
     pub fn is_derived(predicate: &str) -> bool {
         matches!(
             predicate,
+            // Bluesky: follows
             "follows"
+                | "follow_created_at"
                 | "is_followed_by"
+                // Bluesky: likes
                 | "liked"
+                | "like_created_at"
+                | "like_cid"
+                // Bluesky: reposts
                 | "reposted"
+                | "repost_created_at"
+                | "repost_cid"
+                // Bluesky: posts
                 | "posted"
+                | "post_created_at"
                 | "replied_to"
-                | "quoted"
+                | "reply_parent_uri"
+                | "reply_parent_cid"
                 | "thread_root"
+                | "reply_root_uri"
+                | "reply_root_cid"
+                | "quoted"
+                | "quote_cid"
+                | "post_lang"
+                | "post_mention"
+                | "post_link"
+                | "post_hashtag"
+                // Winter: directives
                 | "has_value"
                 | "has_interest"
                 | "has_belief"
@@ -190,13 +263,20 @@ impl DerivedFactGenerator {
                 | "has_boundary"
                 | "has_aspiration"
                 | "has_self_concept"
+                // Winter: tools, jobs
                 | "has_tool"
                 | "has_job"
+                // Winter: notes
                 | "has_note"
                 | "note_tag"
                 | "note_related_fact"
+                // Winter: thoughts
                 | "has_thought"
+                | "thought_tag"
+                | "tool_call_duration"
+                // Winter: blog
                 | "has_blog_post"
+                // Winter: fact tags
                 | "fact_tag"
         )
     }
@@ -208,49 +288,140 @@ impl DerivedFactGenerator {
     pub fn predicate_info() -> HashMap<&'static str, PredicateInfo> {
         let mut m = HashMap::new();
 
-        // Bluesky predicates
+        // =================================================================
+        // Bluesky: follows
+        // =================================================================
         m.insert("follows", PredicateInfo {
             arity: 3,
             args: &["self_did", "target_did", "rkey"],
             description: "Accounts you follow",
+        });
+        m.insert("follow_created_at", PredicateInfo {
+            arity: 4,
+            args: &["self_did", "target_did", "timestamp", "rkey"],
+            description: "When each follow was created (ISO8601)",
         });
         m.insert("is_followed_by", PredicateInfo {
             arity: 2,
             args: &["follower_did", "self_did"],
             description: "Accounts that follow you (no rkey - from API)",
         });
+
+        // =================================================================
+        // Bluesky: likes
+        // =================================================================
         m.insert("liked", PredicateInfo {
             arity: 3,
             args: &["self_did", "post_uri", "rkey"],
             description: "Posts you have liked",
         });
+        m.insert("like_created_at", PredicateInfo {
+            arity: 4,
+            args: &["self_did", "post_uri", "timestamp", "rkey"],
+            description: "When each like was created (ISO8601)",
+        });
+        m.insert("like_cid", PredicateInfo {
+            arity: 4,
+            args: &["self_did", "post_uri", "cid", "rkey"],
+            description: "CID of the liked post",
+        });
+
+        // =================================================================
+        // Bluesky: reposts
+        // =================================================================
         m.insert("reposted", PredicateInfo {
             arity: 3,
             args: &["self_did", "post_uri", "rkey"],
             description: "Posts you have reposted",
         });
+        m.insert("repost_created_at", PredicateInfo {
+            arity: 4,
+            args: &["self_did", "post_uri", "timestamp", "rkey"],
+            description: "When each repost was created (ISO8601)",
+        });
+        m.insert("repost_cid", PredicateInfo {
+            arity: 4,
+            args: &["self_did", "post_uri", "cid", "rkey"],
+            description: "CID of the reposted post",
+        });
+
+        // =================================================================
+        // Bluesky: posts
+        // =================================================================
         m.insert("posted", PredicateInfo {
             arity: 3,
             args: &["self_did", "post_uri", "rkey"],
             description: "Posts you have created",
         });
+        m.insert("post_created_at", PredicateInfo {
+            arity: 3,
+            args: &["post_uri", "timestamp", "rkey"],
+            description: "When each post was created (ISO8601)",
+        });
         m.insert("replied_to", PredicateInfo {
             arity: 3,
             args: &["post_uri", "parent_uri", "rkey"],
-            description: "Reply relationships between posts",
+            description: "Reply relationships between posts (alias: reply_parent_uri)",
+        });
+        m.insert("reply_parent_uri", PredicateInfo {
+            arity: 3,
+            args: &["post_uri", "parent_uri", "rkey"],
+            description: "URI of the reply parent (alias: replied_to)",
+        });
+        m.insert("reply_parent_cid", PredicateInfo {
+            arity: 3,
+            args: &["post_uri", "parent_cid", "rkey"],
+            description: "CID of the reply parent",
+        });
+        m.insert("thread_root", PredicateInfo {
+            arity: 3,
+            args: &["post_uri", "root_uri", "rkey"],
+            description: "Thread membership (alias: reply_root_uri)",
+        });
+        m.insert("reply_root_uri", PredicateInfo {
+            arity: 3,
+            args: &["post_uri", "root_uri", "rkey"],
+            description: "URI of the thread root (alias: thread_root)",
+        });
+        m.insert("reply_root_cid", PredicateInfo {
+            arity: 3,
+            args: &["post_uri", "root_cid", "rkey"],
+            description: "CID of the thread root",
         });
         m.insert("quoted", PredicateInfo {
             arity: 3,
             args: &["post_uri", "quoted_uri", "rkey"],
             description: "Quote post relationships",
         });
-        m.insert("thread_root", PredicateInfo {
+        m.insert("quote_cid", PredicateInfo {
             arity: 3,
-            args: &["post_uri", "root_uri", "rkey"],
-            description: "Thread membership (which root a reply belongs to)",
+            args: &["post_uri", "quoted_cid", "rkey"],
+            description: "CID of the quoted post",
+        });
+        m.insert("post_lang", PredicateInfo {
+            arity: 3,
+            args: &["post_uri", "lang", "rkey"],
+            description: "Language tag for post (one row per language)",
+        });
+        m.insert("post_mention", PredicateInfo {
+            arity: 3,
+            args: &["post_uri", "did", "rkey"],
+            description: "Accounts mentioned in post (one row per mention)",
+        });
+        m.insert("post_link", PredicateInfo {
+            arity: 3,
+            args: &["post_uri", "link_uri", "rkey"],
+            description: "External links in post (one row per link)",
+        });
+        m.insert("post_hashtag", PredicateInfo {
+            arity: 3,
+            args: &["post_uri", "tag", "rkey"],
+            description: "Hashtags in post (one row per tag)",
         });
 
+        // =================================================================
         // Directive predicates
+        // =================================================================
         m.insert("has_value", PredicateInfo {
             arity: 2,
             args: &["content", "rkey"],
@@ -321,6 +492,16 @@ impl DerivedFactGenerator {
             arity: 5,
             args: &["uri", "kind", "trigger", "created_at", "rkey"],
             description: "Your stream of consciousness",
+        });
+        m.insert("thought_tag", PredicateInfo {
+            arity: 3,
+            args: &["thought_uri", "tag", "rkey"],
+            description: "Tags on thoughts (one row per tag)",
+        });
+        m.insert("tool_call_duration", PredicateInfo {
+            arity: 4,
+            args: &["uri", "tool_name", "duration_ms", "rkey"],
+            description: "Duration of tool calls in milliseconds",
         });
 
         // Blog predicates
@@ -472,13 +653,21 @@ impl DerivedFactGenerator {
     // =========================================================================
 
     fn add_follow(&mut self, rkey: String, follow: &Follow) {
-        self.follows.insert(rkey, follow.subject.clone());
+        self.follows.insert(
+            rkey,
+            FollowMeta {
+                target_did: follow.subject.clone(),
+                created_at: follow.created_at,
+            },
+        );
         self.dirty_predicates.insert("follows".to_string());
+        self.dirty_predicates.insert("follow_created_at".to_string());
     }
 
     fn remove_follow(&mut self, rkey: &str) {
         if self.follows.remove(rkey).is_some() {
             self.dirty_predicates.insert("follows".to_string());
+            self.dirty_predicates.insert("follow_created_at".to_string());
         }
     }
 
@@ -487,13 +676,24 @@ impl DerivedFactGenerator {
     // =========================================================================
 
     fn add_like(&mut self, rkey: String, like: &Like) {
-        self.likes.insert(rkey, like.subject.uri.clone());
+        self.likes.insert(
+            rkey,
+            LikeMeta {
+                post_uri: like.subject.uri.clone(),
+                post_cid: like.subject.cid.clone(),
+                created_at: like.created_at,
+            },
+        );
         self.dirty_predicates.insert("liked".to_string());
+        self.dirty_predicates.insert("like_created_at".to_string());
+        self.dirty_predicates.insert("like_cid".to_string());
     }
 
     fn remove_like(&mut self, rkey: &str) {
         if self.likes.remove(rkey).is_some() {
             self.dirty_predicates.insert("liked".to_string());
+            self.dirty_predicates.insert("like_created_at".to_string());
+            self.dirty_predicates.insert("like_cid".to_string());
         }
     }
 
@@ -502,13 +702,24 @@ impl DerivedFactGenerator {
     // =========================================================================
 
     fn add_repost(&mut self, rkey: String, repost: &Repost) {
-        self.reposts.insert(rkey, repost.subject.uri.clone());
+        self.reposts.insert(
+            rkey,
+            RepostMeta {
+                post_uri: repost.subject.uri.clone(),
+                post_cid: repost.subject.cid.clone(),
+                created_at: repost.created_at,
+            },
+        );
         self.dirty_predicates.insert("reposted".to_string());
+        self.dirty_predicates.insert("repost_created_at".to_string());
+        self.dirty_predicates.insert("repost_cid".to_string());
     }
 
     fn remove_repost(&mut self, rkey: &str) {
         if self.reposts.remove(rkey).is_some() {
             self.dirty_predicates.insert("reposted".to_string());
+            self.dirty_predicates.insert("repost_created_at".to_string());
+            self.dirty_predicates.insert("repost_cid".to_string());
         }
     }
 
@@ -517,68 +728,137 @@ impl DerivedFactGenerator {
     // =========================================================================
 
     fn add_post(&mut self, rkey: String, post: &Post) {
+        use winter_atproto::FacetFeature;
+
         let uri = format!("at://{}/app.bsky.feed.post/{}", self.self_did, rkey);
 
+        // Extract reply info
         let reply_parent = post.reply.as_ref().map(|r| r.parent.uri.clone());
+        let reply_parent_cid = post.reply.as_ref().map(|r| r.parent.cid.clone());
         let reply_root = post.reply.as_ref().map(|r| r.root.uri.clone());
-        let quote_uri = post.embed.as_ref().and_then(|e| match e {
-            winter_atproto::PostEmbed::Record { record } => Some(record.uri.clone()),
-            winter_atproto::PostEmbed::RecordWithMedia { record, .. } => {
-                Some(record.record.uri.clone())
+        let reply_root_cid = post.reply.as_ref().map(|r| r.root.cid.clone());
+
+        // Extract quote embed info (URI and CID)
+        let (quote_uri, quote_cid) = post.embed.as_ref().map_or((None, None), |e| match e {
+            winter_atproto::PostEmbed::Record { record } => {
+                (Some(record.uri.clone()), Some(record.cid.clone()))
             }
-            _ => None,
+            winter_atproto::PostEmbed::RecordWithMedia { record, .. } => (
+                Some(record.record.uri.clone()),
+                Some(record.record.cid.clone()),
+            ),
+            _ => (None, None),
         });
 
-        let had_reply = self
-            .posts
-            .get(&rkey)
-            .map(|p| p.reply_parent.is_some())
-            .unwrap_or(false);
-        let had_root = self
-            .posts
-            .get(&rkey)
-            .map(|p| p.reply_root.is_some())
-            .unwrap_or(false);
-        let had_quote = self
-            .posts
-            .get(&rkey)
-            .map(|p| p.quote_uri.is_some())
-            .unwrap_or(false);
+        // Extract facets: mentions, links, hashtags
+        let mut mentions = Vec::new();
+        let mut links = Vec::new();
+        let mut hashtags = Vec::new();
+        for facet in &post.facets {
+            for feature in &facet.features {
+                match feature {
+                    FacetFeature::Mention { did } => mentions.push(did.clone()),
+                    FacetFeature::Link { uri } => links.push(uri.clone()),
+                    FacetFeature::Tag { tag } => hashtags.push(tag.clone()),
+                }
+            }
+        }
+
+        // Check what the previous post had (for dirty tracking)
+        let prev = self.posts.get(&rkey);
+        let had_reply = prev.map(|p| p.reply_parent.is_some()).unwrap_or(false);
+        let had_root = prev.map(|p| p.reply_root.is_some()).unwrap_or(false);
+        let had_quote = prev.map(|p| p.quote_uri.is_some()).unwrap_or(false);
+        let had_langs = prev.map(|p| !p.langs.is_empty()).unwrap_or(false);
+        let had_mentions = prev.map(|p| !p.mentions.is_empty()).unwrap_or(false);
+        let had_links = prev.map(|p| !p.links.is_empty()).unwrap_or(false);
+        let had_hashtags = prev.map(|p| !p.hashtags.is_empty()).unwrap_or(false);
+
+        // Track whether current post has these fields (before move)
+        let has_mentions = !mentions.is_empty();
+        let has_links = !links.is_empty();
+        let has_hashtags = !hashtags.is_empty();
 
         self.posts.insert(
             rkey,
             PostMeta {
                 uri,
                 reply_parent: reply_parent.clone(),
+                reply_parent_cid: reply_parent_cid.clone(),
                 reply_root: reply_root.clone(),
+                reply_root_cid: reply_root_cid.clone(),
                 quote_uri: quote_uri.clone(),
+                quote_cid: quote_cid.clone(),
+                created_at: post.created_at,
+                langs: post.langs.clone(),
+                mentions,
+                links,
+                hashtags,
             },
         );
 
+        // Mark base predicates dirty
         self.dirty_predicates.insert("posted".to_string());
+        self.dirty_predicates.insert("post_created_at".to_string());
 
+        // Mark conditional predicates dirty
         if reply_parent.is_some() || had_reply {
             self.dirty_predicates.insert("replied_to".to_string());
+            self.dirty_predicates.insert("reply_parent_uri".to_string());
+            self.dirty_predicates.insert("reply_parent_cid".to_string());
         }
         if reply_root.is_some() || had_root {
             self.dirty_predicates.insert("thread_root".to_string());
+            self.dirty_predicates.insert("reply_root_uri".to_string());
+            self.dirty_predicates.insert("reply_root_cid".to_string());
         }
         if quote_uri.is_some() || had_quote {
             self.dirty_predicates.insert("quoted".to_string());
+            self.dirty_predicates.insert("quote_cid".to_string());
+        }
+        if !post.langs.is_empty() || had_langs {
+            self.dirty_predicates.insert("post_lang".to_string());
+        }
+        if has_mentions || had_mentions {
+            self.dirty_predicates.insert("post_mention".to_string());
+        }
+        if has_links || had_links {
+            self.dirty_predicates.insert("post_link".to_string());
+        }
+        if has_hashtags || had_hashtags {
+            self.dirty_predicates.insert("post_hashtag".to_string());
         }
     }
 
     fn remove_post(&mut self, rkey: &str) {
         if let Some(post) = self.posts.remove(rkey) {
             self.dirty_predicates.insert("posted".to_string());
+            self.dirty_predicates.insert("post_created_at".to_string());
             if post.reply_parent.is_some() {
                 self.dirty_predicates.insert("replied_to".to_string());
+                self.dirty_predicates.insert("reply_parent_uri".to_string());
+                self.dirty_predicates.insert("reply_parent_cid".to_string());
             }
             if post.reply_root.is_some() {
                 self.dirty_predicates.insert("thread_root".to_string());
+                self.dirty_predicates.insert("reply_root_uri".to_string());
+                self.dirty_predicates.insert("reply_root_cid".to_string());
             }
             if post.quote_uri.is_some() {
                 self.dirty_predicates.insert("quoted".to_string());
+                self.dirty_predicates.insert("quote_cid".to_string());
+            }
+            if !post.langs.is_empty() {
+                self.dirty_predicates.insert("post_lang".to_string());
+            }
+            if !post.mentions.is_empty() {
+                self.dirty_predicates.insert("post_mention".to_string());
+            }
+            if !post.links.is_empty() {
+                self.dirty_predicates.insert("post_link".to_string());
+            }
+            if !post.hashtags.is_empty() {
+                self.dirty_predicates.insert("post_hashtag".to_string());
             }
         }
     }
@@ -759,22 +1039,55 @@ impl DerivedFactGenerator {
             winter_atproto::ThoughtKind::ToolCall => "tool_call",
         };
 
+        // Parse tool name from content for tool_call thoughts
+        // Content format: "Called {tool_name}\n..." or "Called {tool_name} - FAILED\n..."
+        let tool_name = if matches!(thought.kind, winter_atproto::ThoughtKind::ToolCall) {
+            thought
+                .content
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("Called "))
+                .map(|s| s.trim_end_matches(" - FAILED").to_string())
+        } else {
+            None
+        };
+
+        // Check if tags changed for dirty tracking
+        let had_tags = self
+            .thoughts
+            .get(&rkey)
+            .map(|m| !m.tags.is_empty())
+            .unwrap_or(false);
+
         self.thoughts.insert(
             rkey,
             ThoughtMeta {
                 uri,
                 kind: kind.to_string(),
                 trigger: thought.trigger.clone(),
+                tags: thought.tags.clone(),
+                duration_ms: thought.duration_ms,
+                tool_name,
                 created_at: thought.created_at,
             },
         );
 
         self.dirty_predicates.insert("has_thought".to_string());
+        self.dirty_predicates
+            .insert("tool_call_duration".to_string());
+        if !thought.tags.is_empty() || had_tags {
+            self.dirty_predicates.insert("thought_tag".to_string());
+        }
     }
 
     fn remove_thought(&mut self, rkey: &str) {
-        if self.thoughts.remove(rkey).is_some() {
+        if let Some(meta) = self.thoughts.remove(rkey) {
             self.dirty_predicates.insert("has_thought".to_string());
+            self.dirty_predicates
+                .insert("tool_call_duration".to_string());
+            if !meta.tags.is_empty() {
+                self.dirty_predicates.insert("thought_tag".to_string());
+            }
         }
     }
 
@@ -909,13 +1222,15 @@ impl DerivedFactGenerator {
 
         // Get count based on predicate (for logging)
         let count = match predicate {
-            "follows" => self.follows.len(),
+            "follows" | "follow_created_at" => self.follows.len(),
             "is_followed_by" => self.followers.len(),
-            "liked" => self.likes.len(),
-            "reposted" => self.reposts.len(),
-            "posted" | "replied_to" | "quoted" | "thread_root" => self.posts.len(),
+            "liked" | "like_created_at" | "like_cid" => self.likes.len(),
+            "reposted" | "repost_created_at" | "repost_cid" => self.reposts.len(),
+            "posted" | "post_created_at" | "replied_to" | "reply_parent_uri" | "reply_parent_cid"
+            | "thread_root" | "reply_root_uri" | "reply_root_cid" | "quoted" | "quote_cid"
+            | "post_lang" | "post_mention" | "post_link" | "post_hashtag" => self.posts.len(),
             "has_note" | "note_tag" | "note_related_fact" => self.notes.len(),
-            "has_thought" => self.thoughts.len(),
+            "has_thought" | "thought_tag" | "tool_call_duration" => self.thoughts.len(),
             "has_blog_post" => self.blog_entries.len(),
             "has_tool" => self.tools.len(),
             "has_job" => self.jobs.len(),
@@ -923,9 +1238,24 @@ impl DerivedFactGenerator {
         };
 
         match predicate {
+            // =================================================================
+            // Follows
+            // =================================================================
             "follows" => {
-                for (rkey, target) in &self.follows {
-                    writeln!(file, "{}\t{}\t{}", self.self_did, target, rkey)?;
+                for (rkey, meta) in &self.follows {
+                    writeln!(file, "{}\t{}\t{}", self.self_did, meta.target_did, rkey)?;
+                }
+            }
+            "follow_created_at" => {
+                for (rkey, meta) in &self.follows {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}",
+                        self.self_did,
+                        meta.target_did,
+                        meta.created_at.to_rfc3339(),
+                        rkey
+                    )?;
                 }
             }
             "is_followed_by" => {
@@ -934,25 +1264,105 @@ impl DerivedFactGenerator {
                     writeln!(file, "{}\t{}", follower, self.self_did)?;
                 }
             }
+
+            // =================================================================
+            // Likes
+            // =================================================================
             "liked" => {
-                for (rkey, uri) in &self.likes {
-                    writeln!(file, "{}\t{}\t{}", self.self_did, uri, rkey)?;
+                for (rkey, meta) in &self.likes {
+                    writeln!(file, "{}\t{}\t{}", self.self_did, meta.post_uri, rkey)?;
                 }
             }
+            "like_created_at" => {
+                for (rkey, meta) in &self.likes {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}",
+                        self.self_did,
+                        meta.post_uri,
+                        meta.created_at.to_rfc3339(),
+                        rkey
+                    )?;
+                }
+            }
+            "like_cid" => {
+                for (rkey, meta) in &self.likes {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}",
+                        self.self_did, meta.post_uri, meta.post_cid, rkey
+                    )?;
+                }
+            }
+
+            // =================================================================
+            // Reposts
+            // =================================================================
             "reposted" => {
-                for (rkey, uri) in &self.reposts {
-                    writeln!(file, "{}\t{}\t{}", self.self_did, uri, rkey)?;
+                for (rkey, meta) in &self.reposts {
+                    writeln!(file, "{}\t{}\t{}", self.self_did, meta.post_uri, rkey)?;
                 }
             }
+            "repost_created_at" => {
+                for (rkey, meta) in &self.reposts {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}",
+                        self.self_did,
+                        meta.post_uri,
+                        meta.created_at.to_rfc3339(),
+                        rkey
+                    )?;
+                }
+            }
+            "repost_cid" => {
+                for (rkey, meta) in &self.reposts {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}",
+                        self.self_did, meta.post_uri, meta.post_cid, rkey
+                    )?;
+                }
+            }
+
+            // =================================================================
+            // Posts
+            // =================================================================
             "posted" => {
                 for (rkey, post) in &self.posts {
                     writeln!(file, "{}\t{}\t{}", self.self_did, post.uri, rkey)?;
                 }
             }
-            "replied_to" => {
+            "post_created_at" => {
+                for (rkey, post) in &self.posts {
+                    writeln!(file, "{}\t{}\t{}", post.uri, post.created_at.to_rfc3339(), rkey)?;
+                }
+            }
+            "replied_to" | "reply_parent_uri" => {
                 for (rkey, post) in &self.posts {
                     if let Some(ref parent) = post.reply_parent {
                         writeln!(file, "{}\t{}\t{}", post.uri, parent, rkey)?;
+                    }
+                }
+            }
+            "reply_parent_cid" => {
+                for (rkey, post) in &self.posts {
+                    if let Some(ref cid) = post.reply_parent_cid {
+                        writeln!(file, "{}\t{}\t{}", post.uri, cid, rkey)?;
+                    }
+                }
+            }
+            "thread_root" | "reply_root_uri" => {
+                for (rkey, post) in &self.posts {
+                    if let Some(ref root) = post.reply_root {
+                        writeln!(file, "{}\t{}\t{}", post.uri, root, rkey)?;
+                    }
+                }
+            }
+            "reply_root_cid" => {
+                for (rkey, post) in &self.posts {
+                    if let Some(ref cid) = post.reply_root_cid {
+                        writeln!(file, "{}\t{}\t{}", post.uri, cid, rkey)?;
                     }
                 }
             }
@@ -963,13 +1373,45 @@ impl DerivedFactGenerator {
                     }
                 }
             }
-            "thread_root" => {
+            "quote_cid" => {
                 for (rkey, post) in &self.posts {
-                    if let Some(ref root) = post.reply_root {
-                        writeln!(file, "{}\t{}\t{}", post.uri, root, rkey)?;
+                    if let Some(ref cid) = post.quote_cid {
+                        writeln!(file, "{}\t{}\t{}", post.uri, cid, rkey)?;
                     }
                 }
             }
+            "post_lang" => {
+                for (rkey, post) in &self.posts {
+                    for lang in &post.langs {
+                        writeln!(file, "{}\t{}\t{}", post.uri, lang, rkey)?;
+                    }
+                }
+            }
+            "post_mention" => {
+                for (rkey, post) in &self.posts {
+                    for did in &post.mentions {
+                        writeln!(file, "{}\t{}\t{}", post.uri, did, rkey)?;
+                    }
+                }
+            }
+            "post_link" => {
+                for (rkey, post) in &self.posts {
+                    for link in &post.links {
+                        writeln!(file, "{}\t{}\t{}", post.uri, link, rkey)?;
+                    }
+                }
+            }
+            "post_hashtag" => {
+                for (rkey, post) in &self.posts {
+                    for tag in &post.hashtags {
+                        writeln!(file, "{}\t{}\t{}", post.uri, tag, rkey)?;
+                    }
+                }
+            }
+
+            // =================================================================
+            // Directives
+            // =================================================================
             "has_value" => {
                 self.write_directive_predicate(&mut file, &DirectiveKind::Value)?;
             }
@@ -991,6 +1433,10 @@ impl DerivedFactGenerator {
             "has_self_concept" => {
                 self.write_directive_predicate(&mut file, &DirectiveKind::SelfConcept)?;
             }
+
+            // =================================================================
+            // Tools and Jobs
+            // =================================================================
             "has_tool" => {
                 for (rkey, (name, approved)) in &self.tools {
                     let approved_str = if *approved { "true" } else { "false" };
@@ -1002,6 +1448,10 @@ impl DerivedFactGenerator {
                     writeln!(file, "{}\t{}\t{}", name, schedule_type, rkey)?;
                 }
             }
+
+            // =================================================================
+            // Notes
+            // =================================================================
             "has_note" => {
                 for (rkey, meta) in &self.notes {
                     let category = meta.category.as_deref().unwrap_or("");
@@ -1028,6 +1478,10 @@ impl DerivedFactGenerator {
                     }
                 }
             }
+
+            // =================================================================
+            // Thoughts
+            // =================================================================
             "has_thought" => {
                 for (rkey, meta) in &self.thoughts {
                     let trigger = meta.trigger.as_deref().unwrap_or("");
@@ -1038,6 +1492,29 @@ impl DerivedFactGenerator {
                     )?;
                 }
             }
+            "thought_tag" => {
+                for (rkey, meta) in &self.thoughts {
+                    for tag in &meta.tags {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, tag, rkey)?;
+                    }
+                }
+            }
+            "tool_call_duration" => {
+                for (rkey, meta) in &self.thoughts {
+                    // Only tool_call thoughts with duration and tool name
+                    if meta.kind == "tool_call" {
+                        if let (Some(duration), Some(tool_name)) =
+                            (meta.duration_ms, meta.tool_name.as_ref())
+                        {
+                            writeln!(file, "{}\t{}\t{}\t{}", meta.uri, tool_name, duration, rkey)?;
+                        }
+                    }
+                }
+            }
+
+            // =================================================================
+            // Blog Posts
+            // =================================================================
             "has_blog_post" => {
                 for (rkey, meta) in &self.blog_entries {
                     let title = escape_tsv(&meta.title);
@@ -1049,6 +1526,10 @@ impl DerivedFactGenerator {
                     )?;
                 }
             }
+
+            // =================================================================
+            // Fact Tags
+            // =================================================================
             "fact_tag" => {
                 for (rkey, tags) in &self.fact_tags {
                     let uri = format!("at://{}/diy.razorgirl.winter.fact/{}", self.self_did, rkey);
@@ -1190,10 +1671,15 @@ mod tests {
     }
 
     fn make_thought(kind: ThoughtKind, trigger: Option<&str>) -> Thought {
+        make_thought_with_tags(kind, trigger, vec![])
+    }
+
+    fn make_thought_with_tags(kind: ThoughtKind, trigger: Option<&str>, tags: Vec<&str>) -> Thought {
         Thought {
             kind,
             content: "test thought content".to_string(),
             trigger: trigger.map(String::from),
+            tags: tags.into_iter().map(String::from).collect(),
             duration_ms: None,
             created_at: Utc::now(),
         }
@@ -1746,6 +2232,126 @@ mod tests {
     }
 
     #[test]
+    fn test_thought_tag_tsv_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
+
+        // Thought with tags
+        dfg.handle_update(&CacheUpdate::ThoughtCreated {
+            rkey: "thought1".to_string(),
+            thought: make_thought_with_tags(
+                ThoughtKind::Insight,
+                Some("test trigger"),
+                vec!["datalog", "performance", "optimization"],
+            ),
+        });
+
+        // Thought without tags (should not produce rows)
+        dfg.handle_update(&CacheUpdate::ThoughtCreated {
+            rkey: "thought2".to_string(),
+            thought: make_thought(ThoughtKind::Question, None),
+        });
+
+        dfg.flush_to_dir(dir.path()).unwrap();
+
+        let content = std::fs::read_to_string(dir.path().join("thought_tag.facts")).unwrap();
+        let uri = "at://did:plc:test/diy.razorgirl.winter.thought/thought1";
+
+        // Each tag should produce a row: uri\ttag\trkey
+        assert!(content.contains(&format!("{}\tdatalog\tthought1", uri)));
+        assert!(content.contains(&format!("{}\tperformance\tthought1", uri)));
+        assert!(content.contains(&format!("{}\toptimization\tthought1", uri)));
+
+        // Count lines (should be 3, only from thought1 with tags)
+        let line_count = content.lines().filter(|l| !l.is_empty()).count();
+        assert_eq!(line_count, 3);
+    }
+
+    #[test]
+    fn test_thought_tag_dirty_tracking() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
+
+        // Create thought without tags - should NOT mark thought_tag dirty
+        dfg.handle_update(&CacheUpdate::ThoughtCreated {
+            rkey: "thought1".to_string(),
+            thought: make_thought(ThoughtKind::Insight, None),
+        });
+        dfg.flush_to_dir(dir.path()).unwrap();
+
+        // Create thought with tags - should mark thought_tag dirty
+        dfg.handle_update(&CacheUpdate::ThoughtCreated {
+            rkey: "thought2".to_string(),
+            thought: make_thought_with_tags(ThoughtKind::Plan, None, vec!["tag1"]),
+        });
+        assert!(dfg.dirty_predicates.contains("thought_tag"));
+        dfg.flush_to_dir(dir.path()).unwrap();
+
+        // Delete thought with tags - should mark thought_tag dirty
+        dfg.handle_update(&CacheUpdate::ThoughtDeleted {
+            rkey: "thought2".to_string(),
+        });
+        assert!(dfg.dirty_predicates.contains("thought_tag"));
+    }
+
+    #[test]
+    fn test_tool_call_duration_tsv_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
+
+        // Tool call thought with duration
+        dfg.handle_update(&CacheUpdate::ThoughtCreated {
+            rkey: "toolcall1".to_string(),
+            thought: Thought {
+                kind: ThoughtKind::ToolCall,
+                content: "Called query_facts\nArgs:\n{}".to_string(),
+                trigger: Some("internal:tool_call".to_string()),
+                tags: Vec::new(),
+                duration_ms: Some(1234),
+                created_at: Utc::now(),
+            },
+        });
+
+        // Tool call without duration (should not appear in tool_call_duration)
+        dfg.handle_update(&CacheUpdate::ThoughtCreated {
+            rkey: "toolcall2".to_string(),
+            thought: Thought {
+                kind: ThoughtKind::ToolCall,
+                content: "Called list_rules\nArgs:\n{}".to_string(),
+                trigger: Some("internal:tool_call".to_string()),
+                tags: Vec::new(),
+                duration_ms: None,
+                created_at: Utc::now(),
+            },
+        });
+
+        // Non-tool-call thought (should not appear)
+        dfg.handle_update(&CacheUpdate::ThoughtCreated {
+            rkey: "thought1".to_string(),
+            thought: make_thought(ThoughtKind::Reflection, Some("test")),
+        });
+
+        dfg.flush_to_dir(dir.path()).unwrap();
+
+        let content =
+            std::fs::read_to_string(dir.path().join("tool_call_duration.facts")).unwrap();
+
+        // Only toolcall1 should appear (has duration)
+        assert!(content.contains("at://did:plc:test/diy.razorgirl.winter.thought/toolcall1"));
+        assert!(content.contains("query_facts"));
+        assert!(content.contains("1234"));
+
+        // toolcall2 should not appear (no duration)
+        assert!(!content.contains("toolcall2"));
+
+        // thought1 should not appear (not a tool_call)
+        assert!(!content.contains("thought1"));
+
+        let line_count = content.lines().filter(|l| !l.is_empty()).count();
+        assert_eq!(line_count, 1);
+    }
+
+    #[test]
     fn test_has_blog_post_tsv_generation() {
         let dir = tempfile::tempdir().unwrap();
         let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
@@ -2091,5 +2697,525 @@ mod tests {
             content.lines().filter(|l| !l.is_empty()).count(),
             kinds.len()
         );
+    }
+
+    // =========================================================================
+    // New Predicate Tests
+    // =========================================================================
+
+    fn make_repost(uri: &str, cid: &str) -> Repost {
+        Repost {
+            subject: StrongRef {
+                uri: uri.to_string(),
+                cid: cid.to_string(),
+            },
+            created_at: Utc::now(),
+        }
+    }
+
+    fn make_post_with_facets(
+        text: &str,
+        reply: Option<ReplyRef>,
+        embed: Option<winter_atproto::PostEmbed>,
+        facets: Vec<Facet>,
+        langs: Vec<&str>,
+    ) -> Post {
+        Post {
+            text: text.to_string(),
+            reply,
+            embed,
+            facets,
+            langs: langs.into_iter().map(String::from).collect(),
+            created_at: Utc::now(),
+        }
+    }
+
+    use winter_atproto::{ByteSlice, Facet, FacetFeature, ReplyRef};
+
+    #[test]
+    fn test_new_predicates_in_is_derived() {
+        // Post predicates
+        assert!(DerivedFactGenerator::is_derived("post_created_at"));
+        assert!(DerivedFactGenerator::is_derived("reply_parent_uri"));
+        assert!(DerivedFactGenerator::is_derived("reply_parent_cid"));
+        assert!(DerivedFactGenerator::is_derived("reply_root_uri"));
+        assert!(DerivedFactGenerator::is_derived("reply_root_cid"));
+        assert!(DerivedFactGenerator::is_derived("quote_cid"));
+        assert!(DerivedFactGenerator::is_derived("post_lang"));
+        assert!(DerivedFactGenerator::is_derived("post_mention"));
+        assert!(DerivedFactGenerator::is_derived("post_link"));
+        assert!(DerivedFactGenerator::is_derived("post_hashtag"));
+        // Like predicates
+        assert!(DerivedFactGenerator::is_derived("like_created_at"));
+        assert!(DerivedFactGenerator::is_derived("like_cid"));
+        // Repost predicates
+        assert!(DerivedFactGenerator::is_derived("repost_created_at"));
+        assert!(DerivedFactGenerator::is_derived("repost_cid"));
+        // Follow predicates
+        assert!(DerivedFactGenerator::is_derived("follow_created_at"));
+    }
+
+    #[test]
+    fn test_new_predicate_arities() {
+        let arities = DerivedFactGenerator::arities();
+        // Post predicates
+        assert_eq!(arities.get("post_created_at"), Some(&3)); // (post_uri, timestamp, rkey)
+        assert_eq!(arities.get("reply_parent_uri"), Some(&3)); // (post_uri, parent_uri, rkey)
+        assert_eq!(arities.get("reply_parent_cid"), Some(&3)); // (post_uri, parent_cid, rkey)
+        assert_eq!(arities.get("reply_root_uri"), Some(&3)); // (post_uri, root_uri, rkey)
+        assert_eq!(arities.get("reply_root_cid"), Some(&3)); // (post_uri, root_cid, rkey)
+        assert_eq!(arities.get("quote_cid"), Some(&3)); // (post_uri, quoted_cid, rkey)
+        assert_eq!(arities.get("post_lang"), Some(&3)); // (post_uri, lang, rkey)
+        assert_eq!(arities.get("post_mention"), Some(&3)); // (post_uri, did, rkey)
+        assert_eq!(arities.get("post_link"), Some(&3)); // (post_uri, link_uri, rkey)
+        assert_eq!(arities.get("post_hashtag"), Some(&3)); // (post_uri, tag, rkey)
+        // Like predicates
+        assert_eq!(arities.get("like_created_at"), Some(&4)); // (self_did, post_uri, timestamp, rkey)
+        assert_eq!(arities.get("like_cid"), Some(&4)); // (self_did, post_uri, cid, rkey)
+        // Repost predicates
+        assert_eq!(arities.get("repost_created_at"), Some(&4)); // (self_did, post_uri, timestamp, rkey)
+        assert_eq!(arities.get("repost_cid"), Some(&4)); // (self_did, post_uri, cid, rkey)
+        // Follow predicates
+        assert_eq!(arities.get("follow_created_at"), Some(&4)); // (self_did, target_did, timestamp, rkey)
+    }
+
+    #[test]
+    fn test_follow_created_at_tsv_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
+
+        dfg.handle_update(&CacheUpdate::FollowCreated {
+            rkey: "follow1".to_string(),
+            follow: make_follow("did:plc:target"),
+        });
+
+        dfg.flush_to_dir(dir.path()).unwrap();
+
+        // Check follows file
+        let follows = std::fs::read_to_string(dir.path().join("follows.facts")).unwrap();
+        assert!(follows.contains("did:plc:test"));
+        assert!(follows.contains("did:plc:target"));
+        assert!(follows.contains("follow1"));
+
+        // Check follow_created_at file
+        let follow_created_at =
+            std::fs::read_to_string(dir.path().join("follow_created_at.facts")).unwrap();
+        assert!(follow_created_at.contains("did:plc:test"));
+        assert!(follow_created_at.contains("did:plc:target"));
+        assert!(follow_created_at.contains("follow1"));
+        // Should have ISO8601 timestamp
+        assert!(follow_created_at.contains("T"));
+    }
+
+    #[test]
+    fn test_like_predicates_tsv_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
+
+        dfg.handle_update(&CacheUpdate::LikeCreated {
+            rkey: "like1".to_string(),
+            like: Like {
+                subject: StrongRef {
+                    uri: "at://did:plc:author/app.bsky.feed.post/abc".to_string(),
+                    cid: "bafyreig123".to_string(),
+                },
+                created_at: Utc::now(),
+            },
+        });
+
+        dfg.flush_to_dir(dir.path()).unwrap();
+
+        // Check liked file
+        let liked = std::fs::read_to_string(dir.path().join("liked.facts")).unwrap();
+        assert!(liked.contains("did:plc:test"));
+        assert!(liked.contains("at://did:plc:author/app.bsky.feed.post/abc"));
+
+        // Check like_created_at file
+        let like_created_at =
+            std::fs::read_to_string(dir.path().join("like_created_at.facts")).unwrap();
+        assert!(like_created_at.contains("did:plc:test"));
+        assert!(like_created_at.contains("at://did:plc:author/app.bsky.feed.post/abc"));
+        assert!(like_created_at.contains("T")); // ISO8601 timestamp
+
+        // Check like_cid file
+        let like_cid = std::fs::read_to_string(dir.path().join("like_cid.facts")).unwrap();
+        assert!(like_cid.contains("did:plc:test"));
+        assert!(like_cid.contains("bafyreig123"));
+    }
+
+    #[test]
+    fn test_repost_predicates_tsv_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
+
+        dfg.handle_update(&CacheUpdate::RepostCreated {
+            rkey: "repost1".to_string(),
+            repost: make_repost("at://did:plc:author/app.bsky.feed.post/xyz", "bafyreig456"),
+        });
+
+        dfg.flush_to_dir(dir.path()).unwrap();
+
+        // Check reposted file
+        let reposted = std::fs::read_to_string(dir.path().join("reposted.facts")).unwrap();
+        assert!(reposted.contains("did:plc:test"));
+        assert!(reposted.contains("at://did:plc:author/app.bsky.feed.post/xyz"));
+
+        // Check repost_created_at file
+        let repost_created_at =
+            std::fs::read_to_string(dir.path().join("repost_created_at.facts")).unwrap();
+        assert!(repost_created_at.contains("T")); // ISO8601 timestamp
+
+        // Check repost_cid file
+        let repost_cid = std::fs::read_to_string(dir.path().join("repost_cid.facts")).unwrap();
+        assert!(repost_cid.contains("bafyreig456"));
+    }
+
+    #[test]
+    fn test_post_created_at_tsv_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
+
+        dfg.handle_update(&CacheUpdate::PostCreated {
+            rkey: "post1".to_string(),
+            post: make_post_with_facets("Hello world", None, None, vec![], vec!["en"]),
+        });
+
+        dfg.flush_to_dir(dir.path()).unwrap();
+
+        // Check post_created_at file
+        let post_created_at =
+            std::fs::read_to_string(dir.path().join("post_created_at.facts")).unwrap();
+        assert!(post_created_at.contains("at://did:plc:test/app.bsky.feed.post/post1"));
+        assert!(post_created_at.contains("T")); // ISO8601 timestamp
+    }
+
+    #[test]
+    fn test_post_lang_tsv_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
+
+        dfg.handle_update(&CacheUpdate::PostCreated {
+            rkey: "post1".to_string(),
+            post: make_post_with_facets("Hello world", None, None, vec![], vec!["en", "ja"]),
+        });
+
+        dfg.flush_to_dir(dir.path()).unwrap();
+
+        // Check post_lang file
+        let post_lang = std::fs::read_to_string(dir.path().join("post_lang.facts")).unwrap();
+        let post_uri = "at://did:plc:test/app.bsky.feed.post/post1";
+
+        // Should have two rows (one per language)
+        assert!(post_lang.contains(&format!("{}\ten", post_uri)));
+        assert!(post_lang.contains(&format!("{}\tja", post_uri)));
+        assert_eq!(post_lang.lines().filter(|l| !l.is_empty()).count(), 2);
+    }
+
+    #[test]
+    fn test_post_mention_tsv_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
+
+        let facets = vec![Facet {
+            index: ByteSlice {
+                byte_start: 0,
+                byte_end: 5,
+            },
+            features: vec![FacetFeature::Mention {
+                did: "did:plc:alice".to_string(),
+            }],
+        }];
+
+        dfg.handle_update(&CacheUpdate::PostCreated {
+            rkey: "post1".to_string(),
+            post: make_post_with_facets("@alice hello", None, None, facets, vec![]),
+        });
+
+        dfg.flush_to_dir(dir.path()).unwrap();
+
+        // Check post_mention file
+        let post_mention = std::fs::read_to_string(dir.path().join("post_mention.facts")).unwrap();
+        let post_uri = "at://did:plc:test/app.bsky.feed.post/post1";
+
+        assert!(post_mention.contains(&format!("{}\tdid:plc:alice", post_uri)));
+    }
+
+    #[test]
+    fn test_post_link_tsv_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
+
+        let facets = vec![Facet {
+            index: ByteSlice {
+                byte_start: 0,
+                byte_end: 20,
+            },
+            features: vec![FacetFeature::Link {
+                uri: "https://example.com".to_string(),
+            }],
+        }];
+
+        dfg.handle_update(&CacheUpdate::PostCreated {
+            rkey: "post1".to_string(),
+            post: make_post_with_facets("Check out https://example.com", None, None, facets, vec![]),
+        });
+
+        dfg.flush_to_dir(dir.path()).unwrap();
+
+        // Check post_link file
+        let post_link = std::fs::read_to_string(dir.path().join("post_link.facts")).unwrap();
+        let post_uri = "at://did:plc:test/app.bsky.feed.post/post1";
+
+        assert!(post_link.contains(&format!("{}\thttps://example.com", post_uri)));
+    }
+
+    #[test]
+    fn test_post_hashtag_tsv_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
+
+        let facets = vec![Facet {
+            index: ByteSlice {
+                byte_start: 0,
+                byte_end: 8,
+            },
+            features: vec![FacetFeature::Tag {
+                tag: "atproto".to_string(),
+            }],
+        }];
+
+        dfg.handle_update(&CacheUpdate::PostCreated {
+            rkey: "post1".to_string(),
+            post: make_post_with_facets("#atproto is cool", None, None, facets, vec![]),
+        });
+
+        dfg.flush_to_dir(dir.path()).unwrap();
+
+        // Check post_hashtag file
+        let post_hashtag = std::fs::read_to_string(dir.path().join("post_hashtag.facts")).unwrap();
+        let post_uri = "at://did:plc:test/app.bsky.feed.post/post1";
+
+        assert!(post_hashtag.contains(&format!("{}\tatproto", post_uri)));
+    }
+
+    #[test]
+    fn test_reply_predicates_tsv_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
+
+        let reply = ReplyRef {
+            parent: StrongRef {
+                uri: "at://did:plc:other/app.bsky.feed.post/parent".to_string(),
+                cid: "bafyparent".to_string(),
+            },
+            root: StrongRef {
+                uri: "at://did:plc:other/app.bsky.feed.post/root".to_string(),
+                cid: "bafyroot".to_string(),
+            },
+        };
+
+        dfg.handle_update(&CacheUpdate::PostCreated {
+            rkey: "reply1".to_string(),
+            post: make_post_with_facets("This is a reply", Some(reply), None, vec![], vec![]),
+        });
+
+        dfg.flush_to_dir(dir.path()).unwrap();
+
+        let post_uri = "at://did:plc:test/app.bsky.feed.post/reply1";
+        let parent_uri = "at://did:plc:other/app.bsky.feed.post/parent";
+        let root_uri = "at://did:plc:other/app.bsky.feed.post/root";
+
+        // Check replied_to file (same as reply_parent_uri)
+        let replied_to = std::fs::read_to_string(dir.path().join("replied_to.facts")).unwrap();
+        assert!(replied_to.contains(&format!("{}\t{}", post_uri, parent_uri)));
+
+        // Check reply_parent_uri file (alias for replied_to)
+        let reply_parent_uri =
+            std::fs::read_to_string(dir.path().join("reply_parent_uri.facts")).unwrap();
+        assert!(reply_parent_uri.contains(&format!("{}\t{}", post_uri, parent_uri)));
+
+        // Check reply_parent_cid file
+        let reply_parent_cid =
+            std::fs::read_to_string(dir.path().join("reply_parent_cid.facts")).unwrap();
+        assert!(reply_parent_cid.contains(&format!("{}\tbafyparent", post_uri)));
+
+        // Check thread_root file (same as reply_root_uri)
+        let thread_root = std::fs::read_to_string(dir.path().join("thread_root.facts")).unwrap();
+        assert!(thread_root.contains(&format!("{}\t{}", post_uri, root_uri)));
+
+        // Check reply_root_uri file (alias for thread_root)
+        let reply_root_uri =
+            std::fs::read_to_string(dir.path().join("reply_root_uri.facts")).unwrap();
+        assert!(reply_root_uri.contains(&format!("{}\t{}", post_uri, root_uri)));
+
+        // Check reply_root_cid file
+        let reply_root_cid =
+            std::fs::read_to_string(dir.path().join("reply_root_cid.facts")).unwrap();
+        assert!(reply_root_cid.contains(&format!("{}\tbafyroot", post_uri)));
+    }
+
+    #[test]
+    fn test_quote_cid_tsv_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
+
+        let embed = winter_atproto::PostEmbed::Record {
+            record: StrongRef {
+                uri: "at://did:plc:other/app.bsky.feed.post/quoted".to_string(),
+                cid: "bafyquoted".to_string(),
+            },
+        };
+
+        dfg.handle_update(&CacheUpdate::PostCreated {
+            rkey: "quote1".to_string(),
+            post: make_post_with_facets("Check this out", None, Some(embed), vec![], vec![]),
+        });
+
+        dfg.flush_to_dir(dir.path()).unwrap();
+
+        let post_uri = "at://did:plc:test/app.bsky.feed.post/quote1";
+
+        // Check quote_cid file
+        let quote_cid = std::fs::read_to_string(dir.path().join("quote_cid.facts")).unwrap();
+        assert!(quote_cid.contains(&format!("{}\tbafyquoted", post_uri)));
+
+        // Check quoted file (URI)
+        let quoted = std::fs::read_to_string(dir.path().join("quoted.facts")).unwrap();
+        assert!(
+            quoted.contains(&format!("{}\tat://did:plc:other/app.bsky.feed.post/quoted", post_uri))
+        );
+    }
+
+    #[test]
+    fn test_combined_post_predicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
+
+        // Create a post with multiple facets
+        let facets = vec![
+            Facet {
+                index: ByteSlice {
+                    byte_start: 0,
+                    byte_end: 6,
+                },
+                features: vec![FacetFeature::Mention {
+                    did: "did:plc:alice".to_string(),
+                }],
+            },
+            Facet {
+                index: ByteSlice {
+                    byte_start: 10,
+                    byte_end: 30,
+                },
+                features: vec![FacetFeature::Link {
+                    uri: "https://example.com".to_string(),
+                }],
+            },
+            Facet {
+                index: ByteSlice {
+                    byte_start: 35,
+                    byte_end: 43,
+                },
+                features: vec![FacetFeature::Tag {
+                    tag: "bluesky".to_string(),
+                }],
+            },
+        ];
+
+        dfg.handle_update(&CacheUpdate::PostCreated {
+            rkey: "complex1".to_string(),
+            post: make_post_with_facets(
+                "@alice check https://example.com #bluesky",
+                None,
+                None,
+                facets,
+                vec!["en", "es"],
+            ),
+        });
+
+        dfg.flush_to_dir(dir.path()).unwrap();
+
+        let post_uri = "at://did:plc:test/app.bsky.feed.post/complex1";
+
+        // Verify all predicates have content
+        let post_mention = std::fs::read_to_string(dir.path().join("post_mention.facts")).unwrap();
+        assert!(post_mention.contains(&format!("{}\tdid:plc:alice", post_uri)));
+
+        let post_link = std::fs::read_to_string(dir.path().join("post_link.facts")).unwrap();
+        assert!(post_link.contains(&format!("{}\thttps://example.com", post_uri)));
+
+        let post_hashtag = std::fs::read_to_string(dir.path().join("post_hashtag.facts")).unwrap();
+        assert!(post_hashtag.contains(&format!("{}\tbluesky", post_uri)));
+
+        let post_lang = std::fs::read_to_string(dir.path().join("post_lang.facts")).unwrap();
+        assert!(post_lang.contains(&format!("{}\ten", post_uri)));
+        assert!(post_lang.contains(&format!("{}\tes", post_uri)));
+    }
+
+    #[test]
+    fn test_dirty_tracking_for_new_predicates() {
+        let mut dfg = DerivedFactGenerator::new("did:plc:test", "test.handle");
+
+        // Create a follow
+        dfg.handle_update(&CacheUpdate::FollowCreated {
+            rkey: "follow1".to_string(),
+            follow: make_follow("did:plc:target"),
+        });
+
+        assert!(dfg.dirty_predicates.contains("follows"));
+        assert!(dfg.dirty_predicates.contains("follow_created_at"));
+
+        dfg.dirty_predicates.clear();
+
+        // Create a like
+        dfg.handle_update(&CacheUpdate::LikeCreated {
+            rkey: "like1".to_string(),
+            like: make_like("at://did:plc:author/post/1"),
+        });
+
+        assert!(dfg.dirty_predicates.contains("liked"));
+        assert!(dfg.dirty_predicates.contains("like_created_at"));
+        assert!(dfg.dirty_predicates.contains("like_cid"));
+
+        dfg.dirty_predicates.clear();
+
+        // Create a repost
+        dfg.handle_update(&CacheUpdate::RepostCreated {
+            rkey: "repost1".to_string(),
+            repost: make_repost("at://did:plc:author/post/1", "bafycid"),
+        });
+
+        assert!(dfg.dirty_predicates.contains("reposted"));
+        assert!(dfg.dirty_predicates.contains("repost_created_at"));
+        assert!(dfg.dirty_predicates.contains("repost_cid"));
+
+        dfg.dirty_predicates.clear();
+
+        // Create a post with facets
+        let facets = vec![Facet {
+            index: ByteSlice {
+                byte_start: 0,
+                byte_end: 5,
+            },
+            features: vec![
+                FacetFeature::Mention {
+                    did: "did:plc:alice".to_string(),
+                },
+                FacetFeature::Tag {
+                    tag: "test".to_string(),
+                },
+            ],
+        }];
+
+        dfg.handle_update(&CacheUpdate::PostCreated {
+            rkey: "post1".to_string(),
+            post: make_post_with_facets("@alice #test", None, None, facets, vec!["en"]),
+        });
+
+        assert!(dfg.dirty_predicates.contains("posted"));
+        assert!(dfg.dirty_predicates.contains("post_created_at"));
+        assert!(dfg.dirty_predicates.contains("post_lang"));
+        assert!(dfg.dirty_predicates.contains("post_mention"));
+        assert!(dfg.dirty_predicates.contains("post_hashtag"));
     }
 }
