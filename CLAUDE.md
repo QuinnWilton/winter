@@ -116,6 +116,24 @@ _fact(R, P, _), _created_at(R, T), T > "2026-01-15T00:00:00Z".
 
 // Get the rkey of a follow record
 follows(Self, Target, Rkey).
+
+// Find all my replies to a specific thread root
+my_reply(Post, Root) :- thread_root(Post, Root, _), posted(Self, Post, _).
+
+// Find posts in a specific language
+english_posts(Post) :- posted(Self, Post, _), post_lang(Post, "en", _).
+
+// Find posts mentioning a specific account
+mentions_alice(Post) :- post_mention(Post, "did:plc:alice", _).
+
+// Find posts with a specific hashtag
+atproto_posts(Post) :- post_hashtag(Post, "atproto", _).
+
+// Find recent follows (with timestamps for temporal reasoning)
+recent_follows(Target, Time) :-
+    follows(Self, Target, _),
+    follow_created_at(Self, Target, Time, _),
+    Time > "2026-01-01T00:00:00Z".
 ```
 
 ### Ephemeral Facts
@@ -183,31 +201,98 @@ These predicates are automatically generated from PDS records. They exist only i
 
 **Important**: All predicates have `rkey` as their **last argument**, except `is_followed_by` (which comes from external API data). Use `_` to ignore rkey when not needed: `follows(X, Y, _)`.
 
-| Predicate | Arity | Source | Arguments |
-|-----------|-------|--------|-----------|
-| `follows` | 3 | `app.bsky.graph.follow` | (self_did, target_did, rkey) |
-| `is_followed_by` | 2 | Bluesky API sync | (follower_did, self_did) — no rkey |
-| `liked` | 3 | `app.bsky.feed.like` | (self_did, post_uri, rkey) |
-| `reposted` | 3 | `app.bsky.feed.repost` | (self_did, post_uri, rkey) |
-| `posted` | 3 | `app.bsky.feed.post` | (self_did, post_uri, rkey) |
-| `replied_to` | 3 | posts with reply | (post_uri, parent_uri, rkey) |
-| `quoted` | 3 | posts with quote | (post_uri, quoted_uri, rkey) |
-| `thread_root` | 3 | posts with reply | (post_uri, root_uri, rkey) |
-| `has_value` | 2 | directives | (content, rkey) |
-| `has_interest` | 2 | directives | (content, rkey) |
-| `has_belief` | 2 | directives | (content, rkey) |
-| `has_guideline` | 2 | directives | (content, rkey) |
-| `has_boundary` | 2 | directives | (content, rkey) |
-| `has_aspiration` | 2 | directives | (content, rkey) |
-| `has_self_concept` | 2 | directives | (content, rkey) |
-| `has_tool` | 3 | tools + approvals | (name, approved_bool, rkey) |
-| `has_job` | 3 | jobs | (name, schedule_type, rkey) |
-| `has_note` | 6 | notes | (uri, title, category, created_at, last_updated, rkey) |
-| `note_tag` | 3 | notes | (note_uri, tag, rkey) |
-| `note_related_fact` | 3 | notes | (note_uri, fact_uri, rkey) |
-| `has_thought` | 5 | thoughts | (uri, kind, trigger, created_at, rkey) |
-| `has_blog_post` | 6 | blog entries | (uri, title, whtwnd_url, created_at, is_draft, rkey) |
-| `fact_tag` | 3 | facts | (fact_uri, tag, rkey) |
+### Bluesky Predicates
+
+#### Follows
+
+| Predicate | Arity | Arguments | Description |
+|-----------|-------|-----------|-------------|
+| `follows` | 3 | (self_did, target_did, rkey) | Accounts you follow |
+| `follow_created_at` | 4 | (self_did, target_did, timestamp, rkey) | When each follow was created (ISO8601) |
+| `is_followed_by` | 2 | (follower_did, self_did) | Accounts that follow you (no rkey - from API) |
+
+#### Likes
+
+| Predicate | Arity | Arguments | Description |
+|-----------|-------|-----------|-------------|
+| `liked` | 3 | (self_did, post_uri, rkey) | Posts you have liked |
+| `like_created_at` | 4 | (self_did, post_uri, timestamp, rkey) | When each like was created (ISO8601) |
+| `like_cid` | 4 | (self_did, post_uri, cid, rkey) | CID of the liked post |
+
+#### Reposts
+
+| Predicate | Arity | Arguments | Description |
+|-----------|-------|-----------|-------------|
+| `reposted` | 3 | (self_did, post_uri, rkey) | Posts you have reposted |
+| `repost_created_at` | 4 | (self_did, post_uri, timestamp, rkey) | When each repost was created (ISO8601) |
+| `repost_cid` | 4 | (self_did, post_uri, cid, rkey) | CID of the reposted post |
+
+#### Posts
+
+| Predicate | Arity | Arguments | Description |
+|-----------|-------|-----------|-------------|
+| `posted` | 3 | (self_did, post_uri, rkey) | Posts you have created |
+| `post_created_at` | 3 | (post_uri, timestamp, rkey) | When each post was created (ISO8601) |
+| `replied_to` | 3 | (post_uri, parent_uri, rkey) | Reply relationships (alias: reply_parent_uri) |
+| `reply_parent_uri` | 3 | (post_uri, parent_uri, rkey) | URI of the reply parent (alias: replied_to) |
+| `reply_parent_cid` | 3 | (post_uri, parent_cid, rkey) | CID of the reply parent |
+| `thread_root` | 3 | (post_uri, root_uri, rkey) | Thread membership (alias: reply_root_uri) |
+| `reply_root_uri` | 3 | (post_uri, root_uri, rkey) | URI of the thread root (alias: thread_root) |
+| `reply_root_cid` | 3 | (post_uri, root_cid, rkey) | CID of the thread root |
+| `quoted` | 3 | (post_uri, quoted_uri, rkey) | Quote post relationships |
+| `quote_cid` | 3 | (post_uri, quoted_cid, rkey) | CID of the quoted post |
+| `post_lang` | 3 | (post_uri, lang, rkey) | Language tag for post (one row per language) |
+| `post_mention` | 3 | (post_uri, did, rkey) | Accounts mentioned in post (one row per mention) |
+| `post_link` | 3 | (post_uri, link_uri, rkey) | External links in post (one row per link) |
+| `post_hashtag` | 3 | (post_uri, tag, rkey) | Hashtags in post (one row per tag) |
+
+### Winter Predicates
+
+#### Directives
+
+| Predicate | Arity | Arguments | Description |
+|-----------|-------|-----------|-------------|
+| `has_value` | 2 | (content, rkey) | Your active values |
+| `has_interest` | 2 | (content, rkey) | Your active interests |
+| `has_belief` | 2 | (content, rkey) | Your active beliefs |
+| `has_guideline` | 2 | (content, rkey) | Your active guidelines |
+| `has_boundary` | 2 | (content, rkey) | Your active boundaries |
+| `has_aspiration` | 2 | (content, rkey) | Your active aspirations |
+| `has_self_concept` | 2 | (content, rkey) | Your active self-concepts |
+
+#### Tools and Jobs
+
+| Predicate | Arity | Arguments | Description |
+|-----------|-------|-----------|-------------|
+| `has_tool` | 3 | (name, approved_bool, rkey) | Your custom tools (approved: true/false) |
+| `has_job` | 3 | (name, schedule_type, rkey) | Your scheduled jobs (once/interval) |
+
+#### Notes
+
+| Predicate | Arity | Arguments | Description |
+|-----------|-------|-----------|-------------|
+| `has_note` | 6 | (uri, title, category, created_at, last_updated, rkey) | Your notes |
+| `note_tag` | 3 | (note_uri, tag, rkey) | Tags on notes (one row per tag) |
+| `note_related_fact` | 3 | (note_uri, fact_uri, rkey) | Facts linked to notes |
+
+#### Thoughts
+
+| Predicate | Arity | Arguments | Description |
+|-----------|-------|-----------|-------------|
+| `has_thought` | 5 | (uri, kind, trigger, created_at, rkey) | Your stream of consciousness |
+| `thought_tag` | 3 | (thought_uri, tag, rkey) | Tags on thoughts (one row per tag) |
+
+#### Blog Posts
+
+| Predicate | Arity | Arguments | Description |
+|-----------|-------|-----------|-------------|
+| `has_blog_post` | 6 | (uri, title, whtwnd_url, created_at, is_draft, rkey) | Your WhiteWind blog posts |
+
+#### Facts
+
+| Predicate | Arity | Arguments | Description |
+|-----------|-------|-----------|-------------|
+| `fact_tag` | 3 | (fact_uri, tag, rkey) | Tags on facts (one row per tag) |
 
 ---
 
