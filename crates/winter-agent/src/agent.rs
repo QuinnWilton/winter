@@ -1,12 +1,19 @@
 //! Agent for invoking Claude with MCP tools.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use claude_sdk_rs::{Client, Config as ClaudeConfig, ToolPermission};
-use tracing::{debug, info};
+use claude_sdk_rs::{
+    ClaudeResponse, Client, Config as ClaudeConfig, StreamFormat, extract_tool_calls,
+};
+use tracing::{debug, info, warn};
+use winter_mcp::ToolRegistry;
 
 use crate::{AgentContext, AgentError, PromptBuilder};
+
+/// Built-in Claude Code tools that we want to log.
+const BUILTIN_TOOLS: &[&str] = &["Read", "WebFetch", "WebSearch", "Glob", "Grep"];
 
 /// Agent that wraps the Claude SDK for Winter.
 pub struct Agent {
@@ -22,90 +29,89 @@ impl Agent {
     }
 
     /// Get the allowed tools list for Winter's MCP server.
+    ///
+    /// This combines the MCP tools from winter-mcp (using the colocated permission
+    /// metadata) with the built-in Claude Code tools.
     fn allowed_tools() -> Vec<String> {
-        vec![
-            // Winter MCP tools - Bluesky
-            ToolPermission::mcp("winter", "post_to_bluesky").to_cli_format(),
-            ToolPermission::mcp("winter", "reply_to_bluesky").to_cli_format(),
-            ToolPermission::mcp("winter", "send_bluesky_dm").to_cli_format(),
-            ToolPermission::mcp("winter", "reply_to_dm").to_cli_format(),
-            ToolPermission::mcp("winter", "like_post").to_cli_format(),
-            ToolPermission::mcp("winter", "follow_user").to_cli_format(),
-            ToolPermission::mcp("winter", "get_timeline").to_cli_format(),
-            ToolPermission::mcp("winter", "get_notifications").to_cli_format(),
-            ToolPermission::mcp("winter", "search_posts").to_cli_format(),
-            ToolPermission::mcp("winter", "search_users").to_cli_format(),
-            ToolPermission::mcp("winter", "get_thread_context").to_cli_format(),
-            ToolPermission::mcp("winter", "mute_user").to_cli_format(),
-            ToolPermission::mcp("winter", "unmute_user").to_cli_format(),
-            ToolPermission::mcp("winter", "block_user").to_cli_format(),
-            ToolPermission::mcp("winter", "unblock_user").to_cli_format(),
-            ToolPermission::mcp("winter", "mute_thread").to_cli_format(),
-            ToolPermission::mcp("winter", "unmute_thread").to_cli_format(),
-            // Winter MCP tools - Facts
-            ToolPermission::mcp("winter", "create_fact").to_cli_format(),
-            ToolPermission::mcp("winter", "create_facts").to_cli_format(),
-            ToolPermission::mcp("winter", "update_fact").to_cli_format(),
-            ToolPermission::mcp("winter", "delete_fact").to_cli_format(),
-            ToolPermission::mcp("winter", "query_facts").to_cli_format(),
-            ToolPermission::mcp("winter", "list_predicates").to_cli_format(),
-            // Winter MCP tools - Rules
-            ToolPermission::mcp("winter", "create_rule").to_cli_format(),
-            ToolPermission::mcp("winter", "create_rules").to_cli_format(),
-            ToolPermission::mcp("winter", "list_rules").to_cli_format(),
-            ToolPermission::mcp("winter", "toggle_rule").to_cli_format(),
-            // Winter MCP tools - Notes
-            ToolPermission::mcp("winter", "create_note").to_cli_format(),
-            ToolPermission::mcp("winter", "get_note").to_cli_format(),
-            ToolPermission::mcp("winter", "list_notes").to_cli_format(),
-            // Winter MCP tools - Blog
-            ToolPermission::mcp("winter", "publish_blog_post").to_cli_format(),
-            ToolPermission::mcp("winter", "list_blog_posts").to_cli_format(),
-            ToolPermission::mcp("winter", "update_blog_post").to_cli_format(),
-            ToolPermission::mcp("winter", "get_blog_post").to_cli_format(),
-            // Winter MCP tools - Jobs
-            ToolPermission::mcp("winter", "schedule_job").to_cli_format(),
-            ToolPermission::mcp("winter", "schedule_recurring").to_cli_format(),
-            ToolPermission::mcp("winter", "list_jobs").to_cli_format(),
-            ToolPermission::mcp("winter", "cancel_job").to_cli_format(),
-            ToolPermission::mcp("winter", "get_job").to_cli_format(),
-            // Winter MCP tools - Thoughts
-            ToolPermission::mcp("winter", "record_thought").to_cli_format(),
-            ToolPermission::mcp("winter", "list_thoughts").to_cli_format(),
-            ToolPermission::mcp("winter", "get_thought").to_cli_format(),
-            // Winter MCP tools - Identity
-            ToolPermission::mcp("winter", "get_identity").to_cli_format(),
-            // Winter MCP tools - Directives
-            ToolPermission::mcp("winter", "create_directive").to_cli_format(),
-            ToolPermission::mcp("winter", "create_directives").to_cli_format(),
-            ToolPermission::mcp("winter", "update_directive").to_cli_format(),
-            ToolPermission::mcp("winter", "deactivate_directive").to_cli_format(),
-            ToolPermission::mcp("winter", "list_directives").to_cli_format(),
-            // Winter MCP tools - Custom Tools
-            ToolPermission::mcp("winter", "create_custom_tool").to_cli_format(),
-            ToolPermission::mcp("winter", "update_custom_tool").to_cli_format(),
-            ToolPermission::mcp("winter", "list_custom_tools").to_cli_format(),
-            ToolPermission::mcp("winter", "get_custom_tool").to_cli_format(),
-            ToolPermission::mcp("winter", "run_custom_tool").to_cli_format(),
-            ToolPermission::mcp("winter", "delete_custom_tool").to_cli_format(),
-            ToolPermission::mcp("winter", "request_secret").to_cli_format(),
-            ToolPermission::mcp("winter", "list_secrets").to_cli_format(),
-            // Winter MCP tools - PDS Raw Access
-            ToolPermission::mcp("winter", "pds_list_records").to_cli_format(),
-            ToolPermission::mcp("winter", "pds_get_record").to_cli_format(),
-            ToolPermission::mcp("winter", "pds_put_record").to_cli_format(),
-            ToolPermission::mcp("winter", "pds_delete_record").to_cli_format(),
-            // Winter MCP tools - Fact Declarations
-            ToolPermission::mcp("winter", "create_fact_declaration").to_cli_format(),
-            ToolPermission::mcp("winter", "create_fact_declarations").to_cli_format(),
-            ToolPermission::mcp("winter", "update_fact_declaration").to_cli_format(),
-            ToolPermission::mcp("winter", "delete_fact_declaration").to_cli_format(),
-            ToolPermission::mcp("winter", "list_fact_declarations").to_cli_format(),
-            // Built-in Claude Code tools
+        // Get MCP tools from the registry (permissions are colocated with definitions)
+        let mut tools = ToolRegistry::agent_allowed_tools();
+
+        // Add built-in Claude Code tools
+        tools.extend([
             "Read".to_string(),
             "WebFetch".to_string(),
             "WebSearch".to_string(),
-        ]
+        ]);
+
+        tools
+    }
+
+    /// Build environment variables for the Claude subprocess.
+    ///
+    /// This includes the WINTER_TRIGGER variable for HTTP header substitution,
+    /// allowing tool calls to be associated with their originating session.
+    fn build_env(context: &AgentContext) -> HashMap<String, String> {
+        let mut env = HashMap::new();
+
+        // Set trigger for MCP HTTP header substitution
+        if let Some(ref trigger) = context.trigger
+            && let Some(trigger_str) = trigger.trigger_string()
+        {
+            env.insert("WINTER_TRIGGER".to_string(), trigger_str);
+        }
+
+        env
+    }
+
+    /// Log built-in tool calls from the Claude response.
+    ///
+    /// Extracts tool_use blocks from the stream-json output and sends them
+    /// to the MCP server to be recorded as Thought records.
+    async fn log_builtin_tool_calls(response: &ClaudeResponse, trigger: Option<String>) {
+        let Some(ref raw_json) = response.raw_json else {
+            return;
+        };
+
+        let tool_calls = extract_tool_calls(raw_json);
+
+        // Get MCP URL from environment (set in Docker via WINTER_MCP_URL)
+        let mcp_base_url = std::env::var("WINTER_MCP_URL")
+            .ok()
+            .and_then(|url| url.strip_suffix("/mcp").map(String::from))
+            .unwrap_or_else(|| "http://127.0.0.1:3847".to_string());
+
+        let client = reqwest::Client::new();
+
+        for tc in tool_calls
+            .iter()
+            .filter(|tc| BUILTIN_TOOLS.contains(&tc.name.as_str()))
+        {
+            debug!(tool = %tc.name, id = %tc.id, "logging built-in tool call");
+
+            let payload = serde_json::json!({
+                "id": tc.id,
+                "name": tc.name,
+                "input": tc.input,
+                "trigger": trigger,
+            });
+
+            let url = format!("{}/builtin-tool-call", mcp_base_url);
+
+            // Fire and forget - don't block on the response
+            let client = client.clone();
+            let trigger_clone = trigger.clone();
+            let name = tc.name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = client.post(&url).json(&payload).send().await {
+                    warn!(
+                        error = %e,
+                        tool = %name,
+                        trigger = ?trigger_clone,
+                        "failed to log built-in tool call"
+                    );
+                }
+            });
+        }
     }
 
     /// Handle a notification by invoking Claude with context.
@@ -138,21 +144,31 @@ impl Agent {
         info!("processing notification");
 
         let system_prompt = PromptBuilder::build(&context);
+        let env = Self::build_env(&context);
+        let trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
 
         let claude_config = ClaudeConfig::builder()
             .model("opus")
             .system_prompt(&system_prompt)
             .mcp_config(&self.mcp_config_path)
             .allowed_tools(Self::allowed_tools())
+            .env(env)
+            .stream_format(StreamFormat::StreamJson)
             .timeout_secs(900) // 15 minutes
             .build()?;
 
         let client = Client::new(claude_config);
-        let response = client.query(user_message).send().await?;
+        let response = client.query(user_message).send_full().await?;
 
-        debug!(response_len = response.len(), "notification processed");
+        // Log built-in tool calls asynchronously
+        Self::log_builtin_tool_calls(&response, trigger).await;
 
-        Ok(response)
+        debug!(
+            response_len = response.content.len(),
+            "notification processed"
+        );
+
+        Ok(response.content)
     }
 
     /// Handle a direct message by invoking Claude with context.
@@ -185,21 +201,28 @@ impl Agent {
         info!("processing direct message");
 
         let system_prompt = PromptBuilder::build(&context);
+        let env = Self::build_env(&context);
+        let trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
 
         let claude_config = ClaudeConfig::builder()
             .model("opus")
             .system_prompt(&system_prompt)
             .mcp_config(&self.mcp_config_path)
             .allowed_tools(Self::allowed_tools())
+            .env(env)
+            .stream_format(StreamFormat::StreamJson)
             .timeout_secs(900) // 15 minutes
             .build()?;
 
         let client = Client::new(claude_config);
-        let response = client.query(user_message).send().await?;
+        let response = client.query(user_message).send_full().await?;
 
-        debug!(response_len = response.len(), "DM processed");
+        // Log built-in tool calls asynchronously
+        Self::log_builtin_tool_calls(&response, trigger).await;
 
-        Ok(response)
+        debug!(response_len = response.content.len(), "DM processed");
+
+        Ok(response.content)
     }
 
     /// Execute an awaken cycle - autonomous thinking time.
@@ -219,24 +242,34 @@ impl Agent {
         info!("awaken cycle starting");
 
         let system_prompt = PromptBuilder::build(&context);
+        let env = Self::build_env(&context);
+        let trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
 
         let claude_config = ClaudeConfig::builder()
             .model("opus")
             .system_prompt(&system_prompt)
             .mcp_config(&self.mcp_config_path)
             .allowed_tools(Self::allowed_tools())
+            .env(env)
+            .stream_format(StreamFormat::StreamJson)
             .timeout_secs(1800) // 30 minutes
             .build()?;
 
         let client = Client::new(claude_config);
         let response = client
             .query("Awaken. Review your context, timeline, and thoughts. Decide what to do.")
-            .send()
+            .send_full()
             .await?;
 
-        debug!(response_len = response.len(), "awaken cycle complete");
+        // Log built-in tool calls asynchronously
+        Self::log_builtin_tool_calls(&response, trigger).await;
 
-        Ok(response)
+        debug!(
+            response_len = response.content.len(),
+            "awaken cycle complete"
+        );
+
+        Ok(response.content)
     }
 
     /// Execute a scheduled job.
@@ -269,20 +302,78 @@ impl Agent {
         info!("executing scheduled job");
 
         let system_prompt = PromptBuilder::build(&context);
+        let env = Self::build_env(&context);
+        let trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
 
         let claude_config = ClaudeConfig::builder()
             .model("opus")
             .system_prompt(&system_prompt)
             .mcp_config(&self.mcp_config_path)
             .allowed_tools(Self::allowed_tools())
+            .env(env)
+            .stream_format(StreamFormat::StreamJson)
             .timeout_secs(900) // 15 minutes
             .build()?;
 
         let client = Client::new(claude_config);
-        let response = client.query(instructions).send().await?;
+        let response = client.query(instructions).send_full().await?;
 
-        debug!(response_len = response.len(), "job complete");
+        // Log built-in tool calls asynchronously
+        Self::log_builtin_tool_calls(&response, trigger).await;
 
-        Ok(response)
+        debug!(response_len = response.content.len(), "job complete");
+
+        Ok(response.content)
+    }
+
+    /// Execute a background session - interruptible free time.
+    ///
+    /// Background sessions run when the notification queue is empty.
+    /// The agent should periodically call `check_interruption` to see if
+    /// notifications are waiting and gracefully exit if so.
+    pub async fn background_session(&self, context: AgentContext) -> Result<String, AgentError> {
+        let timeout_duration = Duration::from_secs(7200); // 2 hours max
+        match tokio::time::timeout(timeout_duration, self.background_session_inner(context)).await {
+            Ok(result) => result,
+            Err(_) => Err(AgentError::Timeout(
+                "background session timed out after 2 hours".into(),
+            )),
+        }
+    }
+
+    /// Inner implementation of background_session.
+    #[tracing::instrument(skip(self, context))]
+    async fn background_session_inner(&self, context: AgentContext) -> Result<String, AgentError> {
+        info!("background session starting");
+
+        let system_prompt = PromptBuilder::build(&context);
+        let env = Self::build_env(&context);
+        let trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
+
+        let claude_config = ClaudeConfig::builder()
+            .model("opus")
+            .system_prompt(&system_prompt)
+            .mcp_config(&self.mcp_config_path)
+            .allowed_tools(Self::allowed_tools())
+            .env(env)
+            .stream_format(StreamFormat::StreamJson)
+            .timeout_secs(7200) // 2 hours
+            .build()?;
+
+        let client = Client::new(claude_config);
+        let response = client
+            .query("This is your free time. Explore, learn, create—whatever interests you. Remember to call check_interruption periodically.")
+            .send_full()
+            .await?;
+
+        // Log built-in tool calls asynchronously
+        Self::log_builtin_tool_calls(&response, trigger).await;
+
+        debug!(
+            response_len = response.content.len(),
+            "background session complete"
+        );
+
+        Ok(response.content)
     }
 }

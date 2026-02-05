@@ -25,9 +25,13 @@ chrono = { workspace = true }
 # Logging
 tracing = { workspace = true }
 
+# HTTP client (for logging built-in tool calls)
+reqwest = { workspace = true }
+
 # Internal
 winter-atproto = { workspace = true }
 winter-datalog = { workspace = true }
+winter-mcp = { workspace = true }
 
 # Bluesky
 bsky-sdk = { workspace = true }

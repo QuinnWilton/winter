@@ -1,7 +1,19 @@
 //! Agent context for Claude prompts.
 
+use chrono::{DateTime, Utc};
 use winter_atproto::Facet;
 use winter_atproto::{Directive, Identity, Thought};
+
+/// A message in the DM conversation history.
+#[derive(Debug, Clone)]
+pub struct ConversationHistoryMessage {
+    /// Label for the sender ("You" for Winter, "@handle" for others).
+    pub sender_label: String,
+    /// Message text.
+    pub text: String,
+    /// When the message was sent.
+    pub sent_at: DateTime<Utc>,
+}
 
 /// Context assembled for a Claude prompt.
 #[derive(Debug, Clone)]
@@ -76,11 +88,15 @@ pub enum ContextTrigger {
         text: String,
         /// Rich text facets (mentions, links, tags).
         facets: Vec<Facet>,
+        /// Recent conversation history (last 15 minutes, excluding triggering message).
+        history: Vec<ConversationHistoryMessage>,
     },
     /// A scheduled job.
     Job { id: String, name: String },
     /// An awaken cycle.
     Awaken,
+    /// A background session (interruptible free time).
+    Background,
 }
 
 /// Scope for filtering thoughts by conversation context.
@@ -116,6 +132,7 @@ impl ContextTrigger {
             },
             ContextTrigger::Job { name, .. } => ConversationScope::Job { name: name.clone() },
             ContextTrigger::Awaken => ConversationScope::Global,
+            ContextTrigger::Background => ConversationScope::Global,
         }
     }
 
@@ -140,6 +157,7 @@ impl ContextTrigger {
             } => Some(format!("dm:{}:{}", convo_id, message_id)),
             ContextTrigger::Job { name, .. } => Some(format!("job:{}", name)),
             ContextTrigger::Awaken => None,
+            ContextTrigger::Background => Some("background".to_string()),
         }
     }
 }
@@ -204,6 +222,7 @@ impl AgentContext {
                 format!("job:{}", name)
             }
             Some(ContextTrigger::Awaken) => "awaken".to_string(),
+            Some(ContextTrigger::Background) => "background".to_string(),
             None => "none".to_string(),
         }
     }

@@ -16,7 +16,9 @@ mod prompt;
 mod state;
 
 pub use agent::Agent;
-pub use context::{AgentContext, ContextTrigger, CustomToolSummary, PostRef};
+pub use context::{
+    AgentContext, ContextTrigger, ConversationHistoryMessage, CustomToolSummary, PostRef,
+};
 pub use error::AgentError;
 pub use identity::IdentityManager;
 pub use prompt::PromptBuilder;
