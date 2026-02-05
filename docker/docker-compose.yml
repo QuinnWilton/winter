@@ -21,6 +21,34 @@ services:
     profiles:
       - bootstrap
 
+  mcp-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: winter-mcp
+    restart: unless-stopped
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+      - net.ipv6.conf.default.disable_ipv6=1
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    environment:
+      - WINTER_PDS_URL=${WINTER_PDS_URL}
+      - WINTER_HANDLE=${WINTER_HANDLE}
+      - WINTER_APP_PASSWORD=${WINTER_APP_PASSWORD}
+      - WINTER_FIREHOSE_URL=${WINTER_FIREHOSE_URL:-wss://bsky.network}
+      - WINTER_WEB_URL=${WINTER_WEB_URL:-http://localhost:8080}
+      - WINTER_SECRETS_PATH=/home/winter/.config/winter/secrets.json
+      - RUST_LOG=winter=info,winter_mcp=debug
+    volumes:
+      - ${HOME}/.config/winter:/home/winter/.config/winter
+      - ${HOME}/.cache/winter:/home/winter/.cache/winter
+      - ${HOME}/.cache/deno:/home/winter/.cache/deno
+    command: ["winter", "mcp-server-http", "--port", "3847"]
+    # Internal only - no external port exposure needed
+    # The daemon connects via Docker network
+
   web:
     build:
       context: ..
@@ -68,11 +96,20 @@ services:
       - WINTER_SECRETS_PATH=/home/winter/.config/winter/secrets.json
       - WINTER_WORKSPACE=/home/winter/workspace
       - WINTER_FAST_FORWARD=${WINTER_FAST_FORWARD:-}
+      # Enable HTTP MCP transport - connects to persistent mcp-server container
+      - WINTER_MCP_URL=http://mcp-server:3847/mcp
+      # Background sessions (interruptible free time when idle)
+      - WINTER_BACKGROUND_ENABLED=${WINTER_BACKGROUND_ENABLED:-true}
+      - WINTER_BACKGROUND_GRACE_SECS=${WINTER_BACKGROUND_GRACE_SECS:-60}
+      - WINTER_BACKGROUND_IDLE_SECS=${WINTER_BACKGROUND_IDLE_SECS:-300}
       - RUST_LOG=winter=info
     volumes:
       - ${HOME}/.config/winter:/home/winter/.config/winter
       - ${HOME}/.winter-workspace:/home/winter/workspace
       - ${HOME}/.cache/winter:/home/winter/.cache/winter
+      # Mount HTTP MCP config from repo
+      - ../config/mcp-http.json:/home/winter/.config/winter/mcp-http.json:ro
     command: ["winter", "daemon"]
     depends_on:
       - web
+      - mcp-server

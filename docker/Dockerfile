@@ -26,13 +26,17 @@ FROM rustlang/rust:nightly-bookworm AS builder
 
 WORKDIR /app
 
-# Install Soufflé runtime deps (needed for build.rs or tests that use it)
+# Install Soufflé runtime deps and mold linker for faster builds
 RUN apt-get update && apt-get install -y \
     libffi8 libncurses6 libsqlite3-0 mcpp zlib1g \
+    mold \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy Soufflé from builder
 COPY --from=souffle-builder /opt/souffle/bin/souffle /usr/local/bin/
+
+# Copy cargo config for mold linker
+COPY .cargo/config.toml .cargo/
 
 # Copy dependency manifests first (maximizes cache reuse)
 COPY Cargo.toml Cargo.lock ./
@@ -106,12 +110,12 @@ COPY --from=souffle-builder /opt/souffle/bin/souffle /usr/local/bin/
 COPY --from=builder /app/winter-bin /usr/local/bin/winter
 
 RUN useradd -m -s /bin/bash winter
-RUN mkdir -p /home/winter/.config/winter
+RUN mkdir -p /home/winter/.config/winter /home/winter/.cache/deno
 COPY config/mcp.json /home/winter/.config/winter/mcp.json
 # Create empty secrets file with proper permissions
 RUN echo '{"version":1,"secrets":{}}' > /home/winter/.config/winter/secrets.json \
     && chmod 600 /home/winter/.config/winter/secrets.json
-RUN chown -R winter:winter /home/winter/.config
+RUN chown -R winter:winter /home/winter/.config /home/winter/.cache
 
 USER winter
 WORKDIR /home/winter
