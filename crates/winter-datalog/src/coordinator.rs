@@ -212,7 +212,7 @@ mod tests {
 
     fn temp_cache() -> Arc<DatalogCache> {
         let temp_dir = tempfile::tempdir().unwrap();
-        DatalogCache::new(temp_dir.into_path()).unwrap()
+        DatalogCache::new(temp_dir.keep()).unwrap()
     }
 
     #[tokio::test]

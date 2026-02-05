@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
-use winter_atproto::{Fact, ListRecordItem};
+use winter_atproto::{AtUri, Fact, ListRecordItem};
 
 use crate::DatalogError;
 use crate::cache::CachedFactData;
@@ -39,7 +39,7 @@ impl FactExtractor {
         // Build CID -> rkey map for supersession lookups
         let cid_to_rkey: HashMap<&str, &str> = facts
             .iter()
-            .map(|item| (item.cid.as_str(), extract_rkey(&item.uri)))
+            .map(|item| (item.cid.as_str(), AtUri::extract_rkey(&item.uri)))
             .collect();
 
         // Collect superseded CIDs (facts that have been replaced)
@@ -64,7 +64,7 @@ impl FactExtractor {
         for item in facts {
             let fact = &item.value;
             let predicate = &fact.predicate;
-            let rkey = extract_rkey(&item.uri);
+            let rkey = AtUri::extract_rkey(&item.uri);
             let cid = &item.cid;
             let args = fact.args.join("\t");
             let is_current = !superseded_cids.contains(cid.as_str());
@@ -113,12 +113,23 @@ impl FactExtractor {
             }
 
             // Write to _created_at.facts (dense - every fact)
-            writeln!(created_at_file, "{}\t{}", rkey, fact.created_at.to_rfc3339())?;
+            writeln!(
+                created_at_file,
+                "{}\t{}",
+                rkey,
+                fact.created_at.to_rfc3339()
+            )?;
         }
 
         Ok(ExtractResult {
             predicates,
-            meta_relations: vec!["_fact", "_confidence", "_source", "_supersedes", "_created_at"],
+            meta_relations: vec![
+                "_fact",
+                "_confidence",
+                "_source",
+                "_supersedes",
+                "_created_at",
+            ],
         })
     }
 
@@ -295,13 +306,6 @@ impl FactExtractor {
     }
 }
 
-/// Extract the rkey (record key) from an AT-URI.
-///
-/// e.g., "at://did:plc:xxx/diy.razorgirl.winter.fact/3abc123" -> "3abc123"
-fn extract_rkey(uri: &str) -> &str {
-    uri.rsplit('/').next().unwrap_or("")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,16 +341,6 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_rkey() {
-        assert_eq!(
-            extract_rkey("at://did:plc:xxx/diy.razorgirl.winter.fact/3abc123"),
-            "3abc123"
-        );
-        assert_eq!(extract_rkey("at://did/col/rkey"), "rkey");
-        assert_eq!(extract_rkey(""), "");
-    }
-
-    #[test]
     fn test_extract_to_dir_basic() {
         let dir = tempdir().unwrap();
         let facts = vec![
@@ -361,7 +355,13 @@ mod tests {
         assert!(result.predicates.contains(&"interested_in".to_string()));
         assert_eq!(
             result.meta_relations,
-            vec!["_fact", "_confidence", "_source", "_supersedes", "_created_at"]
+            vec![
+                "_fact",
+                "_confidence",
+                "_source",
+                "_supersedes",
+                "_created_at"
+            ]
         );
 
         // Check current facts file
@@ -626,7 +626,10 @@ mod tests {
             let parts: Vec<&str> = line.split('\t').collect();
             assert_eq!(parts.len(), 2);
             let timestamp = parts[1];
-            assert!(timestamp.contains('T'), "timestamp should be ISO8601 format");
+            assert!(
+                timestamp.contains('T'),
+                "timestamp should be ISO8601 format"
+            );
         }
     }
 }

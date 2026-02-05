@@ -12,6 +12,7 @@
 pub mod cache;
 mod compiler;
 pub mod coordinator;
+pub mod dependency;
 pub mod derived;
 mod error;
 mod executor;
@@ -21,8 +22,9 @@ mod validator;
 pub use cache::{CachedFactData, DatalogCache};
 pub use compiler::RuleCompiler;
 pub use coordinator::{DatalogCoordinator, DatalogCoordinatorHandle};
+pub use dependency::PredicateDependencyGraph;
 pub use derived::{DerivedFactGenerator, DerivedFactStats, PredicateInfo};
 pub use error::DatalogError;
 pub use executor::SouffleExecutor;
 pub use extractor::{ExtractResult, FactExtractor};
-pub use validator::{validate_fact_against_declaration, ValidationError};
+pub use validator::{ValidationError, validate_fact_against_declaration};

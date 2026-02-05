@@ -8,7 +8,7 @@
 //! and are regenerated when source records change.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use tracing::{debug, trace};
@@ -291,232 +291,366 @@ impl DerivedFactGenerator {
         // =================================================================
         // Bluesky: follows
         // =================================================================
-        m.insert("follows", PredicateInfo {
-            arity: 3,
-            args: &["self_did", "target_did", "rkey"],
-            description: "Accounts you follow",
-        });
-        m.insert("follow_created_at", PredicateInfo {
-            arity: 4,
-            args: &["self_did", "target_did", "timestamp", "rkey"],
-            description: "When each follow was created (ISO8601)",
-        });
-        m.insert("is_followed_by", PredicateInfo {
-            arity: 2,
-            args: &["follower_did", "self_did"],
-            description: "Accounts that follow you (no rkey - from API)",
-        });
+        m.insert(
+            "follows",
+            PredicateInfo {
+                arity: 3,
+                args: &["self_did", "target_did", "rkey"],
+                description: "Accounts you follow",
+            },
+        );
+        m.insert(
+            "follow_created_at",
+            PredicateInfo {
+                arity: 4,
+                args: &["self_did", "target_did", "timestamp", "rkey"],
+                description: "When each follow was created (ISO8601)",
+            },
+        );
+        m.insert(
+            "is_followed_by",
+            PredicateInfo {
+                arity: 2,
+                args: &["follower_did", "self_did"],
+                description: "Accounts that follow you (no rkey - from API)",
+            },
+        );
 
         // =================================================================
         // Bluesky: likes
         // =================================================================
-        m.insert("liked", PredicateInfo {
-            arity: 3,
-            args: &["self_did", "post_uri", "rkey"],
-            description: "Posts you have liked",
-        });
-        m.insert("like_created_at", PredicateInfo {
-            arity: 4,
-            args: &["self_did", "post_uri", "timestamp", "rkey"],
-            description: "When each like was created (ISO8601)",
-        });
-        m.insert("like_cid", PredicateInfo {
-            arity: 4,
-            args: &["self_did", "post_uri", "cid", "rkey"],
-            description: "CID of the liked post",
-        });
+        m.insert(
+            "liked",
+            PredicateInfo {
+                arity: 3,
+                args: &["self_did", "post_uri", "rkey"],
+                description: "Posts you have liked",
+            },
+        );
+        m.insert(
+            "like_created_at",
+            PredicateInfo {
+                arity: 4,
+                args: &["self_did", "post_uri", "timestamp", "rkey"],
+                description: "When each like was created (ISO8601)",
+            },
+        );
+        m.insert(
+            "like_cid",
+            PredicateInfo {
+                arity: 4,
+                args: &["self_did", "post_uri", "cid", "rkey"],
+                description: "CID of the liked post",
+            },
+        );
 
         // =================================================================
         // Bluesky: reposts
         // =================================================================
-        m.insert("reposted", PredicateInfo {
-            arity: 3,
-            args: &["self_did", "post_uri", "rkey"],
-            description: "Posts you have reposted",
-        });
-        m.insert("repost_created_at", PredicateInfo {
-            arity: 4,
-            args: &["self_did", "post_uri", "timestamp", "rkey"],
-            description: "When each repost was created (ISO8601)",
-        });
-        m.insert("repost_cid", PredicateInfo {
-            arity: 4,
-            args: &["self_did", "post_uri", "cid", "rkey"],
-            description: "CID of the reposted post",
-        });
+        m.insert(
+            "reposted",
+            PredicateInfo {
+                arity: 3,
+                args: &["self_did", "post_uri", "rkey"],
+                description: "Posts you have reposted",
+            },
+        );
+        m.insert(
+            "repost_created_at",
+            PredicateInfo {
+                arity: 4,
+                args: &["self_did", "post_uri", "timestamp", "rkey"],
+                description: "When each repost was created (ISO8601)",
+            },
+        );
+        m.insert(
+            "repost_cid",
+            PredicateInfo {
+                arity: 4,
+                args: &["self_did", "post_uri", "cid", "rkey"],
+                description: "CID of the reposted post",
+            },
+        );
 
         // =================================================================
         // Bluesky: posts
         // =================================================================
-        m.insert("posted", PredicateInfo {
-            arity: 3,
-            args: &["self_did", "post_uri", "rkey"],
-            description: "Posts you have created",
-        });
-        m.insert("post_created_at", PredicateInfo {
-            arity: 3,
-            args: &["post_uri", "timestamp", "rkey"],
-            description: "When each post was created (ISO8601)",
-        });
-        m.insert("replied_to", PredicateInfo {
-            arity: 3,
-            args: &["post_uri", "parent_uri", "rkey"],
-            description: "Reply relationships between posts (alias: reply_parent_uri)",
-        });
-        m.insert("reply_parent_uri", PredicateInfo {
-            arity: 3,
-            args: &["post_uri", "parent_uri", "rkey"],
-            description: "URI of the reply parent (alias: replied_to)",
-        });
-        m.insert("reply_parent_cid", PredicateInfo {
-            arity: 3,
-            args: &["post_uri", "parent_cid", "rkey"],
-            description: "CID of the reply parent",
-        });
-        m.insert("thread_root", PredicateInfo {
-            arity: 3,
-            args: &["post_uri", "root_uri", "rkey"],
-            description: "Thread membership (alias: reply_root_uri)",
-        });
-        m.insert("reply_root_uri", PredicateInfo {
-            arity: 3,
-            args: &["post_uri", "root_uri", "rkey"],
-            description: "URI of the thread root (alias: thread_root)",
-        });
-        m.insert("reply_root_cid", PredicateInfo {
-            arity: 3,
-            args: &["post_uri", "root_cid", "rkey"],
-            description: "CID of the thread root",
-        });
-        m.insert("quoted", PredicateInfo {
-            arity: 3,
-            args: &["post_uri", "quoted_uri", "rkey"],
-            description: "Quote post relationships",
-        });
-        m.insert("quote_cid", PredicateInfo {
-            arity: 3,
-            args: &["post_uri", "quoted_cid", "rkey"],
-            description: "CID of the quoted post",
-        });
-        m.insert("post_lang", PredicateInfo {
-            arity: 3,
-            args: &["post_uri", "lang", "rkey"],
-            description: "Language tag for post (one row per language)",
-        });
-        m.insert("post_mention", PredicateInfo {
-            arity: 3,
-            args: &["post_uri", "did", "rkey"],
-            description: "Accounts mentioned in post (one row per mention)",
-        });
-        m.insert("post_link", PredicateInfo {
-            arity: 3,
-            args: &["post_uri", "link_uri", "rkey"],
-            description: "External links in post (one row per link)",
-        });
-        m.insert("post_hashtag", PredicateInfo {
-            arity: 3,
-            args: &["post_uri", "tag", "rkey"],
-            description: "Hashtags in post (one row per tag)",
-        });
+        m.insert(
+            "posted",
+            PredicateInfo {
+                arity: 3,
+                args: &["self_did", "post_uri", "rkey"],
+                description: "Posts you have created",
+            },
+        );
+        m.insert(
+            "post_created_at",
+            PredicateInfo {
+                arity: 3,
+                args: &["post_uri", "timestamp", "rkey"],
+                description: "When each post was created (ISO8601)",
+            },
+        );
+        m.insert(
+            "replied_to",
+            PredicateInfo {
+                arity: 3,
+                args: &["post_uri", "parent_uri", "rkey"],
+                description: "Reply relationships between posts (alias: reply_parent_uri)",
+            },
+        );
+        m.insert(
+            "reply_parent_uri",
+            PredicateInfo {
+                arity: 3,
+                args: &["post_uri", "parent_uri", "rkey"],
+                description: "URI of the reply parent (alias: replied_to)",
+            },
+        );
+        m.insert(
+            "reply_parent_cid",
+            PredicateInfo {
+                arity: 3,
+                args: &["post_uri", "parent_cid", "rkey"],
+                description: "CID of the reply parent",
+            },
+        );
+        m.insert(
+            "thread_root",
+            PredicateInfo {
+                arity: 3,
+                args: &["post_uri", "root_uri", "rkey"],
+                description: "Thread membership (alias: reply_root_uri)",
+            },
+        );
+        m.insert(
+            "reply_root_uri",
+            PredicateInfo {
+                arity: 3,
+                args: &["post_uri", "root_uri", "rkey"],
+                description: "URI of the thread root (alias: thread_root)",
+            },
+        );
+        m.insert(
+            "reply_root_cid",
+            PredicateInfo {
+                arity: 3,
+                args: &["post_uri", "root_cid", "rkey"],
+                description: "CID of the thread root",
+            },
+        );
+        m.insert(
+            "quoted",
+            PredicateInfo {
+                arity: 3,
+                args: &["post_uri", "quoted_uri", "rkey"],
+                description: "Quote post relationships",
+            },
+        );
+        m.insert(
+            "quote_cid",
+            PredicateInfo {
+                arity: 3,
+                args: &["post_uri", "quoted_cid", "rkey"],
+                description: "CID of the quoted post",
+            },
+        );
+        m.insert(
+            "post_lang",
+            PredicateInfo {
+                arity: 3,
+                args: &["post_uri", "lang", "rkey"],
+                description: "Language tag for post (one row per language)",
+            },
+        );
+        m.insert(
+            "post_mention",
+            PredicateInfo {
+                arity: 3,
+                args: &["post_uri", "did", "rkey"],
+                description: "Accounts mentioned in post (one row per mention)",
+            },
+        );
+        m.insert(
+            "post_link",
+            PredicateInfo {
+                arity: 3,
+                args: &["post_uri", "link_uri", "rkey"],
+                description: "External links in post (one row per link)",
+            },
+        );
+        m.insert(
+            "post_hashtag",
+            PredicateInfo {
+                arity: 3,
+                args: &["post_uri", "tag", "rkey"],
+                description: "Hashtags in post (one row per tag)",
+            },
+        );
 
         // =================================================================
         // Directive predicates
         // =================================================================
-        m.insert("has_value", PredicateInfo {
-            arity: 2,
-            args: &["content", "rkey"],
-            description: "Your active values",
-        });
-        m.insert("has_interest", PredicateInfo {
-            arity: 2,
-            args: &["content", "rkey"],
-            description: "Your active interests",
-        });
-        m.insert("has_belief", PredicateInfo {
-            arity: 2,
-            args: &["content", "rkey"],
-            description: "Your active beliefs",
-        });
-        m.insert("has_guideline", PredicateInfo {
-            arity: 2,
-            args: &["content", "rkey"],
-            description: "Your active guidelines",
-        });
-        m.insert("has_boundary", PredicateInfo {
-            arity: 2,
-            args: &["content", "rkey"],
-            description: "Your active boundaries",
-        });
-        m.insert("has_aspiration", PredicateInfo {
-            arity: 2,
-            args: &["content", "rkey"],
-            description: "Your active aspirations",
-        });
-        m.insert("has_self_concept", PredicateInfo {
-            arity: 2,
-            args: &["content", "rkey"],
-            description: "Your active self-concepts",
-        });
+        m.insert(
+            "has_value",
+            PredicateInfo {
+                arity: 2,
+                args: &["content", "rkey"],
+                description: "Your active values",
+            },
+        );
+        m.insert(
+            "has_interest",
+            PredicateInfo {
+                arity: 2,
+                args: &["content", "rkey"],
+                description: "Your active interests",
+            },
+        );
+        m.insert(
+            "has_belief",
+            PredicateInfo {
+                arity: 2,
+                args: &["content", "rkey"],
+                description: "Your active beliefs",
+            },
+        );
+        m.insert(
+            "has_guideline",
+            PredicateInfo {
+                arity: 2,
+                args: &["content", "rkey"],
+                description: "Your active guidelines",
+            },
+        );
+        m.insert(
+            "has_boundary",
+            PredicateInfo {
+                arity: 2,
+                args: &["content", "rkey"],
+                description: "Your active boundaries",
+            },
+        );
+        m.insert(
+            "has_aspiration",
+            PredicateInfo {
+                arity: 2,
+                args: &["content", "rkey"],
+                description: "Your active aspirations",
+            },
+        );
+        m.insert(
+            "has_self_concept",
+            PredicateInfo {
+                arity: 2,
+                args: &["content", "rkey"],
+                description: "Your active self-concepts",
+            },
+        );
 
         // Tool and job predicates
-        m.insert("has_tool", PredicateInfo {
-            arity: 3,
-            args: &["name", "approved", "rkey"],
-            description: "Your custom tools (approved: true/false)",
-        });
-        m.insert("has_job", PredicateInfo {
-            arity: 3,
-            args: &["name", "schedule_type", "rkey"],
-            description: "Your scheduled jobs (once/interval)",
-        });
+        m.insert(
+            "has_tool",
+            PredicateInfo {
+                arity: 3,
+                args: &["name", "approved", "rkey"],
+                description: "Your custom tools (approved: true/false)",
+            },
+        );
+        m.insert(
+            "has_job",
+            PredicateInfo {
+                arity: 3,
+                args: &["name", "schedule_type", "rkey"],
+                description: "Your scheduled jobs (once/interval)",
+            },
+        );
 
         // Note predicates
-        m.insert("has_note", PredicateInfo {
-            arity: 6,
-            args: &["uri", "title", "category", "created_at", "last_updated", "rkey"],
-            description: "Your notes",
-        });
-        m.insert("note_tag", PredicateInfo {
-            arity: 3,
-            args: &["note_uri", "tag", "rkey"],
-            description: "Tags on notes (one row per tag)",
-        });
-        m.insert("note_related_fact", PredicateInfo {
-            arity: 3,
-            args: &["note_uri", "fact_uri", "rkey"],
-            description: "Facts linked to notes",
-        });
+        m.insert(
+            "has_note",
+            PredicateInfo {
+                arity: 6,
+                args: &[
+                    "uri",
+                    "title",
+                    "category",
+                    "created_at",
+                    "last_updated",
+                    "rkey",
+                ],
+                description: "Your notes",
+            },
+        );
+        m.insert(
+            "note_tag",
+            PredicateInfo {
+                arity: 3,
+                args: &["note_uri", "tag", "rkey"],
+                description: "Tags on notes (one row per tag)",
+            },
+        );
+        m.insert(
+            "note_related_fact",
+            PredicateInfo {
+                arity: 3,
+                args: &["note_uri", "fact_uri", "rkey"],
+                description: "Facts linked to notes",
+            },
+        );
 
         // Thought predicates
-        m.insert("has_thought", PredicateInfo {
-            arity: 5,
-            args: &["uri", "kind", "trigger", "created_at", "rkey"],
-            description: "Your stream of consciousness",
-        });
-        m.insert("thought_tag", PredicateInfo {
-            arity: 3,
-            args: &["thought_uri", "tag", "rkey"],
-            description: "Tags on thoughts (one row per tag)",
-        });
-        m.insert("tool_call_duration", PredicateInfo {
-            arity: 4,
-            args: &["uri", "tool_name", "duration_ms", "rkey"],
-            description: "Duration of tool calls in milliseconds",
-        });
+        m.insert(
+            "has_thought",
+            PredicateInfo {
+                arity: 5,
+                args: &["uri", "kind", "trigger", "created_at", "rkey"],
+                description: "Your stream of consciousness",
+            },
+        );
+        m.insert(
+            "thought_tag",
+            PredicateInfo {
+                arity: 3,
+                args: &["thought_uri", "tag", "rkey"],
+                description: "Tags on thoughts (one row per tag)",
+            },
+        );
+        m.insert(
+            "tool_call_duration",
+            PredicateInfo {
+                arity: 4,
+                args: &["uri", "tool_name", "duration_ms", "rkey"],
+                description: "Duration of tool calls in milliseconds",
+            },
+        );
 
         // Blog predicates
-        m.insert("has_blog_post", PredicateInfo {
-            arity: 6,
-            args: &["uri", "title", "whtwnd_url", "created_at", "is_draft", "rkey"],
-            description: "Your WhiteWind blog posts",
-        });
+        m.insert(
+            "has_blog_post",
+            PredicateInfo {
+                arity: 6,
+                args: &[
+                    "uri",
+                    "title",
+                    "whtwnd_url",
+                    "created_at",
+                    "is_draft",
+                    "rkey",
+                ],
+                description: "Your WhiteWind blog posts",
+            },
+        );
 
         // Fact tags
-        m.insert("fact_tag", PredicateInfo {
-            arity: 3,
-            args: &["fact_uri", "tag", "rkey"],
-            description: "Tags on facts (one row per tag)",
-        });
+        m.insert(
+            "fact_tag",
+            PredicateInfo {
+                arity: 3,
+                args: &["fact_uri", "tag", "rkey"],
+                description: "Tags on facts (one row per tag)",
+            },
+        );
 
         m
     }
@@ -661,13 +795,15 @@ impl DerivedFactGenerator {
             },
         );
         self.dirty_predicates.insert("follows".to_string());
-        self.dirty_predicates.insert("follow_created_at".to_string());
+        self.dirty_predicates
+            .insert("follow_created_at".to_string());
     }
 
     fn remove_follow(&mut self, rkey: &str) {
         if self.follows.remove(rkey).is_some() {
             self.dirty_predicates.insert("follows".to_string());
-            self.dirty_predicates.insert("follow_created_at".to_string());
+            self.dirty_predicates
+                .insert("follow_created_at".to_string());
         }
     }
 
@@ -711,14 +847,16 @@ impl DerivedFactGenerator {
             },
         );
         self.dirty_predicates.insert("reposted".to_string());
-        self.dirty_predicates.insert("repost_created_at".to_string());
+        self.dirty_predicates
+            .insert("repost_created_at".to_string());
         self.dirty_predicates.insert("repost_cid".to_string());
     }
 
     fn remove_repost(&mut self, rkey: &str) {
         if self.reposts.remove(rkey).is_some() {
             self.dirty_predicates.insert("reposted".to_string());
-            self.dirty_predicates.insert("repost_created_at".to_string());
+            self.dirty_predicates
+                .insert("repost_created_at".to_string());
             self.dirty_predicates.insert("repost_cid".to_string());
         }
     }
@@ -1216,9 +1354,14 @@ impl DerivedFactGenerator {
         Ok(())
     }
 
-    fn write_predicate_file(&self, fact_dir: &Path, predicate: &str) -> Result<usize, DatalogError> {
+    fn write_predicate_file(
+        &self,
+        fact_dir: &Path,
+        predicate: &str,
+    ) -> Result<usize, DatalogError> {
         let path = fact_dir.join(format!("{}.facts", predicate));
-        let mut file = std::fs::File::create(&path)?;
+        let file = std::fs::File::create(&path)?;
+        let mut file = BufWriter::new(file);
 
         // Get count based on predicate (for logging)
         let count = match predicate {
@@ -1226,9 +1369,10 @@ impl DerivedFactGenerator {
             "is_followed_by" => self.followers.len(),
             "liked" | "like_created_at" | "like_cid" => self.likes.len(),
             "reposted" | "repost_created_at" | "repost_cid" => self.reposts.len(),
-            "posted" | "post_created_at" | "replied_to" | "reply_parent_uri" | "reply_parent_cid"
-            | "thread_root" | "reply_root_uri" | "reply_root_cid" | "quoted" | "quote_cid"
-            | "post_lang" | "post_mention" | "post_link" | "post_hashtag" => self.posts.len(),
+            "posted" | "post_created_at" | "replied_to" | "reply_parent_uri"
+            | "reply_parent_cid" | "thread_root" | "reply_root_uri" | "reply_root_cid"
+            | "quoted" | "quote_cid" | "post_lang" | "post_mention" | "post_link"
+            | "post_hashtag" => self.posts.len(),
             "has_note" | "note_tag" | "note_related_fact" => self.notes.len(),
             "has_thought" | "thought_tag" | "tool_call_duration" => self.thoughts.len(),
             "has_blog_post" => self.blog_entries.len(),
@@ -1335,7 +1479,13 @@ impl DerivedFactGenerator {
             }
             "post_created_at" => {
                 for (rkey, post) in &self.posts {
-                    writeln!(file, "{}\t{}\t{}", post.uri, post.created_at.to_rfc3339(), rkey)?;
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}",
+                        post.uri,
+                        post.created_at.to_rfc3339(),
+                        rkey
+                    )?;
                 }
             }
             "replied_to" | "reply_parent_uri" => {
@@ -1502,12 +1652,11 @@ impl DerivedFactGenerator {
             "tool_call_duration" => {
                 for (rkey, meta) in &self.thoughts {
                     // Only tool_call thoughts with duration and tool name
-                    if meta.kind == "tool_call" {
-                        if let (Some(duration), Some(tool_name)) =
+                    if meta.kind == "tool_call"
+                        && let (Some(duration), Some(tool_name)) =
                             (meta.duration_ms, meta.tool_name.as_ref())
-                        {
-                            writeln!(file, "{}\t{}\t{}\t{}", meta.uri, tool_name, duration, rkey)?;
-                        }
+                    {
+                        writeln!(file, "{}\t{}\t{}\t{}", meta.uri, tool_name, duration, rkey)?;
                     }
                 }
             }
@@ -1547,15 +1696,15 @@ impl DerivedFactGenerator {
         Ok(count)
     }
 
-    fn write_directive_predicate(
+    fn write_directive_predicate<W: Write>(
         &self,
-        file: &mut std::fs::File,
+        file: &mut W,
         kind: &DirectiveKind,
     ) -> Result<(), DatalogError> {
         for (rkey, (k, content)) in &self.directives {
             if k == kind {
                 // Escape tabs and newlines in content
-                let escaped = content.replace('\t', " ").replace('\n', " ");
+                let escaped = content.replace(['\t', '\n'], " ");
                 writeln!(file, "{}\t{}", escaped, rkey)?;
             }
         }
@@ -1590,6 +1739,460 @@ impl DerivedFactGenerator {
             self.dirty_predicates.insert((*predicate).to_string());
         }
     }
+
+    /// Get a snapshot of currently dirty predicates.
+    pub fn dirty_predicates_snapshot(&self) -> HashSet<String> {
+        self.dirty_predicates.clone()
+    }
+
+    /// Clear the dirty predicates set.
+    pub fn clear_dirty(&mut self) {
+        self.dirty_predicates.clear();
+    }
+
+    /// Create a snapshot of the derived facts for flushing.
+    ///
+    /// This clones all data needed for writing TSV files, allowing the
+    /// caller to release locks before doing I/O.
+    pub fn clone_for_flush(&self) -> DerivedFlushSnapshot {
+        DerivedFlushSnapshot {
+            self_did: self.self_did.clone(),
+            handle: self.handle.clone(),
+            follows: self.follows.clone(),
+            likes: self.likes.clone(),
+            reposts: self.reposts.clone(),
+            posts: self.posts.clone(),
+            directives: self.directives.clone(),
+            tools: self.tools.clone(),
+            jobs: self.jobs.clone(),
+            notes: self.notes.clone(),
+            thoughts: self.thoughts.clone(),
+            blog_entries: self.blog_entries.clone(),
+            fact_tags: self.fact_tags.clone(),
+            followers: self.followers.clone(),
+        }
+    }
+}
+
+/// A snapshot of derived facts for writing to disk.
+///
+/// This is used to release locks before doing I/O, preventing
+/// lock contention during file writes.
+#[derive(Clone)]
+pub struct DerivedFlushSnapshot {
+    self_did: String,
+    #[allow(dead_code)]
+    handle: String,
+    follows: HashMap<String, FollowMeta>,
+    likes: HashMap<String, LikeMeta>,
+    reposts: HashMap<String, RepostMeta>,
+    posts: HashMap<String, PostMeta>,
+    directives: HashMap<String, (DirectiveKind, String)>,
+    tools: HashMap<String, (String, bool)>,
+    jobs: HashMap<String, (String, String)>,
+    notes: HashMap<String, NoteMeta>,
+    thoughts: HashMap<String, ThoughtMeta>,
+    blog_entries: HashMap<String, BlogMeta>,
+    fact_tags: HashMap<String, Vec<String>>,
+    followers: HashSet<String>,
+}
+
+impl DerivedFlushSnapshot {
+    /// Write all derived predicate files.
+    pub fn write_all_predicates(&self, fact_dir: &Path) -> Result<(), DatalogError> {
+        for predicate in DerivedFactGenerator::arities().keys() {
+            self.write_predicate_file(fact_dir, predicate)?;
+        }
+        Ok(())
+    }
+
+    /// Write only the specified dirty predicates.
+    pub fn write_dirty_predicates(
+        &self,
+        fact_dir: &Path,
+        dirty: &HashSet<String>,
+    ) -> Result<(), DatalogError> {
+        for predicate in dirty {
+            self.write_predicate_file(fact_dir, predicate)?;
+        }
+        Ok(())
+    }
+
+    /// Write only the specified subset of predicates.
+    ///
+    /// Used for lazy regeneration - only writes predicates that are needed
+    /// for the current query, creating empty files for predicates that exist
+    /// but have no data.
+    pub fn write_predicates_subset(
+        &self,
+        fact_dir: &Path,
+        predicates: &HashSet<String>,
+    ) -> Result<(), DatalogError> {
+        for predicate in predicates {
+            // Only write if this is a known derived predicate
+            if DerivedFactGenerator::is_derived(predicate) {
+                self.write_predicate_file(fact_dir, predicate)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_predicate_file(&self, fact_dir: &Path, predicate: &str) -> Result<(), DatalogError> {
+        let path = fact_dir.join(format!("{}.facts", predicate));
+        let file = std::fs::File::create(&path)?;
+        let mut file = BufWriter::new(file);
+
+        match predicate {
+            // =================================================================
+            // Follows
+            // =================================================================
+            "follows" => {
+                for (rkey, meta) in &self.follows {
+                    writeln!(file, "{}\t{}\t{}", self.self_did, meta.target_did, rkey)?;
+                }
+            }
+            "follow_created_at" => {
+                for (rkey, meta) in &self.follows {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}",
+                        self.self_did,
+                        meta.target_did,
+                        meta.created_at.to_rfc3339(),
+                        rkey
+                    )?;
+                }
+            }
+            "is_followed_by" => {
+                for follower in &self.followers {
+                    writeln!(file, "{}\t{}", follower, self.self_did)?;
+                }
+            }
+
+            // =================================================================
+            // Likes
+            // =================================================================
+            "liked" => {
+                for (rkey, meta) in &self.likes {
+                    writeln!(file, "{}\t{}\t{}", self.self_did, meta.post_uri, rkey)?;
+                }
+            }
+            "like_created_at" => {
+                for (rkey, meta) in &self.likes {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}",
+                        self.self_did,
+                        meta.post_uri,
+                        meta.created_at.to_rfc3339(),
+                        rkey
+                    )?;
+                }
+            }
+            "like_cid" => {
+                for (rkey, meta) in &self.likes {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}",
+                        self.self_did, meta.post_uri, meta.post_cid, rkey
+                    )?;
+                }
+            }
+
+            // =================================================================
+            // Reposts
+            // =================================================================
+            "reposted" => {
+                for (rkey, meta) in &self.reposts {
+                    writeln!(file, "{}\t{}\t{}", self.self_did, meta.post_uri, rkey)?;
+                }
+            }
+            "repost_created_at" => {
+                for (rkey, meta) in &self.reposts {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}",
+                        self.self_did,
+                        meta.post_uri,
+                        meta.created_at.to_rfc3339(),
+                        rkey
+                    )?;
+                }
+            }
+            "repost_cid" => {
+                for (rkey, meta) in &self.reposts {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}",
+                        self.self_did, meta.post_uri, meta.post_cid, rkey
+                    )?;
+                }
+            }
+
+            // =================================================================
+            // Posts
+            // =================================================================
+            "posted" => {
+                for (rkey, meta) in &self.posts {
+                    writeln!(file, "{}\t{}\t{}", self.self_did, meta.uri, rkey)?;
+                }
+            }
+            "post_created_at" => {
+                for (rkey, meta) in &self.posts {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}",
+                        meta.uri,
+                        meta.created_at.to_rfc3339(),
+                        rkey
+                    )?;
+                }
+            }
+            "replied_to" | "reply_parent_uri" => {
+                for (rkey, meta) in &self.posts {
+                    if let Some(ref parent) = meta.reply_parent {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, parent, rkey)?;
+                    }
+                }
+            }
+            "reply_parent_cid" => {
+                for (rkey, meta) in &self.posts {
+                    if let Some(ref cid) = meta.reply_parent_cid {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, cid, rkey)?;
+                    }
+                }
+            }
+            "thread_root" | "reply_root_uri" => {
+                for (rkey, meta) in &self.posts {
+                    if let Some(ref root) = meta.reply_root {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, root, rkey)?;
+                    }
+                }
+            }
+            "reply_root_cid" => {
+                for (rkey, meta) in &self.posts {
+                    if let Some(ref cid) = meta.reply_root_cid {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, cid, rkey)?;
+                    }
+                }
+            }
+            "quoted" => {
+                for (rkey, meta) in &self.posts {
+                    if let Some(ref quoted) = meta.quote_uri {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, quoted, rkey)?;
+                    }
+                }
+            }
+            "quote_cid" => {
+                for (rkey, meta) in &self.posts {
+                    if let Some(ref cid) = meta.quote_cid {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, cid, rkey)?;
+                    }
+                }
+            }
+            "post_lang" => {
+                for (rkey, meta) in &self.posts {
+                    for lang in &meta.langs {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, lang, rkey)?;
+                    }
+                }
+            }
+            "post_mention" => {
+                for (rkey, meta) in &self.posts {
+                    for did in &meta.mentions {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, did, rkey)?;
+                    }
+                }
+            }
+            "post_link" => {
+                for (rkey, meta) in &self.posts {
+                    for link in &meta.links {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, link, rkey)?;
+                    }
+                }
+            }
+            "post_hashtag" => {
+                for (rkey, meta) in &self.posts {
+                    for tag in &meta.hashtags {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, tag, rkey)?;
+                    }
+                }
+            }
+
+            // =================================================================
+            // Directives
+            // =================================================================
+            "has_value" => {
+                for (rkey, (kind, content)) in &self.directives {
+                    if *kind == DirectiveKind::Value {
+                        writeln!(file, "{}\t{}", escape_tsv(content), rkey)?;
+                    }
+                }
+            }
+            "has_interest" => {
+                for (rkey, (kind, content)) in &self.directives {
+                    if *kind == DirectiveKind::Interest {
+                        writeln!(file, "{}\t{}", escape_tsv(content), rkey)?;
+                    }
+                }
+            }
+            "has_belief" => {
+                for (rkey, (kind, content)) in &self.directives {
+                    if *kind == DirectiveKind::Belief {
+                        writeln!(file, "{}\t{}", escape_tsv(content), rkey)?;
+                    }
+                }
+            }
+            "has_guideline" => {
+                for (rkey, (kind, content)) in &self.directives {
+                    if *kind == DirectiveKind::Guideline {
+                        writeln!(file, "{}\t{}", escape_tsv(content), rkey)?;
+                    }
+                }
+            }
+            "has_boundary" => {
+                for (rkey, (kind, content)) in &self.directives {
+                    if *kind == DirectiveKind::Boundary {
+                        writeln!(file, "{}\t{}", escape_tsv(content), rkey)?;
+                    }
+                }
+            }
+            "has_aspiration" => {
+                for (rkey, (kind, content)) in &self.directives {
+                    if *kind == DirectiveKind::Aspiration {
+                        writeln!(file, "{}\t{}", escape_tsv(content), rkey)?;
+                    }
+                }
+            }
+            "has_self_concept" => {
+                for (rkey, (kind, content)) in &self.directives {
+                    if *kind == DirectiveKind::SelfConcept {
+                        writeln!(file, "{}\t{}", escape_tsv(content), rkey)?;
+                    }
+                }
+            }
+
+            // =================================================================
+            // Tools and Jobs
+            // =================================================================
+            "has_tool" => {
+                for (rkey, (name, approved)) in &self.tools {
+                    writeln!(file, "{}\t{}\t{}", name, approved, rkey)?;
+                }
+            }
+            "has_job" => {
+                for (rkey, (name, schedule_type)) in &self.jobs {
+                    writeln!(file, "{}\t{}\t{}", name, schedule_type, rkey)?;
+                }
+            }
+
+            // =================================================================
+            // Notes
+            // =================================================================
+            "has_note" => {
+                for (rkey, meta) in &self.notes {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        meta.uri,
+                        escape_tsv(&meta.title),
+                        meta.category.as_deref().unwrap_or(""),
+                        meta.created_at.to_rfc3339(),
+                        meta.last_updated.to_rfc3339(),
+                        rkey
+                    )?;
+                }
+            }
+            "note_tag" => {
+                for (rkey, meta) in &self.notes {
+                    for tag in &meta.tags {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, tag, rkey)?;
+                    }
+                }
+            }
+            "note_related_fact" => {
+                for (rkey, meta) in &self.notes {
+                    for fact_uri in &meta.related_facts {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, fact_uri, rkey)?;
+                    }
+                }
+            }
+
+            // =================================================================
+            // Thoughts
+            // =================================================================
+            "has_thought" => {
+                for (rkey, meta) in &self.thoughts {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}\t{}",
+                        meta.uri,
+                        meta.kind,
+                        meta.trigger.as_deref().unwrap_or(""),
+                        meta.created_at.to_rfc3339(),
+                        rkey
+                    )?;
+                }
+            }
+            "thought_tag" => {
+                for (rkey, meta) in &self.thoughts {
+                    for tag in &meta.tags {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, tag, rkey)?;
+                    }
+                }
+            }
+            "tool_call_duration" => {
+                for (rkey, meta) in &self.thoughts {
+                    if let (Some(tool_name), Some(duration_ms)) =
+                        (&meta.tool_name, meta.duration_ms)
+                    {
+                        writeln!(
+                            file,
+                            "{}\t{}\t{}\t{}",
+                            meta.uri, tool_name, duration_ms, rkey
+                        )?;
+                    }
+                }
+            }
+
+            // =================================================================
+            // Blog entries
+            // =================================================================
+            "has_blog_post" => {
+                for (rkey, meta) in &self.blog_entries {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        meta.uri,
+                        escape_tsv(&meta.title),
+                        meta.whtwnd_url,
+                        meta.created_at,
+                        meta.is_draft,
+                        rkey
+                    )?;
+                }
+            }
+
+            // =================================================================
+            // Fact tags
+            // =================================================================
+            "fact_tag" => {
+                for (rkey, tags) in &self.fact_tags {
+                    let uri = format!("at://{}/diy.razorgirl.winter.fact/{}", self.self_did, rkey);
+                    for tag in tags {
+                        writeln!(file, "{}\t{}\t{}", uri, tag, rkey)?;
+                    }
+                }
+            }
+
+            _ => {
+                // Unknown predicate, create empty file
+                trace!(predicate, "unknown derived predicate, creating empty file");
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Statistics about derived facts.
@@ -1610,7 +2213,7 @@ pub struct DerivedFactStats {
 
 /// Escape tabs and newlines in a string for TSV output.
 fn escape_tsv(s: &str) -> String {
-    s.replace('\t', " ").replace('\n', " ")
+    s.replace(['\t', '\n'], " ")
 }
 
 /// Convert a DirectiveKind to its corresponding predicate name.
@@ -1674,7 +2277,11 @@ mod tests {
         make_thought_with_tags(kind, trigger, vec![])
     }
 
-    fn make_thought_with_tags(kind: ThoughtKind, trigger: Option<&str>, tags: Vec<&str>) -> Thought {
+    fn make_thought_with_tags(
+        kind: ThoughtKind,
+        trigger: Option<&str>,
+        tags: Vec<&str>,
+    ) -> Thought {
         Thought {
             kind,
             content: "test thought content".to_string(),
@@ -1985,10 +2592,7 @@ mod tests {
         let meta = generator.blog_entries.get("blog1").unwrap();
         assert_eq!(meta.title, "My Draft Post");
         assert!(meta.is_draft);
-        assert_eq!(
-            meta.uri,
-            "at://did:plc:winter/com.whtwnd.blog.entry/blog1"
-        );
+        assert_eq!(meta.uri, "at://did:plc:winter/com.whtwnd.blog.entry/blog1");
         assert_eq!(meta.whtwnd_url, "https://whtwnd.com/winter.test/blog1");
 
         // Verify dirty predicates
@@ -2333,8 +2937,7 @@ mod tests {
 
         dfg.flush_to_dir(dir.path()).unwrap();
 
-        let content =
-            std::fs::read_to_string(dir.path().join("tool_call_duration.facts")).unwrap();
+        let content = std::fs::read_to_string(dir.path().join("tool_call_duration.facts")).unwrap();
 
         // Only toolcall1 should appear (has duration)
         assert!(content.contains("at://did:plc:test/diy.razorgirl.winter.thought/toolcall1"));
@@ -2640,7 +3243,12 @@ mod tests {
 
         dfg.handle_update(&CacheUpdate::NoteCreated {
             rkey: "note2".to_string(),
-            note: make_note("Second Note", Some("cat2"), vec!["shared", "unique"], vec![]),
+            note: make_note(
+                "Second Note",
+                Some("cat2"),
+                vec!["shared", "unique"],
+                vec![],
+            ),
         });
 
         dfg.flush_to_dir(dir.path()).unwrap();
@@ -2957,7 +3565,13 @@ mod tests {
 
         dfg.handle_update(&CacheUpdate::PostCreated {
             rkey: "post1".to_string(),
-            post: make_post_with_facets("Check out https://example.com", None, None, facets, vec![]),
+            post: make_post_with_facets(
+                "Check out https://example.com",
+                None,
+                None,
+                facets,
+                vec![],
+            ),
         });
 
         dfg.flush_to_dir(dir.path()).unwrap();
@@ -3081,9 +3695,10 @@ mod tests {
 
         // Check quoted file (URI)
         let quoted = std::fs::read_to_string(dir.path().join("quoted.facts")).unwrap();
-        assert!(
-            quoted.contains(&format!("{}\tat://did:plc:other/app.bsky.feed.post/quoted", post_uri))
-        );
+        assert!(quoted.contains(&format!(
+            "{}\tat://did:plc:other/app.bsky.feed.post/quoted",
+            post_uri
+        )));
     }
 
     #[test]

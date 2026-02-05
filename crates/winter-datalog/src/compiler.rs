@@ -85,10 +85,10 @@ impl RuleCompiler {
 
             if let Some((name, arity)) = Self::parse_head(&rule.head) {
                 // Skip if already declared as an input predicate
-                if let Some(declared) = already_declared {
-                    if declared.contains(&name) {
-                        continue;
-                    }
+                if let Some(declared) = already_declared
+                    && declared.contains(&name)
+                {
+                    continue;
                 }
                 // Only insert if we haven't seen this predicate yet
                 predicates.entry(name).or_insert(arity);
@@ -159,6 +159,21 @@ impl RuleCompiler {
         };
 
         Some((name, arity))
+    }
+
+    /// Compile a single rule to Soufflé format with optional comment.
+    ///
+    /// Unlike `compile_rule`, this includes the rule name as a comment.
+    pub fn compile_single_rule(rule: &Rule) -> Result<String, DatalogError> {
+        let compiled = Self::compile_rule(rule)?;
+        if compiled.is_empty() {
+            return Ok(String::new());
+        }
+
+        Ok(format!(
+            "// {}: {}\n{}\n",
+            rule.name, rule.description, compiled
+        ))
     }
 
     /// Generate output declaration for a query predicate.
@@ -418,8 +433,9 @@ mod tests {
     #[test]
     fn test_parse_extra_rules_heads_with_constant() {
         // The key case: rule with constant argument in body
-        let heads =
-            RuleCompiler::parse_extra_rules_heads(r#"filtered(X) :- category(X, "protocol_design")."#);
+        let heads = RuleCompiler::parse_extra_rules_heads(
+            r#"filtered(X) :- category(X, "protocol_design")."#,
+        );
         assert_eq!(heads, vec![("filtered".to_string(), 1)]);
     }
 }

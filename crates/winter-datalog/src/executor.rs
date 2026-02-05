@@ -1,12 +1,19 @@
 //! Execute Soufflé queries.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use tokio::process::Command;
 use tracing::{debug, warn};
 
 use crate::DatalogError;
+
+/// Cached result of souffle availability check.
+/// 0 = unchecked, 1 = available, 2 = not available
+static SOUFFLE_AVAILABLE: AtomicU8 = AtomicU8::new(0);
+/// Lock to prevent concurrent availability checks.
+static SOUFFLE_CHECK_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Executes Soufflé datalog queries.
 pub struct SouffleExecutor {
@@ -29,8 +36,8 @@ impl SouffleExecutor {
 
     /// Execute a Soufflé program and return the output.
     pub async fn execute(&self, program: &str, fact_dir: &Path) -> Result<String, DatalogError> {
-        // Check if Soufflé is available
-        if !Self::is_souffle_available().await {
+        // Check if Soufflé is available (cached after first check)
+        if !Self::is_souffle_available_cached().await {
             return Err(DatalogError::SouffleNotFound);
         }
 
@@ -79,7 +86,59 @@ impl SouffleExecutor {
         }
     }
 
-    /// Check if Soufflé is available in PATH.
+    /// Check if Soufflé is available in PATH (cached).
+    ///
+    /// The result is cached after the first check to avoid spawning
+    /// a subprocess on every query execution.
+    async fn is_souffle_available_cached() -> bool {
+        // Fast path: already checked
+        match SOUFFLE_AVAILABLE.load(Ordering::Acquire) {
+            1 => return true,
+            2 => return false,
+            _ => {}
+        }
+
+        // Slow path: need to check (with lock to prevent concurrent checks)
+        loop {
+            if SOUFFLE_CHECK_IN_PROGRESS
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                break;
+            }
+            // Another task is checking, wait a bit and check result
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            // Check if result is now available
+            match SOUFFLE_AVAILABLE.load(Ordering::Acquire) {
+                1 => return true,
+                2 => return false,
+                _ => continue,
+            }
+        }
+
+        // We have the lock, double-check result wasn't set while we waited
+        match SOUFFLE_AVAILABLE.load(Ordering::Acquire) {
+            1 => {
+                SOUFFLE_CHECK_IN_PROGRESS.store(false, Ordering::Release);
+                return true;
+            }
+            2 => {
+                SOUFFLE_CHECK_IN_PROGRESS.store(false, Ordering::Release);
+                return false;
+            }
+            _ => {}
+        }
+
+        // Actually check
+        let available = Self::is_souffle_available().await;
+        SOUFFLE_AVAILABLE.store(if available { 1 } else { 2 }, Ordering::Release);
+        SOUFFLE_CHECK_IN_PROGRESS.store(false, Ordering::Release);
+
+        debug!(available, "cached souffle availability check");
+        available
+    }
+
+    /// Check if Soufflé is available in PATH (uncached).
     async fn is_souffle_available() -> bool {
         Command::new("which")
             .arg("souffle")
