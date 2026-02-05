@@ -5,11 +5,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use chrono::Utc;
-use tokio::sync::{RwLock, watch};
+use tokio::sync::{Notify, RwLock, watch};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-use winter_atproto::{AtprotoClient, JOB_COLLECTION, Tid};
+use winter_atproto::{AtUri, AtprotoClient, CacheUpdate, JOB_COLLECTION, RepoCache, Tid};
 
 use crate::{Job, JobSchedule, JobStatus, SchedulerError};
 
@@ -27,6 +27,7 @@ pub type JobExecutor =
 pub struct Scheduler {
     client: Arc<AtprotoClient>,
     jobs: Arc<RwLock<Vec<Job>>>,
+    wake: Arc<Notify>,
 }
 
 impl Scheduler {
@@ -35,7 +36,13 @@ impl Scheduler {
         Self {
             client,
             jobs: Arc::new(RwLock::new(Vec::new())),
+            wake: Arc::new(Notify::new()),
         }
+    }
+
+    /// Wake the scheduler immediately (e.g., when a job is triggered early).
+    pub fn wake(&self) {
+        self.wake.notify_one();
     }
 
     /// Load jobs from PDS.
@@ -49,12 +56,7 @@ impl Scheduler {
         let mut jobs = Vec::new();
         for record in records {
             // Parse rkey from URI
-            let rkey = record
-                .uri
-                .rsplit('/')
-                .next()
-                .unwrap_or(&record.uri)
-                .to_string();
+            let rkey = AtUri::extract_rkey(&record.uri).to_string();
 
             let job = Job {
                 rkey,
@@ -83,6 +85,93 @@ impl Scheduler {
         info!(count = jobs.len(), "loaded jobs from PDS");
         *self.jobs.write().await = jobs;
         Ok(())
+    }
+
+    /// Start listening for job updates from the RepoCache.
+    ///
+    /// This enables live updates to the scheduler when jobs are created, updated,
+    /// or deleted via MCP tools or other means. Without this, the scheduler only
+    /// knows about jobs loaded at startup.
+    pub fn start_update_listener(self: &Arc<Self>, repo_cache: Arc<RepoCache>) {
+        let mut rx = repo_cache.subscribe();
+        let scheduler = Arc::clone(self);
+
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(CacheUpdate::JobCreated { rkey, job }) => {
+                        let new_job = Self::convert_job(&rkey, &job);
+                        let mut jobs = scheduler.jobs.write().await;
+                        // Only add if not already present (avoid duplicates from initial load)
+                        if !jobs.iter().any(|j| j.rkey == rkey) {
+                            info!(rkey = %rkey, name = %job.name, "job created via firehose");
+                            jobs.push(new_job);
+                            drop(jobs); // Release lock before waking
+                            scheduler.wake();
+                        }
+                    }
+                    Ok(CacheUpdate::JobUpdated { rkey, job }) => {
+                        let updated_job = Self::convert_job(&rkey, &job);
+                        let mut jobs = scheduler.jobs.write().await;
+                        if let Some(existing) = jobs.iter_mut().find(|j| j.rkey == rkey) {
+                            info!(rkey = %rkey, name = %job.name, "job updated via firehose");
+                            *existing = updated_job;
+                        } else {
+                            // Job wasn't in our list, add it
+                            info!(rkey = %rkey, name = %job.name, "job added via firehose update");
+                            jobs.push(updated_job);
+                        }
+                        drop(jobs); // Release lock before waking
+                        scheduler.wake();
+                    }
+                    Ok(CacheUpdate::JobDeleted { rkey }) => {
+                        let mut jobs = scheduler.jobs.write().await;
+                        let len_before = jobs.len();
+                        jobs.retain(|j| j.rkey != rkey);
+                        if jobs.len() < len_before {
+                            info!(rkey = %rkey, "job deleted via firehose");
+                        }
+                    }
+                    Ok(_) => {
+                        // Other cache updates - ignore
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                        warn!(count, "scheduler missed cache updates, may need reload");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        debug!("cache update channel closed, stopping listener");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Convert an ATProto Job record to a scheduler Job.
+    fn convert_job(rkey: &str, record: &winter_atproto::Job) -> Job {
+        Job {
+            rkey: rkey.to_string(),
+            name: record.name.clone(),
+            instructions: record.instructions.clone(),
+            schedule: match &record.schedule {
+                winter_atproto::JobSchedule::Once { at } => JobSchedule::Once { at: *at },
+                winter_atproto::JobSchedule::Interval { seconds } => {
+                    JobSchedule::Interval { seconds: *seconds }
+                }
+            },
+            status: match &record.status {
+                winter_atproto::JobStatus::Pending => JobStatus::Pending,
+                winter_atproto::JobStatus::Running => JobStatus::Running,
+                winter_atproto::JobStatus::Completed => JobStatus::Completed,
+                winter_atproto::JobStatus::Failed { error } => JobStatus::Failed {
+                    error: error.clone(),
+                },
+            },
+            last_run: record.last_run,
+            next_run: record.next_run.unwrap_or_else(Utc::now),
+            failure_count: record.failure_count,
+            created_at: record.created_at,
+        }
     }
 
     /// Add a new job.
@@ -320,13 +409,18 @@ impl Scheduler {
         }
     }
 
-    /// Sleep until the next job is due.
+    /// Sleep until the next job is due OR wake is signaled.
     ///
     /// Returns immediately if a job is already due.
     /// Sleeps for at most MAX_SLEEP_SECS (60 seconds) before returning.
     pub async fn sleep_until_next_job(&self) {
         let duration = self.calculate_sleep_duration().await;
-        sleep(duration).await;
+        tokio::select! {
+            _ = sleep(duration) => {}
+            _ = self.wake.notified() => {
+                debug!("scheduler woken early");
+            }
+        }
     }
 
     /// Calculate how long to sleep until the next job is due.
