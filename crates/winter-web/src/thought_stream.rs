@@ -23,14 +23,14 @@ pub async fn subscribe_thoughts(
     let max_backoff = Duration::from_secs(60);
 
     loop {
-        match connect_and_stream(&firehose_url, &did, &thought_tx).await {
+        match connect_and_stream(&firehose_url, &did, &thought_tx, &mut backoff).await {
             Ok(()) => {
                 // Clean shutdown (shouldn't happen normally)
                 info!("thought subscription ended cleanly");
                 return;
             }
             Err(e) => {
-                error!(error = %e, "firehose connection error, reconnecting");
+                error!(error = %e, backoff_secs = backoff.as_secs(), "firehose connection error, reconnecting");
                 tokio::time::sleep(backoff).await;
                 backoff = std::cmp::min(backoff * 2, max_backoff);
             }
@@ -42,6 +42,7 @@ async fn connect_and_stream(
     firehose_url: &str,
     did: &str,
     thought_tx: &broadcast::Sender<String>,
+    backoff: &mut Duration,
 ) -> Result<(), String> {
     let url = format!("{}/xrpc/com.atproto.sync.subscribeRepos", firehose_url);
     info!(url = %url, did = %did, "connecting to firehose for thought stream");
@@ -54,6 +55,8 @@ async fn connect_and_stream(
     info!("thought stream connected to firehose");
 
     // Reset backoff on successful connect
+    *backoff = Duration::from_secs(1);
+
     loop {
         match read.next().await {
             Some(Ok(Message::Binary(data))) => {
@@ -141,6 +144,7 @@ async fn handle_message(
                                     "created_at": thought.created_at.to_rfc3339(),
                                     "trigger": thought.trigger,
                                     "duration_ms": thought.duration_ms,
+                                    "tags": thought.tags,
                                 });
 
                                 if let Err(e) = thought_tx.send(thought_json.to_string()) {

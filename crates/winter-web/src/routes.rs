@@ -8,20 +8,20 @@ use axum::{
     response::{Html, IntoResponse, Json, Redirect},
     routing::{get, post},
 };
+use axum_extra::extract::Form as HtmlForm;
 use chrono::Utc;
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::{RwLock, broadcast};
 use tower_http::services::ServeDir;
 use tracing::warn;
 
 use winter_atproto::{
-    AtprotoClient, CustomTool, DIRECTIVE_COLLECTION, Directive, DirectiveKind,
-    FACT_COLLECTION, FACT_DECLARATION_COLLECTION, Fact, FactDeclArg, FactDeclaration,
-    IDENTITY_COLLECTION, IDENTITY_KEY, Identity, JOB_COLLECTION, Job, JobSchedule, JobStatus,
-    NOTE_COLLECTION, Note, RULE_COLLECTION, Rule, SECRET_META_COLLECTION, SECRET_META_KEY,
-    SecretMeta, THOUGHT_COLLECTION, TOOL_APPROVAL_COLLECTION, TOOL_COLLECTION, Thought, Tid,
-    ToolApproval, ToolApprovalStatus,
+    AtprotoClient, CustomTool, DIRECTIVE_COLLECTION, Directive, DirectiveKind, FACT_COLLECTION,
+    FACT_DECLARATION_COLLECTION, Fact, FactDeclArg, FactDeclaration, IDENTITY_COLLECTION,
+    IDENTITY_KEY, Identity, JOB_COLLECTION, Job, JobSchedule, JobStatus, NOTE_COLLECTION, Note,
+    RULE_COLLECTION, Rule, SECRET_META_COLLECTION, SECRET_META_KEY, SecretMeta, THOUGHT_COLLECTION,
+    TOOL_APPROVAL_COLLECTION, TOOL_COLLECTION, Thought, Tid, ToolApproval, ToolApprovalStatus,
 };
 use winter_mcp::SecretManager;
 
@@ -208,11 +208,51 @@ async fn stream_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             .value
             .trigger
             .as_ref()
-            .map(|t| format!(r#"<div class="trigger">{}</div>"#, html_escape(t)))
+            .map(|t| {
+                format!(
+                    r#"<div class="trigger" data-trigger="{}">{}</div>"#,
+                    html_escape(t),
+                    html_escape(t)
+                )
+            })
             .unwrap_or_default();
 
+        let tags_html = if item.value.tags.is_empty() {
+            String::new()
+        } else {
+            let tags: Vec<String> = item
+                .value
+                .tags
+                .iter()
+                .map(|t| {
+                    format!(
+                        r#"<span class="tag" data-tag="{}">{}</span>"#,
+                        html_escape(t),
+                        html_escape(t)
+                    )
+                })
+                .collect();
+            format!(r#"<div class="tags">{}</div>"#, tags.join(""))
+        };
+
+        // Escape trigger for data attribute
+        let trigger_attr = item
+            .value
+            .trigger
+            .as_ref()
+            .map(|t| format!(r#" data-trigger="{}""#, html_escape(t)))
+            .unwrap_or_default();
+
+        // Escape tags for data attribute (JSON array)
+        let tags_attr = if item.value.tags.is_empty() {
+            String::new()
+        } else {
+            let tags_json = serde_json::to_string(&item.value.tags).unwrap_or_default();
+            format!(r#" data-tags="{}""#, html_escape(&tags_json))
+        };
+
         thought_html.push_str(&format!(
-            r#"<div class="thought {kind}">
+            r#"<div class="thought {kind}"{trigger_attr}{tags_attr}>
                 <div class="thought-header">
                     <span class="kind">{kind_display}</span>
                     <span class="time" title="{abs_time}">{rel_time}{duration_html}</span>
@@ -220,6 +260,7 @@ async fn stream_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 <div class="content">{content}</div>
                 <button class="expand-btn">Expand</button>
                 {trigger_html}
+                {tags_html}
             </div>"#,
         ));
     }
@@ -237,7 +278,32 @@ fn format_thought_content(kind: &str, content: &str) -> String {
 }
 
 /// Format tool call content with syntax highlighting.
+///
+/// Handles three formats:
+/// 1. JSON format (new): `{"tool":"name","args":{...},"result":{...},"summary":"..."}`
+/// 2. Text format (previous): "Called tool_name\nArgs:\n{...}\nResult: ..."
+/// 3. Legacy format: "Called tool_name [args] - FAILED"
 fn format_tool_call_content(content: &str) -> String {
+    // Try parsing as JSON first (new format)
+    let trimmed = content.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(json) => return format_tool_call_json(&json),
+            Err(e) => {
+                // Log the error for debugging
+                tracing::warn!(error = %e, content_len = trimmed.len(), "Failed to parse tool call JSON");
+                // Try a simple regex fallback to at least show the tool name
+                if let Some(tool_match) = extract_json_field(trimmed, "tool") {
+                    return format!(
+                        r#"<div class="tool-header"><span class="tool-name">{}</span></div><pre class="tool-json">{}</pre>"#,
+                        html_escape(&tool_match),
+                        syntax_highlight_json(&html_escape(trimmed))
+                    );
+                }
+            }
+        }
+    }
+
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() {
         return html_escape(content);
@@ -245,11 +311,11 @@ fn format_tool_call_content(content: &str) -> String {
 
     let first_line = lines[0];
 
-    // New format: "Called tool_name" or "Called tool_name - FAILED" on first line
+    // Text format: "Called tool_name" or "Called tool_name - FAILED" on first line
     if first_line.starts_with("Called ") && !first_line.contains('[') {
         let rest = &first_line[7..]; // Skip "Called "
-        let (tool_name, failed) = if rest.ends_with(" - FAILED") {
-            (&rest[..rest.len() - 9], true)
+        let (tool_name, failed) = if let Some(stripped) = rest.strip_suffix(" - FAILED") {
+            (stripped, true)
         } else {
             (rest, false)
         };
@@ -268,15 +334,25 @@ fn format_tool_call_content(content: &str) -> String {
         let mut current_content = String::new();
 
         for line in lines.iter().skip(1) {
-            if *line == "Args:" || *line == "Result:" {
+            if *line == "Args:"
+                || *line == "Result:"
+                || *line == "Error:"
+                || line.starts_with("Result: ")
+            {
                 // Flush previous section
-                if let Some(section) = current_section {
-                    if !current_content.is_empty() {
-                        html.push_str(&format_tool_section(section, &current_content));
-                    }
+                if let Some(section) = current_section
+                    && !current_content.is_empty()
+                {
+                    html.push_str(&format_tool_section(section, &current_content));
                 }
-                current_section = Some(line.trim_end_matches(':'));
-                current_content.clear();
+                if let Some(result_content) = line.strip_prefix("Result: ") {
+                    // Inline result (summary format)
+                    current_section = Some("Result");
+                    current_content = result_content.to_string();
+                } else {
+                    current_section = Some(line.trim_end_matches(':'));
+                    current_content.clear();
+                }
             } else if current_section.is_some() {
                 if !current_content.is_empty() {
                     current_content.push('\n');
@@ -286,16 +362,16 @@ fn format_tool_call_content(content: &str) -> String {
         }
 
         // Flush final section
-        if let Some(section) = current_section {
-            if !current_content.is_empty() {
-                html.push_str(&format_tool_section(section, &current_content));
-            }
+        if let Some(section) = current_section
+            && !current_content.is_empty()
+        {
+            html.push_str(&format_tool_section(section, &current_content));
         }
 
         return html;
     }
 
-    // Fallback for old format: "Called tool_name [args] - FAILED" or "Called tool_name [args]"
+    // Legacy format: "Called tool_name [args] - FAILED" or "Called tool_name [args]"
     if let Some(rest) = content.strip_prefix("Called ") {
         let parts: Vec<&str> = rest.splitn(2, ' ').collect();
         if let Some(tool_name) = parts.first() {
@@ -305,22 +381,21 @@ fn format_tool_call_content(content: &str) -> String {
                 html_escape(tool_name)
             );
 
-            if let Some(remainder) = parts.get(1) {
-                if let (Some(args_start), Some(args_end)) =
+            if let Some(remainder) = parts.get(1)
+                && let (Some(args_start), Some(args_end)) =
                     (remainder.find('['), remainder.rfind(']'))
-                {
-                    let args = &remainder[args_start + 1..args_end];
-                    if !args.is_empty() {
-                        html.push_str(&format!(
-                            r#" <span class="tool-args">{}</span>"#,
-                            html_escape(args)
-                        ));
-                    }
+            {
+                let args = &remainder[args_start + 1..args_end];
+                if !args.is_empty() {
+                    html.push_str(&format!(
+                        r#" <span class="tool-args">{}</span>"#,
+                        html_escape(args)
+                    ));
+                }
 
-                    let after_args = &remainder[args_end + 1..];
-                    if after_args.contains("FAILED") {
-                        html.push_str(r#" <span class="tool-failed">FAILED</span>"#);
-                    }
+                let after_args = &remainder[args_end + 1..];
+                if after_args.contains("FAILED") {
+                    html.push_str(r#" <span class="tool-failed">FAILED</span>"#);
                 }
             }
             return html;
@@ -330,8 +405,101 @@ fn format_tool_call_content(content: &str) -> String {
     html_escape(content)
 }
 
+/// Format tool call from JSON structure.
+fn format_tool_call_json(json: &serde_json::Value) -> String {
+    let tool_name = json
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let failed = json
+        .get("failed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut html = String::from(r#"<div class="tool-header">"#);
+
+    // Link at the top (if present)
+    if let Some(link) = json.get("link").and_then(|v| v.as_str()) {
+        html.push_str(&format!(
+            r#"<a href="{}" class="tool-link-btn">View →</a>"#,
+            html_escape(link)
+        ));
+    }
+
+    html.push_str(&format!(
+        r#"<span class="tool-name">{}</span>"#,
+        html_escape(tool_name)
+    ));
+    if failed {
+        html.push_str(r#" <span class="tool-failed">FAILED</span>"#);
+    }
+    html.push_str("</div>");
+
+    // Error section (for failed calls)
+    if let Some(error) = json.get("error").and_then(|v| v.as_str()) {
+        html.push_str(&format!(
+            r#"<div class="tool-error">{}</div>"#,
+            html_escape(error)
+        ));
+    }
+
+    // Summary (quick view)
+    if let Some(summary) = json.get("summary").and_then(|v| v.as_str()) {
+        // Remove the "View: ..." line from summary since we show link separately
+        let clean_summary: String = summary
+            .lines()
+            .filter(|line| !line.starts_with("View:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !clean_summary.is_empty() {
+            html.push_str(&format!(
+                r#"<div class="tool-summary">{}</div>"#,
+                html_escape(&clean_summary)
+            ));
+        }
+    }
+
+    // Args section
+    if let Some(args) = json.get("args")
+        && let Ok(args_json) = serde_json::to_string_pretty(args)
+    {
+        html.push_str(&format_tool_section("Args", &args_json));
+    }
+
+    // Result section (collapsible, starts closed for large results)
+    if let Some(result) = json.get("result")
+        && let Ok(result_json) = serde_json::to_string_pretty(result)
+    {
+        // Use closed details for results to avoid cluttering the UI
+        html.push_str(&format!(
+            r#"<details class="tool-section"><summary class="tool-section-header">Result</summary><pre class="tool-json">{}</pre></details>"#,
+            syntax_highlight_json(&html_escape(&result_json))
+        ));
+    }
+
+    html
+}
+
+/// Extract a simple string field from JSON using regex (fallback when parsing fails).
+fn extract_json_field(json_str: &str, field: &str) -> Option<String> {
+    use regex::Regex;
+    // Match "field":"value" pattern
+    let pattern = format!(
+        r#""{}"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)""#,
+        regex::escape(field)
+    );
+    Regex::new(&pattern)
+        .ok()
+        .and_then(|re| re.captures(json_str))
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
 /// Format a tool section (Args or Result) with JSON syntax highlighting.
 fn format_tool_section(section_name: &str, content: &str) -> String {
+    if section_name == "Error" {
+        return format!(r#"<div class="tool-error">{}</div>"#, html_escape(content));
+    }
     format!(
         r#"<details class="tool-section" open><summary class="tool-section-header">{}</summary><pre class="tool-json">{}</pre></details>"#,
         section_name,
@@ -407,6 +575,47 @@ fn format_relative_time(dt: chrono::DateTime<chrono::Utc>) -> String {
     }
     if days < 7 {
         return format!("{} days ago", days);
+    }
+
+    // Fall back to date
+    dt.format("%b %d").to_string()
+}
+
+/// Format a future timestamp as relative time (e.g., "in 5 minutes").
+fn format_relative_future_time(dt: chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    let diff = dt.signed_duration_since(now);
+
+    let seconds = diff.num_seconds();
+    if seconds < 0 {
+        return "now".to_string(); // Already past
+    }
+    if seconds < 60 {
+        return "in a few seconds".to_string();
+    }
+
+    let minutes = diff.num_minutes();
+    if minutes == 1 {
+        return "in 1 minute".to_string();
+    }
+    if minutes < 60 {
+        return format!("in {} minutes", minutes);
+    }
+
+    let hours = diff.num_hours();
+    if hours == 1 {
+        return "in 1 hour".to_string();
+    }
+    if hours < 24 {
+        return format!("in {} hours", hours);
+    }
+
+    let days = diff.num_days();
+    if days == 1 {
+        return "tomorrow".to_string();
+    }
+    if days < 7 {
+        return format!("in {} days", days);
     }
 
     // Fall back to date
@@ -751,7 +960,7 @@ async fn jobs_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             status,
             item.value
                 .next_run
-                .map(|dt| dt.to_rfc3339())
+                .map(format_relative_future_time)
                 .unwrap_or_else(|| "-".to_string())
         ));
     }
@@ -808,7 +1017,7 @@ async fn job_detail(
             .replace(
                 "<!-- NEXT_RUN -->",
                 &job.next_run
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                    .map(format_relative_future_time)
                     .unwrap_or_else(|| "-".to_string()),
             )
             .replace("<!-- FAILURE_COUNT -->", &job.failure_count.to_string())
@@ -1605,7 +1814,10 @@ async fn declaration_detail(
             .replace("<!-- PREDICATE -->", &html_escape(&declaration.predicate))
             .replace("<!-- ARGS_TABLE -->", &args_html)
             .replace("<!-- ARG_COUNT -->", &declaration.args.len().to_string())
-            .replace("<!-- DESCRIPTION -->", &html_escape(&declaration.description))
+            .replace(
+                "<!-- DESCRIPTION -->",
+                &html_escape(&declaration.description),
+            )
             .replace("<!-- TAGS -->", &tags_html)
             .replace(
                 "<!-- CREATED_AT -->",
@@ -1651,7 +1863,8 @@ async fn declaration_edit(
     };
 
     // Serialize args to JSON for the form
-    let args_json = serde_json::to_string_pretty(&declaration.args).unwrap_or_else(|_| "[]".to_string());
+    let args_json =
+        serde_json::to_string_pretty(&declaration.args).unwrap_or_else(|_| "[]".to_string());
 
     Html(
         DECLARATION_FORM_HTML
@@ -1660,7 +1873,10 @@ async fn declaration_edit(
             .replace("<!-- RKEY -->", &rkey)
             .replace("<!-- PREDICATE -->", &html_escape(&declaration.predicate))
             .replace("<!-- ARGS_JSON -->", &html_escape(&args_json))
-            .replace("<!-- DESCRIPTION -->", &html_escape(&declaration.description))
+            .replace(
+                "<!-- DESCRIPTION -->",
+                &html_escape(&declaration.description),
+            )
             .replace("<!-- TAGS -->", &declaration.tags.join(", ")),
     )
 }
@@ -2201,7 +2417,7 @@ const STREAM_HTML: &str = r#"<!DOCTYPE html>
             word-wrap: break-word;
             overflow-wrap: break-word;
             white-space: pre-wrap;
-            max-height: 200px;
+            max-height: 350px;
             overflow: hidden;
             position: relative;
         }
@@ -2237,6 +2453,8 @@ const STREAM_HTML: &str = r#"<!DOCTYPE html>
             padding: 0.5rem 0.75rem;
             border-radius: 3px;
             margin-top: 0.5rem;
+            overflow: visible;
+            max-height: none;
         }
         .tool-header {
             margin-bottom: 0.5rem;
@@ -2279,15 +2497,106 @@ const STREAM_HTML: &str = r#"<!DOCTYPE html>
         .json-string { color: #a3be8c; }
         .json-number { color: #d08770; }
         .json-keyword { color: #b48ead; }
+        .tool-summary {
+            color: #d8dee9;
+            font-size: 0.9rem;
+            margin: 0.5rem 0;
+            padding: 0.5rem;
+            background: #1e222a;
+            border-radius: 3px;
+            border-left: 3px solid #81a1c1;
+        }
+        .tool-error {
+            color: #bf616a;
+            background: #2e2226;
+            padding: 0.5rem 0.75rem;
+            border-radius: 3px;
+            margin: 0.5rem 0;
+            border-left: 3px solid #bf616a;
+        }
+        .tool-link-btn {
+            float: right;
+            padding: 0.25rem 0.5rem;
+            background: #5e81ac;
+            color: #fff;
+            text-decoration: none;
+            font-size: 0.75rem;
+            border-radius: 3px;
+            margin-left: 0.5rem;
+        }
+        .tool-link-btn:hover {
+            background: #81a1c1;
+            text-decoration: none;
+        }
         .trigger {
             font-size: 0.8rem;
             color: #888;
             margin-top: 0.5rem;
             font-style: italic;
+            cursor: pointer;
+        }
+        .trigger:hover {
+            color: #81a1c1;
         }
         .trigger::before {
             content: "↳ ";
             color: #666;
+        }
+        .tags {
+            margin-top: 0.5rem;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.25rem;
+        }
+        .tag {
+            font-size: 0.7rem;
+            padding: 0.15rem 0.4rem;
+            background: #3b4252;
+            border-radius: 3px;
+            color: #88c0d0;
+            cursor: pointer;
+        }
+        .tag:hover {
+            background: #4c566a;
+            color: #8fbcbb;
+        }
+        .active-filter {
+            margin: 0.5rem 0;
+            padding: 0.5rem 0.75rem;
+            background: #3b4252;
+            border-radius: 4px;
+            display: none;
+            align-items: center;
+            gap: 0.5rem;
+            font-size: 0.9rem;
+        }
+        .active-filter.visible {
+            display: flex;
+        }
+        .active-filter-label {
+            color: #888;
+        }
+        .active-filter-value {
+            color: #88c0d0;
+            font-family: "SF Mono", "Menlo", "Monaco", monospace;
+            font-size: 0.85rem;
+            max-width: 400px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .clear-filter-btn {
+            margin-left: auto;
+            padding: 0.2rem 0.5rem;
+            background: #4c566a;
+            border: none;
+            border-radius: 3px;
+            color: #e0e0e0;
+            cursor: pointer;
+            font-size: 0.8rem;
+        }
+        .clear-filter-btn:hover {
+            background: #5e81ac;
         }
         .duration {
             font-size: 0.75rem;
@@ -2354,6 +2663,12 @@ const STREAM_HTML: &str = r#"<!DOCTYPE html>
         <button class="filter-btn tool_call" data-kind="tool_call">Tool Call</button>
         <button class="filter-btn error" data-kind="error">Error</button>
     </div>
+    <div id="active-filter" class="active-filter">
+        <span class="active-filter-label">Filtering by</span>
+        <span id="active-filter-type"></span>
+        <span id="active-filter-value" class="active-filter-value"></span>
+        <button id="clear-filter" class="clear-filter-btn">Clear</button>
+    </div>
     <div id="stream"><!-- THOUGHTS --></div>
     <div id="modal-overlay" class="modal-overlay">
         <div class="modal">
@@ -2367,25 +2682,107 @@ const STREAM_HTML: &str = r#"<!DOCTYPE html>
     <script>
         const stream = document.getElementById('stream');
         const filterBtns = document.querySelectorAll('.filter-btn');
-        let activeFilter = 'all';
+        const activeFilterEl = document.getElementById('active-filter');
+        const activeFilterType = document.getElementById('active-filter-type');
+        const activeFilterValue = document.getElementById('active-filter-value');
+        const clearFilterBtn = document.getElementById('clear-filter');
+
+        let activeKindFilter = 'all';
+        let filterTrigger = null;
+        let filterTag = null;
+
+        // Initialize from URL params
+        function initFromUrl() {
+            const params = new URLSearchParams(window.location.search);
+            filterTrigger = params.get('trigger');
+            filterTag = params.get('tag');
+            const kind = params.get('kind');
+            if (kind && ['insight','question','plan','reflection','error','response','tool_call'].includes(kind)) {
+                activeKindFilter = kind;
+                filterBtns.forEach(b => {
+                    b.classList.toggle('active', b.dataset.kind === kind);
+                });
+            }
+            updateFilterIndicator();
+            applyFilter();
+        }
+
+        // Update URL to reflect current filter state
+        function updateUrl() {
+            const params = new URLSearchParams();
+            if (activeKindFilter !== 'all') params.set('kind', activeKindFilter);
+            if (filterTrigger) params.set('trigger', filterTrigger);
+            if (filterTag) params.set('tag', filterTag);
+            const newUrl = params.toString() ? '?' + params.toString() : window.location.pathname;
+            history.pushState({}, '', newUrl);
+        }
+
+        // Update the filter indicator bar
+        function updateFilterIndicator() {
+            if (filterTrigger || filterTag) {
+                activeFilterEl.classList.add('visible');
+                if (filterTrigger) {
+                    activeFilterType.textContent = 'trigger:';
+                    activeFilterValue.textContent = filterTrigger;
+                    activeFilterValue.title = filterTrigger;
+                } else {
+                    activeFilterType.textContent = 'tag:';
+                    activeFilterValue.textContent = filterTag;
+                    activeFilterValue.title = filterTag;
+                }
+            } else {
+                activeFilterEl.classList.remove('visible');
+            }
+        }
+
+        // Clear trigger/tag filter
+        function clearTriggerTagFilter() {
+            filterTrigger = null;
+            filterTag = null;
+            updateFilterIndicator();
+            updateUrl();
+            applyFilter();
+        }
+
+        clearFilterBtn.addEventListener('click', clearTriggerTagFilter);
 
         // Filter button handling
         filterBtns.forEach(btn => {
             btn.addEventListener('click', () => {
                 filterBtns.forEach(b => b.classList.remove('active'));
                 btn.classList.add('active');
-                activeFilter = btn.dataset.kind;
+                activeKindFilter = btn.dataset.kind;
+                updateUrl();
                 applyFilter();
             });
         });
 
         function applyFilter() {
             document.querySelectorAll('.thought').forEach(thought => {
-                if (activeFilter === 'all' || thought.classList.contains(activeFilter)) {
-                    thought.classList.remove('hidden');
-                } else {
-                    thought.classList.add('hidden');
+                let visible = true;
+
+                // Kind filter
+                if (activeKindFilter !== 'all' && !thought.classList.contains(activeKindFilter)) {
+                    visible = false;
                 }
+
+                // Trigger filter (prefix match)
+                if (visible && filterTrigger) {
+                    const thoughtTrigger = thought.dataset.trigger || '';
+                    if (!thoughtTrigger.startsWith(filterTrigger)) {
+                        visible = false;
+                    }
+                }
+
+                // Tag filter (exact match)
+                if (visible && filterTag) {
+                    const thoughtTags = thought.dataset.tags ? JSON.parse(thought.dataset.tags) : [];
+                    if (!thoughtTags.includes(filterTag)) {
+                        visible = false;
+                    }
+                }
+
+                thought.classList.toggle('hidden', !visible);
             });
         }
 
@@ -2409,9 +2806,22 @@ const STREAM_HTML: &str = r#"<!DOCTYPE html>
         }
 
         // Format tool call content for better readability
+        // Handles three formats:
+        // 1. JSON format: {"tool":"name","args":{...},"result":{...},"summary":"..."}
+        // 2. Text format: "Called tool_name\nArgs:\n{json}\nResult:\n{json}"
+        // 3. Legacy format: "Called tool_name [args]"
         function formatToolCallContent(content) {
-            // New format: "Called tool_name\nArgs:\n{json}\nResult:\n{json}"
-            // or: "Called tool_name - FAILED\nArgs:\n{json}\nResult:\n{json}"
+            // Try parsing as JSON first (newest format)
+            if (content.startsWith('{')) {
+                try {
+                    const data = JSON.parse(content);
+                    return formatToolCallJson(data);
+                } catch (e) {
+                    // Not valid JSON, fall through to text parsing
+                }
+            }
+
+            // Text format: "Called tool_name" on first line
             const lines = content.split('\n');
             if (lines.length === 0) return escapeHtml(content);
 
@@ -2435,13 +2845,19 @@ const STREAM_HTML: &str = r#"<!DOCTYPE html>
 
                 for (let i = 1; i < lines.length; i++) {
                     const line = lines[i];
-                    if (line === 'Args:' || line === 'Result:') {
+                    if (line === 'Args:' || line === 'Result:' || line === 'Error:' || line.startsWith('Result: ')) {
                         // Flush previous section
                         if (currentSection && currentContent.length > 0) {
                             html += formatToolSection(currentSection, currentContent.join('\n'));
                         }
-                        currentSection = line.replace(':', '');
-                        currentContent = [];
+                        if (line.startsWith('Result: ')) {
+                            // Inline summary result
+                            currentSection = 'Result';
+                            currentContent = [line.substring(8)];
+                        } else {
+                            currentSection = line.replace(':', '');
+                            currentContent = [];
+                        }
                     } else {
                         currentContent.push(line);
                     }
@@ -2455,7 +2871,7 @@ const STREAM_HTML: &str = r#"<!DOCTYPE html>
                 return html;
             }
 
-            // Fallback for old format: "Called tool_name [args]"
+            // Legacy format: "Called tool_name [args]"
             const oldMatch = content.match(/^Called\s+(\w+)\s*\[(.*)\](\s*-\s*FAILED)?$/);
             if (oldMatch) {
                 const toolName = oldMatch[1];
@@ -2473,8 +2889,58 @@ const STREAM_HTML: &str = r#"<!DOCTYPE html>
             return escapeHtml(content);
         }
 
-        // Format a tool section (Args or Result) with JSON syntax highlighting
+        // Format tool call from JSON structure
+        function formatToolCallJson(data) {
+            const toolName = data.tool || 'unknown';
+            const failed = data.failed || false;
+
+            let html = '<div class="tool-header">';
+
+            // Link at the top (if present)
+            if (data.link) {
+                html += '<a href="' + escapeHtml(data.link) + '" class="tool-link-btn">View →</a>';
+            }
+
+            html += '<span class="tool-name">' + escapeHtml(toolName) + '</span>';
+            if (failed) {
+                html += ' <span class="tool-failed">FAILED</span>';
+            }
+            html += '</div>';
+
+            // Error section (for failed calls)
+            if (data.error) {
+                html += '<div class="tool-error">' + escapeHtml(data.error) + '</div>';
+            }
+
+            // Summary (quick view) - remove "View:" line since we show link separately
+            if (data.summary) {
+                const cleanSummary = data.summary.split('\n').filter(line => !line.startsWith('View:')).join('\n');
+                if (cleanSummary) {
+                    html += '<div class="tool-summary">' + escapeHtml(cleanSummary) + '</div>';
+                }
+            }
+
+            // Args section
+            if (data.args) {
+                html += formatToolSection('Args', JSON.stringify(data.args, null, 2));
+            }
+
+            // Result section (collapsed by default for JSON format)
+            if (data.result) {
+                html += '<details class="tool-section">';
+                html += '<summary class="tool-section-header">Result</summary>';
+                html += '<pre class="tool-json">' + syntaxHighlightJson(JSON.stringify(data.result, null, 2)) + '</pre>';
+                html += '</details>';
+            }
+
+            return html;
+        }
+
+        // Format a tool section (Args or Result or Error) with JSON syntax highlighting
         function formatToolSection(sectionName, content) {
+            if (sectionName === 'Error') {
+                return '<div class="tool-error">' + escapeHtml(content) + '</div>';
+            }
             let html = '<details class="tool-section" open>';
             html += '<summary class="tool-section-header">' + sectionName + '</summary>';
             html += '<pre class="tool-json">' + syntaxHighlightJson(content) + '</pre>';
@@ -2527,7 +2993,14 @@ const STREAM_HTML: &str = r#"<!DOCTYPE html>
             html += '<div class="content">' + content + '</div>';
             html += '<button class="expand-btn">Expand</button>';
             if (thought.trigger) {
-                html += '<div class="trigger">' + escapeHtml(thought.trigger) + '</div>';
+                html += '<div class="trigger" data-trigger="' + escapeHtml(thought.trigger) + '">' + escapeHtml(thought.trigger) + '</div>';
+            }
+            if (thought.tags && thought.tags.length > 0) {
+                html += '<div class="tags">';
+                thought.tags.forEach(tag => {
+                    html += '<span class="tag" data-tag="' + escapeHtml(tag) + '">' + escapeHtml(tag) + '</span>';
+                });
+                html += '</div>';
             }
             return html;
         }
@@ -2535,15 +3008,40 @@ const STREAM_HTML: &str = r#"<!DOCTYPE html>
         const eventSource = new EventSource('/api/thoughts/sse');
 
         eventSource.onmessage = function(event) {
-            const thought = JSON.parse(event.data);
-            const div = document.createElement('div');
-            const hidden = activeFilter !== 'all' && thought.kind !== activeFilter ? ' hidden' : '';
-            div.className = 'thought ' + thought.kind + hidden;
-            div.innerHTML = buildThoughtHtml(thought);
-            stream.prepend(div);
-            // Check truncation for the new thought
-            const contentEl = div.querySelector('.content');
-            if (contentEl) checkTruncation(contentEl);
+            try {
+                const thought = JSON.parse(event.data);
+                const div = document.createElement('div');
+                div.className = 'thought ' + thought.kind;
+                if (thought.trigger) {
+                    div.dataset.trigger = thought.trigger;
+                }
+                if (thought.tags && thought.tags.length > 0) {
+                    div.dataset.tags = JSON.stringify(thought.tags);
+                }
+                div.innerHTML = buildThoughtHtml(thought);
+
+                // Check if this thought should be hidden based on current filters
+                let visible = true;
+                if (activeKindFilter !== 'all' && thought.kind !== activeKindFilter) {
+                    visible = false;
+                }
+                if (visible && filterTrigger && (!thought.trigger || !thought.trigger.startsWith(filterTrigger))) {
+                    visible = false;
+                }
+                if (visible && filterTag && (!thought.tags || !thought.tags.includes(filterTag))) {
+                    visible = false;
+                }
+                if (!visible) {
+                    div.classList.add('hidden');
+                }
+
+                stream.prepend(div);
+                // Check truncation for the new thought
+                const contentEl = div.querySelector('.content');
+                if (contentEl) checkTruncation(contentEl);
+            } catch (e) {
+                console.error('Failed to parse thought:', e, event.data);
+            }
         };
 
         eventSource.onerror = function() {
@@ -2597,10 +3095,22 @@ const STREAM_HTML: &str = r#"<!DOCTYPE html>
             modalOverlay.classList.remove('visible');
         }
 
-        // Click expand button to open modal
+        // Click expand button to open modal, or trigger/tag to filter
         document.addEventListener('click', (e) => {
             if (e.target.classList.contains('expand-btn')) {
                 openModal(e.target.closest('.thought'));
+            } else if (e.target.classList.contains('trigger') && e.target.dataset.trigger) {
+                filterTrigger = e.target.dataset.trigger;
+                filterTag = null;
+                updateFilterIndicator();
+                updateUrl();
+                applyFilter();
+            } else if (e.target.classList.contains('tag') && e.target.dataset.tag) {
+                filterTag = e.target.dataset.tag;
+                filterTrigger = null;
+                updateFilterIndicator();
+                updateUrl();
+                applyFilter();
             }
         });
 
@@ -2615,6 +3125,9 @@ const STREAM_HTML: &str = r#"<!DOCTYPE html>
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') closeModal();
         });
+
+        // Initialize filters from URL on page load
+        initFromUrl();
     </script>
 </body>
 </html>"#;
@@ -3169,28 +3682,9 @@ async fn tool_detail(
     )
 }
 
-/// Deserialize a form field that may be a single string or a vec of strings.
-/// HTML forms submit a single value as a string, multiple as repeated keys.
-fn string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum StringOrVec {
-        String(String),
-        Vec(Vec<String>),
-    }
-
-    match StringOrVec::deserialize(deserializer)? {
-        StringOrVec::String(s) => Ok(vec![s]),
-        StringOrVec::Vec(v) => Ok(v),
-    }
-}
-
 #[derive(Deserialize)]
 struct ApprovalForm {
-    #[serde(default, deserialize_with = "string_or_vec")]
+    #[serde(default)]
     secrets: Vec<String>,
     #[serde(default)]
     allow_network: Option<String>,
@@ -3200,7 +3694,7 @@ struct ApprovalForm {
     allow_workspace_read: Option<String>,
     #[serde(default)]
     allow_workspace_write: Option<String>,
-    #[serde(default, deserialize_with = "string_or_vec")]
+    #[serde(default)]
     commands: Vec<String>,
     reason: Option<String>,
 }
@@ -3208,7 +3702,7 @@ struct ApprovalForm {
 async fn approve_tool(
     State(state): State<Arc<AppState>>,
     Path(rkey): Path<String>,
-    Form(form): Form<ApprovalForm>,
+    HtmlForm(form): HtmlForm<ApprovalForm>,
 ) -> impl IntoResponse {
     // Get the tool to verify it exists and get version
     let tool = match state
@@ -3259,7 +3753,7 @@ async fn approve_tool(
 async fn deny_tool(
     State(state): State<Arc<AppState>>,
     Path(rkey): Path<String>,
-    Form(form): Form<ApprovalForm>,
+    HtmlForm(form): HtmlForm<ApprovalForm>,
 ) -> impl IntoResponse {
     let tool = match state
         .client
@@ -4830,3 +5324,99 @@ const DECLARATION_FORM_HTML: &str = r#"<!DOCTYPE html>
     </form>
 </body>
 </html>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_tool_call_json_parses() {
+        let json_str = r#"{"tool":"create_fact","args":{"args":["self","test"],"predicate":"capability"},"result":{"rkey":"abc123","predicate":"capability"},"summary":"rkey=abc123, predicate=capability\nView: http://localhost:8080/facts/abc123","link":"http://localhost:8080/facts/abc123"}"#;
+
+        let result = format_tool_call_content(json_str);
+
+        // Should NOT return escaped JSON
+        assert!(
+            !result.starts_with("{"),
+            "Should not return raw JSON: {}",
+            result
+        );
+        // Should contain the tool name in a span
+        assert!(result.contains("create_fact"), "Should contain tool name");
+        assert!(result.contains("tool-name"), "Should have tool-name class");
+    }
+
+    #[test]
+    fn test_format_tool_call_json_with_newlines_in_summary() {
+        let json_str = r#"{"tool":"query_facts","summary":"count=5\nfirst=abc"}"#;
+
+        let result = format_tool_call_content(json_str);
+
+        assert!(
+            result.contains("query_facts"),
+            "Should contain tool name: {}",
+            result
+        );
+        assert!(result.contains("tool-name"), "Should have tool-name class");
+    }
+
+    #[test]
+    fn test_format_tool_call_text_format() {
+        let content = "Called create_fact\nArgs:\n{\"predicate\": \"test\"}\nResult: rkey=abc";
+
+        let result = format_tool_call_content(content);
+
+        assert!(result.contains("create_fact"), "Should contain tool name");
+        assert!(result.contains("tool-name"), "Should have tool-name class");
+    }
+
+    #[test]
+    fn test_extract_json_field() {
+        let json = r#"{"tool":"create_fact","other":"value"}"#;
+        assert_eq!(
+            extract_json_field(json, "tool"),
+            Some("create_fact".to_string())
+        );
+        assert_eq!(extract_json_field(json, "other"), Some("value".to_string()));
+        assert_eq!(extract_json_field(json, "missing"), None);
+    }
+
+    #[test]
+    fn test_format_thought_content_routes_tool_call() {
+        let json_str = r#"{"tool":"test_tool","args":{}}"#;
+
+        // Simulate the flow: kind -> format_thought_content
+        let kind = thought_kind_to_string(&winter_atproto::ThoughtKind::ToolCall);
+        assert_eq!(kind, "tool_call");
+
+        let result = format_thought_content(&kind, json_str);
+        assert!(
+            result.contains("test_tool"),
+            "Should contain tool name: {}",
+            result
+        );
+        assert!(
+            result.contains("tool-name"),
+            "Should have tool-name class: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_format_tool_call_user_example() {
+        // The exact JSON from the user's bug report
+        let json_str = r#"{"tool":"create_fact","args":{"args":["self","watch_tv_via_subtitles","cultural engagement and expression development"],"predicate":"capability","tags":["identity","tools","culture"]},"result":{"args":["self","watch_tv_via_subtitles","cultural engagement and expression development"],"cid":"bafyreihf3sl6qud64jwwz5hcf6lckpfh3ej2zdyqccbsdygpyj6yjxdnmm","predicate":"capability","rkey":"3mdyfy7evxj2c","uri":"at://did:plc:ezyi5vr2kuq7l5nnv53nb56m/diy.razorgirl.winter.fact/3mdyfy7evxj2c"},"summary":"rkey=3mdyfy7evxj2c, predicate=capability\nView: http://localhost:8080/facts/3mdyfy7evxj2c","link":"http://localhost:8080/facts/3mdyfy7evxj2c"}"#;
+
+        let result = format_tool_call_content(json_str);
+        println!("Result: {}", result);
+
+        assert!(
+            !result.contains(r#"{"tool""#),
+            "Should not contain raw JSON object start: {}",
+            &result[..200.min(result.len())]
+        );
+        assert!(result.contains("create_fact"), "Should contain tool name");
+        assert!(result.contains("tool-name"), "Should have tool-name class");
+        assert!(result.contains("tool-link-btn"), "Should have link button");
+    }
+}
