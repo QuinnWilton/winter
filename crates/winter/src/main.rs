@@ -73,7 +73,7 @@ enum Commands {
         fast_forward: bool,
     },
 
-    /// Run the MCP server (for Claude Code)
+    /// Run the MCP server (for Claude Code) using stdio transport
     McpServer {
         /// PDS URL
         #[arg(long, env = "WINTER_PDS_URL")]
@@ -86,6 +86,25 @@ enum Commands {
         /// App password
         #[arg(long, env = "WINTER_APP_PASSWORD")]
         app_password: String,
+    },
+
+    /// Run the MCP server with HTTP transport (persistent, for Docker)
+    McpServerHttp {
+        /// PDS URL
+        #[arg(long, env = "WINTER_PDS_URL")]
+        pds_url: String,
+
+        /// Account handle
+        #[arg(long, env = "WINTER_HANDLE")]
+        handle: String,
+
+        /// App password
+        #[arg(long, env = "WINTER_APP_PASSWORD")]
+        app_password: String,
+
+        /// HTTP server port
+        #[arg(long, default_value = "3847")]
+        port: u16,
     },
 
     /// Run the web UI server
@@ -237,6 +256,13 @@ async fn main() -> Result<()> {
             app_password,
         } => run_mcp_server(&pds_url, &handle, &app_password).await,
 
+        Commands::McpServerHttp {
+            pds_url,
+            handle,
+            app_password,
+            port,
+        } => run_mcp_server_http(&pds_url, &handle, &app_password, port).await,
+
         Commands::Web {
             pds_url,
             handle,
@@ -353,12 +379,13 @@ async fn run_mcp_server(pds_url: &str, handle: &str, app_password: &str) -> Resu
     // Keep temp_cache_dir alive for the duration of the MCP server
     let _cache_dir_guard = temp_cache_dir;
 
-    let datalog_cache = DatalogCache::new_with_did(&cache_dir, Some(did.clone()), Some(handle.to_string()))
-        .map_err(|e| miette::miette!("failed to create datalog cache: {}", e))?;
+    let datalog_cache =
+        DatalogCache::new_with_did(&cache_dir, Some(did.clone()), Some(handle.to_string()))
+            .map_err(|e| miette::miette!("failed to create datalog cache: {}", e))?;
 
     // Start sync coordinator to populate repo cache from PDS
-    let firehose_url = std::env::var("WINTER_FIREHOSE_URL")
-        .unwrap_or_else(|_| "wss://bsky.network".to_string());
+    let firehose_url =
+        std::env::var("WINTER_FIREHOSE_URL").unwrap_or_else(|_| "wss://bsky.network".to_string());
 
     let sync_coordinator = SyncCoordinator::new(sync_client, &did, Arc::clone(&repo_cache))
         .with_firehose_url(&firehose_url);
@@ -404,8 +431,124 @@ async fn run_mcp_server(pds_url: &str, handle: &str, app_password: &str) -> Resu
         tracing::warn!("Deno not found, custom tools will not be executable");
     }
 
-    let mut server = McpServer::new(tools);
+    let server = McpServer::new(tools);
     server.run().await.map_err(|e| miette::miette!("{}", e))?;
+
+    Ok(())
+}
+
+async fn run_mcp_server_http(
+    pds_url: &str,
+    handle: &str,
+    app_password: &str,
+    port: u16,
+) -> Result<()> {
+    use std::sync::Arc;
+    use winter_atproto::{AtprotoClient, RepoCache, SyncCoordinator};
+    use winter_datalog::DatalogCache;
+    use winter_mcp::{
+        BlueskyClient, DenoExecutor, McpServer, SecretManager, http, tools::ToolRegistry,
+    };
+
+    tracing::info!("starting MCP HTTP server on port {}", port);
+
+    // Create two clients - one for tools, one for sync
+    let client = AtprotoClient::new(pds_url);
+    client
+        .login(handle, app_password)
+        .await
+        .map_err(|e| miette::miette!("{}", e))?;
+
+    // Get the DID for this account
+    let did = client
+        .did()
+        .await
+        .ok_or_else(|| miette::miette!("failed to get DID: not logged in"))?;
+
+    // Create second client for sync coordinator
+    let sync_client = AtprotoClient::new(pds_url);
+    sync_client
+        .login(handle, app_password)
+        .await
+        .map_err(|e| miette::miette!("{}", e))?;
+
+    // Create Bluesky client for social interactions
+    let bluesky = BlueskyClient::new(pds_url, handle, app_password)
+        .await
+        .map_err(|e| miette::miette!("failed to create Bluesky client: {}", e))?;
+
+    let tools = ToolRegistry::new(client).with_bluesky(bluesky);
+
+    // Set up RepoCache and DatalogCache for derived predicates
+    let repo_cache = RepoCache::new();
+
+    // Use a persistent cache directory for the HTTP server
+    // This allows the cache to survive restarts, unlike the temp dir used for stdio
+    let cache_dir = dirs::cache_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("winter")
+        .join("mcp-http");
+
+    std::fs::create_dir_all(&cache_dir)
+        .map_err(|e| miette::miette!("failed to create cache directory: {}", e))?;
+
+    let datalog_cache =
+        DatalogCache::new_with_did(&cache_dir, Some(did.clone()), Some(handle.to_string()))
+            .map_err(|e| miette::miette!("failed to create datalog cache: {}", e))?;
+
+    // Start sync coordinator to populate repo cache from PDS
+    let firehose_url =
+        std::env::var("WINTER_FIREHOSE_URL").unwrap_or_else(|_| "wss://bsky.network".to_string());
+
+    let sync_coordinator = SyncCoordinator::new(sync_client, &did, Arc::clone(&repo_cache))
+        .with_firehose_url(&firehose_url);
+
+    // Create a shutdown channel (HTTP server runs until process exits)
+    let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // Start the sync (downloads CAR file and subscribes to firehose)
+    let _sync_handle = sync_coordinator
+        .start(shutdown_rx)
+        .await
+        .map_err(|e| miette::miette!("failed to start sync: {}", e))?;
+
+    // Connect datalog cache to repo cache for derived fact population
+    datalog_cache.start_update_listener(Arc::clone(&repo_cache));
+
+    // Set the caches on the tool registry
+    tools.set_cache(repo_cache).await;
+    tools.set_datalog_cache(Arc::clone(&datalog_cache)).await;
+
+    tracing::info!("datalog cache initialized for MCP HTTP server");
+
+    // Load secrets from configured path or default
+    let secrets_path = std::env::var("WINTER_SECRETS_PATH")
+        .ok()
+        .map(std::path::PathBuf::from);
+    match SecretManager::load(secrets_path).await {
+        Ok(secrets) => {
+            tools.set_secrets(secrets).await;
+            tracing::info!("loaded secrets manager");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load secrets manager, custom tools will have no secrets");
+        }
+    }
+
+    // Set up Deno executor for custom tools
+    if DenoExecutor::is_available().await {
+        tools.set_deno(DenoExecutor::default()).await;
+        tracing::info!("Deno executor available for custom tools");
+    } else {
+        tracing::warn!("Deno not found, custom tools will not be executable");
+    }
+
+    let server = McpServer::new(tools);
+
+    // Run the HTTP server (blocks until shutdown)
+    http::run_server(server, port)
+        .await
+        .map_err(|e| miette::miette!("HTTP server error: {}", e))?;
 
     Ok(())
 }

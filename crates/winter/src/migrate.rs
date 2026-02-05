@@ -13,9 +13,9 @@ use miette::Result;
 use tracing::info;
 
 use winter_atproto::{
-    AtprotoClient, Directive, DirectiveKind, Fact, Identity, LegacyIdentity, Note, Rule,
-    DIRECTIVE_COLLECTION, FACT_COLLECTION, IDENTITY_COLLECTION, IDENTITY_KEY, NOTE_COLLECTION,
-    RULE_COLLECTION, Tid,
+    AtUri, AtprotoClient, DIRECTIVE_COLLECTION, Directive, DirectiveKind, FACT_COLLECTION, Fact,
+    IDENTITY_COLLECTION, IDENTITY_KEY, Identity, LegacyIdentity, NOTE_COLLECTION, Note,
+    RULE_COLLECTION, Rule, Tid,
 };
 use winter_datalog::DerivedFactGenerator;
 
@@ -64,7 +64,7 @@ pub trait Migration: Send + Sync {
 
 /// Extract the rkey from an AT URI.
 fn extract_rkey(uri: &str) -> String {
-    uri.rsplit('/').next().unwrap_or(uri).to_string()
+    AtUri::extract_rkey(uri).to_string()
 }
 
 /// Check if a reference value needs conversion to AT URI format.
@@ -196,31 +196,31 @@ impl Migration for FactReferencesToUris {
             let mut fact = record.value;
             let mut changed = false;
 
-            if let Some(ref source) = fact.source {
-                if needs_conversion(source) {
-                    if let Some(uri) = cid_map.get(source) {
-                        fact.source = Some(uri.clone());
-                        changed = true;
-                    } else {
-                        errors.push(format!(
-                            "Fact {}: Could not resolve source CID {}",
-                            rkey, source
-                        ));
-                    }
+            if let Some(ref source) = fact.source
+                && needs_conversion(source)
+            {
+                if let Some(uri) = cid_map.get(source) {
+                    fact.source = Some(uri.clone());
+                    changed = true;
+                } else {
+                    errors.push(format!(
+                        "Fact {}: Could not resolve source CID {}",
+                        rkey, source
+                    ));
                 }
             }
 
-            if let Some(ref supersedes) = fact.supersedes {
-                if needs_conversion(supersedes) {
-                    if let Some(uri) = cid_map.get(supersedes) {
-                        fact.supersedes = Some(uri.clone());
-                        changed = true;
-                    } else {
-                        errors.push(format!(
-                            "Fact {}: Could not resolve supersedes CID {}",
-                            rkey, supersedes
-                        ));
-                    }
+            if let Some(ref supersedes) = fact.supersedes
+                && needs_conversion(supersedes)
+            {
+                if let Some(uri) = cid_map.get(supersedes) {
+                    fact.supersedes = Some(uri.clone());
+                    changed = true;
+                } else {
+                    errors.push(format!(
+                        "Fact {}: Could not resolve supersedes CID {}",
+                        rkey, supersedes
+                    ));
                 }
             }
 
@@ -325,20 +325,20 @@ impl Migration for DirectiveSupersedesToUris {
             let rkey = extract_rkey(&record.uri);
             let mut directive = record.value;
 
-            if let Some(ref supersedes) = directive.supersedes {
-                if needs_conversion(supersedes) {
-                    // Try rkey_map first, then construct URI directly
-                    let uri = rkey_map.get(supersedes).cloned().unwrap_or_else(|| {
-                        format!("at://{}/{}/{}", did, DIRECTIVE_COLLECTION, supersedes)
-                    });
-                    directive.supersedes = Some(uri);
-                    directive.last_updated = Some(Utc::now());
-                    client
-                        .put_record(DIRECTIVE_COLLECTION, &rkey, &directive)
-                        .await
-                        .map_err(|e| miette::miette!("{}", e))?;
-                    updated += 1;
-                }
+            if let Some(ref supersedes) = directive.supersedes
+                && needs_conversion(supersedes)
+            {
+                // Try rkey_map first, then construct URI directly
+                let uri = rkey_map.get(supersedes).cloned().unwrap_or_else(|| {
+                    format!("at://{}/{}/{}", did, DIRECTIVE_COLLECTION, supersedes)
+                });
+                directive.supersedes = Some(uri);
+                directive.last_updated = Some(Utc::now());
+                client
+                    .put_record(DIRECTIVE_COLLECTION, &rkey, &directive)
+                    .await
+                    .map_err(|e| miette::miette!("{}", e))?;
+                updated += 1;
             }
         }
 
@@ -435,7 +435,10 @@ impl Migration for NoteRelatedFactsToUris {
                         *rf = uri.clone();
                         changed = true;
                     } else {
-                        errors.push(format!("Note '{}': Could not resolve CID {}", note.title, rf));
+                        errors.push(format!(
+                            "Note '{}': Could not resolve CID {}",
+                            note.title, rf
+                        ));
                     }
                 }
             }
@@ -718,24 +721,15 @@ impl RulePredicateArityMigration {
         let clause = clause.trim();
 
         // Find the predicate name (before the opening paren)
-        let paren_idx = match clause.find('(') {
-            Some(idx) => idx,
-            None => return None,
-        };
+        let paren_idx = clause.find('(')?;
 
         let predicate_name = clause[..paren_idx].trim();
 
         // Get expected arity (includes rkey)
-        let expected_arity = match arities.get(predicate_name) {
-            Some(&a) => a,
-            None => return None,
-        };
+        let expected_arity = *arities.get(predicate_name)?;
 
         // Count current arguments
-        let close_paren = match clause.rfind(')') {
-            Some(idx) => idx,
-            None => return None,
-        };
+        let close_paren = clause.rfind(')')?;
 
         let args_str = &clause[paren_idx + 1..close_paren];
         let current_arity = if args_str.trim().is_empty() {
@@ -750,7 +744,11 @@ impl RulePredicateArityMigration {
             let updated = format!(
                 "{}{})",
                 &clause[..close_paren],
-                if args_str.trim().is_empty() { "_" } else { ", _" },
+                if args_str.trim().is_empty() {
+                    "_"
+                } else {
+                    ", _"
+                },
             );
             Some(updated)
         } else {

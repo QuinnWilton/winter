@@ -42,6 +42,9 @@ clap = { workspace = true, features = ["env"] }
 # Directory helpers
 dirs = "5.0"
 
+# HTTP client (for signaling MCP server in HTTP mode)
+reqwest = { workspace = true }
+
 # Web (for run_web_server)
 axum = { workspace = true }
 tempfile.workspace = true

@@ -15,12 +15,16 @@ use miette::Result;
 use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{debug, error, info, warn};
 
-use winter_agent::{Agent, AgentContext, ContextTrigger, IdentityManager, PostRef, StateManager};
+use winter_agent::{
+    Agent, AgentContext, ContextTrigger, ConversationHistoryMessage, IdentityManager, PostRef,
+    StateManager,
+};
 use winter_atproto::{
     AtprotoClient, DIRECTIVE_COLLECTION, Directive, Identity, RULE_COLLECTION, RepoCache, Rule,
     ScopeFilter, SyncCoordinator, SyncState, THOUGHT_COLLECTION, Thought, ThoughtKind, Tid,
 };
 use winter_datalog::{DatalogCache, DatalogCoordinator};
+use winter_mcp::InterruptionState;
 use winter_mcp::bluesky::{BlueskyNotification, DirectMessage, NotificationReason};
 use winter_mcp::{BlueskyClient, BlueskyError};
 use winter_scheduler::Scheduler;
@@ -36,6 +40,15 @@ const DEFAULT_DM_POLL_INTERVAL: u64 = 5;
 
 /// Default notification poll interval in seconds.
 const DEFAULT_NOTIF_POLL_INTERVAL: u64 = 10;
+
+/// Default idle awaken timeout in seconds (60 minutes).
+const DEFAULT_IDLE_AWAKEN_TIMEOUT: u64 = 3600;
+
+/// Default background session grace period in seconds.
+const DEFAULT_BACKGROUND_GRACE_SECS: u64 = 60;
+
+/// Default background session idle threshold in seconds (5 minutes).
+const DEFAULT_BACKGROUND_IDLE_SECS: u64 = 300;
 
 /// Configuration for the daemon.
 pub struct DaemonConfig {
@@ -60,6 +73,14 @@ pub struct DaemonConfig {
     pub dm_poll_interval: Option<u64>,
     /// Notification poll interval in seconds (default 10).
     pub notif_poll_interval: Option<u64>,
+    /// Idle timeout in seconds before triggering awaken (0 to disable).
+    pub idle_awaken_timeout: Option<u64>,
+    /// Enable background sessions (default: true).
+    pub background_sessions_enabled: Option<bool>,
+    /// Grace period for background session interruption in seconds (default: 60).
+    pub background_grace_secs: Option<u64>,
+    /// How long queue must be empty before starting background session in seconds (default: 300).
+    pub background_idle_secs: Option<u64>,
 }
 
 /// Work item for notification processing.
@@ -71,10 +92,10 @@ struct NotificationWork {
 /// Returns heads like "mutual_follow(X, Y)" for use in queries.
 async fn fetch_rule_heads(client: &AtprotoClient, cache: Option<&RepoCache>) -> Vec<String> {
     // Try cache first
-    if let Some(cache) = cache {
-        if cache.state() == SyncState::Live {
-            return cache.enabled_rule_heads();
-        }
+    if let Some(cache) = cache
+        && cache.state() == SyncState::Live
+    {
+        return cache.enabled_rule_heads();
     }
 
     // Fall back to HTTP
@@ -107,10 +128,10 @@ async fn fetch_recent_thoughts_scoped(
     scope: &ScopeFilter,
 ) -> Vec<Thought> {
     // Try cache first
-    if let Some(cache) = cache {
-        if cache.state() == SyncState::Live {
-            return cache.recent_thoughts_for_scope(limit, scope);
-        }
+    if let Some(cache) = cache
+        && cache.state() == SyncState::Live
+    {
+        return cache.recent_thoughts_for_scope(limit, scope);
     }
 
     // Fall back to HTTP - fetch more and post-filter
@@ -161,10 +182,10 @@ fn thought_matches_scope_filter(thought: &Thought, scope: &ScopeFilter) -> bool 
 /// Returns only active directives, sorted by priority (descending) then created_at.
 async fn fetch_directives(client: &AtprotoClient, cache: Option<&RepoCache>) -> Vec<Directive> {
     // Try cache first
-    if let Some(cache) = cache {
-        if cache.state() == SyncState::Live {
-            return cache.active_directives_sorted();
-        }
+    if let Some(cache) = cache
+        && cache.state() == SyncState::Live
+    {
+        return cache.active_directives_sorted();
     }
 
     // Fall back to HTTP
@@ -214,10 +235,19 @@ pub async fn run(
     follower_sync_interval: u64,
     fast_forward: bool,
 ) -> Result<()> {
-    // Use default MCP config path
-    let mcp_config_path = dirs::home_dir()
-        .map(|h| h.join(".config/winter/mcp.json"))
-        .unwrap_or_else(|| PathBuf::from("/etc/winter/mcp.json"));
+    // Use HTTP MCP config when WINTER_MCP_URL is set (Docker environment),
+    // otherwise fall back to stdio config for local development
+    let mcp_config_path = if std::env::var("WINTER_MCP_URL").is_ok() {
+        // Docker: use HTTP transport config
+        dirs::home_dir()
+            .map(|h| h.join(".config/winter/mcp-http.json"))
+            .unwrap_or_else(|| PathBuf::from("/etc/winter/mcp-http.json"))
+    } else {
+        // Local: use stdio transport config
+        dirs::home_dir()
+            .map(|h| h.join(".config/winter/mcp.json"))
+            .unwrap_or_else(|| PathBuf::from("/etc/winter/mcp.json"))
+    };
 
     run_with_config(DaemonConfig {
         pds_url: pds_url.to_string(),
@@ -233,6 +263,10 @@ pub async fn run(
         queue_size: None,
         dm_poll_interval: None,
         notif_poll_interval: None,
+        idle_awaken_timeout: None,
+        background_sessions_enabled: None,
+        background_grace_secs: None,
+        background_idle_secs: None,
     })
     .await
 }
@@ -259,12 +293,10 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
         std::env::var("WINTER_DM_POLL_INTERVAL")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                if config.poll_interval > 0 {
-                    config.poll_interval
-                } else {
-                    DEFAULT_DM_POLL_INTERVAL
-                }
+            .unwrap_or(if config.poll_interval > 0 {
+                config.poll_interval
+            } else {
+                DEFAULT_DM_POLL_INTERVAL
             })
     }));
     let notif_poll_interval =
@@ -272,20 +304,46 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
             std::env::var("WINTER_NOTIF_POLL_INTERVAL")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or_else(|| {
-                    if config.poll_interval > 0 {
-                        config.poll_interval
-                    } else {
-                        DEFAULT_NOTIF_POLL_INTERVAL
-                    }
+                .unwrap_or(if config.poll_interval > 0 {
+                    config.poll_interval
+                } else {
+                    DEFAULT_NOTIF_POLL_INTERVAL
                 })
         }));
+    let idle_awaken_timeout = config.idle_awaken_timeout.unwrap_or_else(|| {
+        std::env::var("WINTER_IDLE_AWAKEN_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_IDLE_AWAKEN_TIMEOUT)
+    });
+    let background_sessions_enabled = config.background_sessions_enabled.unwrap_or_else(|| {
+        std::env::var("WINTER_BACKGROUND_ENABLED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(true)
+    });
+    let background_grace_secs = config.background_grace_secs.unwrap_or_else(|| {
+        std::env::var("WINTER_BACKGROUND_GRACE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_BACKGROUND_GRACE_SECS)
+    });
+    let background_idle_secs = config.background_idle_secs.unwrap_or_else(|| {
+        std::env::var("WINTER_BACKGROUND_IDLE_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_BACKGROUND_IDLE_SECS)
+    });
 
     info!(
         worker_count,
         queue_size,
         dm_poll_interval_secs = dm_poll_interval.as_secs(),
         notif_poll_interval_secs = notif_poll_interval.as_secs(),
+        idle_awaken_timeout_secs = idle_awaken_timeout,
+        background_sessions_enabled,
+        background_grace_secs,
+        background_idle_secs,
         "daemon configuration"
     );
 
@@ -296,6 +354,14 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
         .login(&config.handle, &config.app_password)
         .await
         .map_err(|e| miette::miette!("{}", e))?;
+
+    // Create dedicated ATProto client for DM operations
+    // This prevents DM polling from being blocked by heavy tool calls in background sessions
+    let dm_client = Arc::new(AtprotoClient::new(&config.pds_url));
+    dm_client
+        .login(&config.handle, &config.app_password)
+        .await
+        .map_err(|e| miette::miette!("failed to login DM client: {}", e))?;
 
     // Create identity manager with shared client
     let identity_manager = Arc::new(IdentityManager::new(Arc::clone(&client)));
@@ -369,6 +435,9 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
 
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Create activity channel for idle awaken (signals when wakeup-triggering activity occurs)
+    let (activity_tx, activity_rx) = watch::channel(std::time::Instant::now());
 
     // Handle shutdown signals
     let shutdown_tx_clone = shutdown_tx.clone();
@@ -488,6 +557,10 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
     if let Err(e) = scheduler.load_jobs().await {
         error!(error = %e, "failed to load jobs, starting with empty job list");
     }
+
+    // Connect scheduler to repo cache for live job updates
+    // This enables the scheduler to pick up job changes made via MCP tools
+    scheduler.start_update_listener(Arc::clone(&cache));
 
     // Clean up duplicate awaken jobs (from non-idempotent bootstrap)
     match scheduler.deduplicate_jobs_by_name("awaken").await {
@@ -655,6 +728,9 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
     let (work_tx, work_rx) = mpsc::channel::<NotificationWork>(queue_size);
     let work_rx = Arc::new(Mutex::new(work_rx));
 
+    // Create shared interruption state for background sessions
+    let interruption_state = Arc::new(InterruptionState::new());
+
     // Spawn worker pool
     let mut worker_handles = Vec::with_capacity(worker_count);
     for worker_id in 0..worker_count {
@@ -725,10 +801,11 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
         let operator_did = operator_did.clone();
         let agent = Arc::clone(&agent);
         let identity_manager = Arc::clone(&identity_manager);
-        let client = Arc::clone(&client);
+        let dm_client = Arc::clone(&dm_client);
         let state_manager = Arc::clone(&state_manager);
         let cache = Arc::clone(&cache);
         let mut shutdown_rx = shutdown_rx.clone();
+        let activity_tx = activity_tx.clone();
 
         tokio::spawn(async move {
             info!("operator DM poller started");
@@ -785,8 +862,11 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
                                         }
                                     };
 
-                                    // Handle the DM inline (not queued)
-                                    handle_dm(&dm, &client, &agent, identity, Some(&cache)).await;
+                                    // Handle the DM inline (not queued) using dedicated DM client
+                                    handle_dm(&dm, &dm_client, &dm_bluesky, &agent, identity, Some(&cache)).await;
+
+                                    // Signal activity after processing operator DM
+                                    let _ = activity_tx.send(std::time::Instant::now());
                                 }
                             }
                             Err(e) => {
@@ -807,6 +887,8 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
         let datalog_cache = datalog_cache.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         let work_tx = work_tx; // Move work_tx into this closure
+        let activity_tx = activity_tx.clone();
+        let interruption_state = Arc::clone(&interruption_state);
 
         tokio::spawn(async move {
             info!("notification poller started");
@@ -838,32 +920,27 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
                                 // Reset backoff on success
                                 rate_limit_backoff = Duration::ZERO;
 
-                                // Persist cursor BEFORE enqueuing
-                                if let Some(cursor) = notif_bluesky.last_seen_at() {
-                                    debug!(cursor = %cursor, "persisting notification cursor");
-                                    if let Err(e) = state_manager
-                                        .set_notification_cursor(Some(cursor.to_string()))
-                                        .await
-                                    {
-                                        warn!(error = %e, "failed to persist notification cursor");
-                                    }
-                                }
+                                // Track whether all notifications were successfully enqueued
+                                // Cursor is only persisted AFTER successful enqueuing to prevent
+                                // notification loss on queue full/timeout conditions
+                                let mut all_enqueued = true;
+                                let mut channel_closed = false;
 
                                 // Process notifications
                                 for notif in notifications {
                                     // Handle Follow notifications incrementally
                                     if notif.reason == NotificationReason::Follow {
-                                        if let Some(ref dc) = datalog_cache {
-                                            if dc.add_follower(notif.author_did.clone()).await {
-                                                info!(
-                                                    follower = %notif.author_did,
-                                                    handle = %notif.author_handle,
-                                                    "new follower added"
-                                                );
-                                                // Flush immediately so queries see the update
-                                                if let Err(e) = dc.flush_dirty_predicates().await {
-                                                    warn!(error = %e, "failed to flush follower update");
-                                                }
+                                        if let Some(ref dc) = datalog_cache
+                                            && dc.add_follower(notif.author_did.clone()).await
+                                        {
+                                            info!(
+                                                follower = %notif.author_did,
+                                                handle = %notif.author_handle,
+                                                "new follower added"
+                                            );
+                                            // Flush immediately so queries see the update
+                                            if let Err(e) = dc.flush_dirty_predicates().await {
+                                                warn!(error = %e, "failed to flush follower update");
                                             }
                                         }
                                         continue; // Don't queue Follow notifications for agent processing
@@ -879,18 +956,65 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
                                         continue;
                                     }
 
+                                    // Signal activity on receipt (not enqueue) - queue pressure doesn't mean no activity
+                                    let _ = activity_tx.send(std::time::Instant::now());
+
+                                    // Signal interruption if background session is running
+                                    // This tells the background session to wrap up
+                                    // For HTTP mode, also signal the MCP server
+                                    interruption_state.set_interrupt("queue_pressure").await;
+                                    if let Ok(mcp_url) = std::env::var("WINTER_MCP_URL") {
+                                        // Fire-and-forget HTTP call to MCP server
+                                        let url = format!("{}/interrupt", mcp_url.trim_end_matches('/'));
+                                        tokio::spawn(async move {
+                                            let client = reqwest::Client::new();
+                                            let _ = client.post(&url)
+                                                .json(&serde_json::json!({"reason": "queue_pressure"}))
+                                                .send()
+                                                .await;
+                                        });
+                                    }
+
                                     let work = NotificationWork { notification: notif };
 
-                                    // Non-blocking send - if queue is full, log and drop
-                                    match work_tx.try_send(work) {
-                                        Ok(()) => {}
-                                        Err(mpsc::error::TrySendError::Full(_)) => {
-                                            warn!("notification queue full, dropping notification");
-                                        }
-                                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    // Blocking send with timeout - applies backpressure instead of dropping
+                                    // If workers are overloaded, this will wait up to 5s before giving up
+                                    match tokio::time::timeout(
+                                        Duration::from_secs(5),
+                                        work_tx.send(work)
+                                    ).await {
+                                        Ok(Ok(())) => {}
+                                        Ok(Err(_)) => {
                                             // Channel closed, stop polling
+                                            channel_closed = true;
                                             break;
                                         }
+                                        Err(_) => {
+                                            // Timeout - queue is full and workers are overloaded
+                                            // Don't persist cursor so these notifications will be re-fetched
+                                            warn!("notification send timed out, will retry on next poll");
+                                            all_enqueued = false;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                if channel_closed {
+                                    break;
+                                }
+
+                                // Only persist cursor if all notifications were successfully enqueued
+                                // This ensures notifications are never lost - if we couldn't enqueue them,
+                                // they'll be re-fetched on the next poll
+                                if all_enqueued
+                                    && let Some(cursor) = notif_bluesky.last_seen_at()
+                                {
+                                    debug!(cursor = %cursor, "persisting notification cursor");
+                                    if let Err(e) = state_manager
+                                        .set_notification_cursor(Some(cursor.to_string()))
+                                        .await
+                                    {
+                                        warn!(error = %e, "failed to persist notification cursor");
                                     }
                                 }
                             }
@@ -999,6 +1123,162 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
         })
     };
 
+    // Spawn idle watcher task (triggers awaken or background session when no activity)
+    let idle_watcher_handle = if idle_awaken_timeout > 0 {
+        let agent = Arc::clone(&agent);
+        let identity_manager = Arc::clone(&identity_manager);
+        let cache = Arc::clone(&cache);
+        let client = Arc::clone(&client);
+        let activity_tx = activity_tx.clone();
+        let mut activity_rx = activity_rx.clone();
+        let mut shutdown_rx = shutdown_rx.clone();
+        let idle_timeout = Duration::from_secs(idle_awaken_timeout);
+        let interruption_state = Arc::clone(&interruption_state);
+        let background_idle = Duration::from_secs(background_idle_secs);
+        // Note: grace period would be used for force-cancellation, but current implementation
+        // relies on the agent calling check_interruption and exiting gracefully.
+        // Force-cancel would require aborting the future, which we don't do here.
+        let _grace_period = Duration::from_secs(background_grace_secs);
+
+        Some(tokio::spawn(async move {
+            info!(
+                idle_timeout_secs = idle_awaken_timeout,
+                background_enabled = background_sessions_enabled,
+                background_idle_secs,
+                "idle watcher started"
+            );
+            let mut last_activity = *activity_rx.borrow();
+
+            loop {
+                let elapsed = last_activity.elapsed();
+
+                // Use shorter timeout for background sessions when enabled
+                let target_timeout = if background_sessions_enabled {
+                    background_idle
+                } else {
+                    idle_timeout
+                };
+                let remaining = target_timeout.saturating_sub(elapsed);
+
+                tokio::select! {
+                    biased;
+
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+
+                    _ = activity_rx.changed() => {
+                        last_activity = *activity_rx.borrow();
+                        debug!("activity detected, resetting idle timer");
+                    }
+
+                    _ = tokio::time::sleep(remaining) => {
+                        // Double-check we actually reached the timeout
+                        if last_activity.elapsed() >= target_timeout {
+                            // Load identity for context
+                            let identity = match identity_manager.load().await {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    warn!(error = ?e, "failed to load identity for idle session");
+                                    last_activity = std::time::Instant::now();
+                                    let _ = activity_tx.send(last_activity);
+                                    continue;
+                                }
+                            };
+
+                            // Fetch context
+                            let (directives, rule_heads, recent_thoughts) = tokio::join!(
+                                fetch_directives(&client, Some(&cache)),
+                                fetch_rule_heads(&client, Some(&cache)),
+                                fetch_recent_thoughts_scoped(&client, Some(&cache), 10, &ScopeFilter::Global)
+                            );
+
+                            if background_sessions_enabled {
+                                // Start background session
+                                info!("idle timeout reached, starting background session");
+
+                                // Clear any previous interruption
+                                interruption_state.clear().await;
+
+                                let context = AgentContext::new(identity)
+                                    .with_directives(directives)
+                                    .with_rule_heads(rule_heads)
+                                    .with_thoughts(recent_thoughts)
+                                    .with_trigger(ContextTrigger::Background);
+
+                                // Run background session with interruptibility
+                                // When activity occurs, the notification poller sets interruption state
+                                // The agent should call check_interruption and exit gracefully
+                                // If not, we force-cancel after the session's internal timeout
+                                let session_future = agent.background_session(context);
+
+                                // Monitor for activity while session runs
+                                tokio::select! {
+                                    biased;
+
+                                    _ = shutdown_rx.changed() => {
+                                        if *shutdown_rx.borrow() {
+                                            info!("shutdown during background session");
+                                            break;
+                                        }
+                                    }
+
+                                    result = session_future => {
+                                        match result {
+                                            Ok(_response) => {
+                                                info!("background session completed");
+                                            }
+                                            Err(e) => {
+                                                warn!(error = %e, "background session failed");
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Clear interruption state after session ends
+                                interruption_state.clear().await;
+                            } else {
+                                // Fall back to awaken cycle
+                                info!("idle timeout reached, triggering awaken");
+
+                                let context = AgentContext::new(identity)
+                                    .with_directives(directives)
+                                    .with_rule_heads(rule_heads)
+                                    .with_thoughts(recent_thoughts)
+                                    .with_trigger(ContextTrigger::Awaken);
+
+                                match tokio::time::timeout(
+                                    Duration::from_secs(1800),
+                                    agent.awaken(context)
+                                ).await {
+                                    Ok(Ok(_response)) => {
+                                        info!("idle awaken completed");
+                                    }
+                                    Ok(Err(e)) => {
+                                        warn!(error = %e, "idle awaken failed");
+                                    }
+                                    Err(_) => {
+                                        warn!("idle awaken timed out");
+                                    }
+                                }
+                            }
+
+                            // Reset idle timer after session (success or failure)
+                            last_activity = std::time::Instant::now();
+                            let _ = activity_tx.send(last_activity);
+                        }
+                    }
+                }
+            }
+            info!("idle watcher stopped");
+        }))
+    } else {
+        info!("idle watcher disabled (timeout = 0)");
+        None
+    };
+
     // Wait for shutdown signal
     let mut main_shutdown_rx = shutdown_rx.clone();
     loop {
@@ -1021,6 +1301,9 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
     let _ = notif_handle.await;
     let _ = scheduler_handle.await;
     let _ = follower_sync_handle.await;
+    if let Some(handle) = idle_watcher_handle {
+        let _ = handle.await;
+    }
 
     for handle in worker_handles {
         let _ = handle.await;
@@ -1189,6 +1472,7 @@ async fn handle_notification(
 async fn handle_dm(
     dm: &DirectMessage,
     atproto: &AtprotoClient,
+    bluesky: &BlueskyClient,
     agent: &Agent,
     identity: Identity,
     cache: Option<&RepoCache>,
@@ -1222,6 +1506,9 @@ async fn handle_dm(
         warn!(error = %e, "failed to record DM observation thought");
     }
 
+    // Fetch conversation history (last 15 minutes, excluding triggering message)
+    let history = fetch_dm_history(bluesky, &dm.convo_id, &dm.id, dm.sent_at).await;
+
     // Build context for Claude
     let trigger = ContextTrigger::DirectMessage {
         convo_id: dm.convo_id.clone(),
@@ -1230,6 +1517,7 @@ async fn handle_dm(
         sender_handle: sender_handle.clone(),
         text: dm.text.clone(),
         facets: dm.facets.clone(),
+        history,
     };
 
     // Build scope filter for thought fetching (same DM conversation)
@@ -1239,10 +1527,18 @@ async fn handle_dm(
 
     // Fetch directives, rule heads, and recent thoughts for context (in parallel)
     // Use scoped thought fetching to only include thoughts from this conversation
+    debug!(convo_id = %dm.convo_id, "fetching DM context");
     let (directives, rule_heads, recent_thoughts) = tokio::join!(
         fetch_directives(atproto, cache),
         fetch_rule_heads(atproto, cache),
         fetch_recent_thoughts_scoped(atproto, cache, 10, &scope)
+    );
+    debug!(
+        convo_id = %dm.convo_id,
+        directives = directives.len(),
+        rules = rule_heads.len(),
+        thoughts = recent_thoughts.len(),
+        "DM context fetched"
     );
 
     let context = AgentContext::new(identity)
@@ -1250,6 +1546,11 @@ async fn handle_dm(
         .with_rule_heads(rule_heads)
         .with_thoughts(recent_thoughts)
         .with_trigger(trigger);
+
+    debug!(
+        convo_id = %dm.convo_id,
+        "invoking agent for DM"
+    );
 
     // Invoke Claude via agent - Claude should use reply_to_dm tool to send the response
     match agent.handle_dm(context, &dm.text).await {
@@ -1302,6 +1603,44 @@ async fn handle_dm(
             }
 
             error!(error = ?e, convo_id = %dm.convo_id, message_id = %dm.id, "failed to handle DM");
+        }
+    }
+}
+
+/// Fetch recent DM history from the conversation (last 15 minutes).
+///
+/// Returns messages sorted chronologically (oldest first), excluding the triggering message.
+async fn fetch_dm_history(
+    bluesky: &BlueskyClient,
+    convo_id: &str,
+    triggering_message_id: &str,
+    trigger_time: chrono::DateTime<chrono::Utc>,
+) -> Vec<ConversationHistoryMessage> {
+    let cutoff = trigger_time - chrono::Duration::minutes(15);
+    let own_did = bluesky.did().await.unwrap_or_default();
+
+    match bluesky.get_messages(convo_id, None).await {
+        Ok(mut messages) => {
+            // Sort chronologically (oldest first)
+            messages.sort_by_key(|m| m.sent_at);
+
+            messages
+                .into_iter()
+                .filter(|m| m.sent_at >= cutoff && m.id != triggering_message_id)
+                .map(|m| ConversationHistoryMessage {
+                    sender_label: if m.sender_did == own_did {
+                        "You".to_string()
+                    } else {
+                        "Operator".to_string()
+                    },
+                    text: m.text,
+                    sent_at: m.sent_at,
+                })
+                .collect()
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to fetch DM history");
+            Vec::new()
         }
     }
 }
