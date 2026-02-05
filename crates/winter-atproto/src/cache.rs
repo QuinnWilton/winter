@@ -5,11 +5,15 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 
 use dashmap::DashMap;
 use tokio::sync::{Mutex, RwLock, broadcast};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
+
+/// Maximum number of pending firehose events to queue during sync.
+/// When exceeded, oldest events are dropped to prevent memory exhaustion.
+const MAX_PENDING_EVENTS: usize = 10_000;
 
 use crate::{
     BlogEntry, CustomTool, DaemonState, Directive, Fact, FactDeclaration, Follow, Identity, Job,
@@ -196,6 +200,8 @@ pub enum CacheUpdate {
 /// A commit event from the firehose, queued during sync.
 #[derive(Debug, Clone)]
 pub struct FirehoseCommit {
+    /// Firehose sequence number.
+    pub seq: i64,
     /// Repository revision.
     pub rev: String,
     /// Operations in this commit.
@@ -265,16 +271,28 @@ pub struct RepoCache {
     state: AtomicU8,
     /// Current repository revision.
     repo_rev: RwLock<Option<String>>,
+    /// Last seen firehose sequence number (for cursor-based reconnection).
+    firehose_seq: AtomicI64,
     /// Pending firehose events during CAR fetch.
     pending_events: Mutex<VecDeque<FirehoseCommit>>,
     /// Broadcast channel for cache updates.
     updates_tx: broadcast::Sender<CacheUpdate>,
+    /// Flag to suppress broadcasts during sync replay.
+    /// When true, cache mutations will not send updates to subscribers.
+    /// This prevents broadcast channel lag during firehose replay (which
+    /// can trigger expensive full TSV regeneration in DatalogCache).
+    suppress_broadcasts: AtomicBool,
 }
+
+/// Broadcast channel capacity for cache updates.
+/// Set high enough to handle firehose reconnection bursts without lagging,
+/// which would trigger expensive full regeneration in DatalogCache.
+const BROADCAST_CHANNEL_CAPACITY: usize = 4096;
 
 impl RepoCache {
     /// Create a new empty cache.
     pub fn new() -> Arc<Self> {
-        let (updates_tx, _) = broadcast::channel(256);
+        let (updates_tx, _) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
         Arc::new(Self {
             facts: DashMap::new(),
             rules: DashMap::new(),
@@ -294,8 +312,10 @@ impl RepoCache {
             declarations: DashMap::new(),
             state: AtomicU8::new(SyncState::Disconnected as u8),
             repo_rev: RwLock::new(None),
+            firehose_seq: AtomicI64::new(0),
             pending_events: Mutex::new(VecDeque::new()),
             updates_tx,
+            suppress_broadcasts: AtomicBool::new(false),
         })
     }
 
@@ -322,9 +342,63 @@ impl RepoCache {
         *self.repo_rev.write().await = Some(rev);
     }
 
+    /// Get the last seen firehose sequence number.
+    ///
+    /// Returns 0 if no events have been processed yet.
+    pub fn firehose_seq(&self) -> i64 {
+        self.firehose_seq.load(Ordering::SeqCst)
+    }
+
+    /// Update the firehose sequence number if the new value is greater.
+    ///
+    /// This is used to track progress through the firehose stream.
+    pub fn update_firehose_seq(&self, seq: i64) {
+        // Only update if greater (sequence numbers are monotonically increasing)
+        self.firehose_seq.fetch_max(seq, Ordering::SeqCst);
+    }
+
+    /// Reset the firehose sequence number (e.g., for full re-sync).
+    pub fn reset_firehose_seq(&self) {
+        self.firehose_seq.store(0, Ordering::SeqCst);
+    }
+
     /// Subscribe to cache updates.
     pub fn subscribe(&self) -> broadcast::Receiver<CacheUpdate> {
         self.updates_tx.subscribe()
+    }
+
+    /// Set whether broadcasts should be suppressed.
+    ///
+    /// When suppressed, cache mutations will not send updates to subscribers.
+    /// This is used during sync replay to prevent broadcast channel lag,
+    /// which would trigger expensive full TSV regeneration in DatalogCache.
+    ///
+    /// After replay completes, a `Synchronized` event should be sent to
+    /// trigger `populate_from_repo_cache()` in subscribers.
+    pub fn set_suppress_broadcasts(&self, suppress: bool) {
+        self.suppress_broadcasts.store(suppress, Ordering::SeqCst);
+        if suppress {
+            debug!("broadcast suppression enabled");
+        } else {
+            debug!("broadcast suppression disabled");
+        }
+    }
+
+    /// Check if broadcasts are currently suppressed.
+    pub fn broadcasts_suppressed(&self) -> bool {
+        self.suppress_broadcasts.load(Ordering::SeqCst)
+    }
+
+    /// Send a cache update to subscribers, respecting suppression flag.
+    ///
+    /// Returns true if the update was sent, false if suppressed or no subscribers.
+    fn broadcast(&self, update: CacheUpdate) {
+        if self.suppress_broadcasts.load(Ordering::SeqCst) {
+            return;
+        }
+        if self.updates_tx.send(update).is_err() {
+            trace!("no subscribers for cache update");
+        }
     }
 
     /// Get a fact by rkey.
@@ -412,9 +486,7 @@ impl RepoCache {
                 }
             };
 
-            if let Err(e) = self.updates_tx.send(update) {
-                trace!(error = %e, "no subscribers for fact update");
-            }
+            self.broadcast(update);
             trace!(rkey = %rkey, predicate = %cached_ref.value().value.predicate, "cache: fact upserted");
         }
     }
@@ -422,11 +494,9 @@ impl RepoCache {
     /// Delete a fact.
     pub fn delete_fact(&self, rkey: &str) {
         if self.facts.remove(rkey).is_some() {
-            if let Err(e) = self.updates_tx.send(CacheUpdate::FactDeleted {
+            self.broadcast(CacheUpdate::FactDeleted {
                 rkey: rkey.to_string(),
-            }) {
-                trace!(error = %e, "no subscribers for fact delete");
-            }
+            });
             trace!(rkey = %rkey, "cache: fact deleted");
         }
     }
@@ -465,9 +535,7 @@ impl RepoCache {
                 }
             };
 
-            if let Err(e) = self.updates_tx.send(update) {
-                trace!(error = %e, "no subscribers for rule update");
-            }
+            self.broadcast(update);
             trace!(rkey = %rkey, name = %cached_ref.value().value.name, "cache: rule upserted");
         }
     }
@@ -475,11 +543,9 @@ impl RepoCache {
     /// Delete a rule.
     pub fn delete_rule(&self, rkey: &str) {
         if self.rules.remove(rkey).is_some() {
-            if let Err(e) = self.updates_tx.send(CacheUpdate::RuleDeleted {
+            self.broadcast(CacheUpdate::RuleDeleted {
                 rkey: rkey.to_string(),
-            }) {
-                trace!(error = %e, "no subscribers for rule delete");
-            }
+            });
             trace!(rkey = %rkey, "cache: rule deleted");
         }
     }
@@ -558,12 +624,10 @@ impl RepoCache {
 
         // Clone from cache only for update notification
         if let Some(cached_ref) = self.thoughts.get(&rkey) {
-            if let Err(e) = self.updates_tx.send(CacheUpdate::ThoughtCreated {
+            self.broadcast(CacheUpdate::ThoughtCreated {
                 rkey: rkey.clone(),
                 thought: cached_ref.value().value.clone(),
-            }) {
-                trace!(error = %e, "no subscribers for thought update");
-            }
+            });
             trace!(rkey = %rkey, kind = ?cached_ref.value().value.kind, "cache: thought upserted");
         }
     }
@@ -571,11 +635,9 @@ impl RepoCache {
     /// Delete a thought.
     pub fn delete_thought(&self, rkey: &str) {
         if self.thoughts.remove(rkey).is_some() {
-            if let Err(e) = self.updates_tx.send(CacheUpdate::ThoughtDeleted {
+            self.broadcast(CacheUpdate::ThoughtDeleted {
                 rkey: rkey.to_string(),
-            }) {
-                trace!(error = %e, "no subscribers for thought delete");
-            }
+            });
             trace!(rkey = %rkey, "cache: thought deleted");
         }
     }
@@ -630,20 +692,16 @@ impl RepoCache {
             }
         };
 
-        if let Err(e) = self.updates_tx.send(update) {
-            trace!(error = %e, "no subscribers for note update");
-        }
+        self.broadcast(update);
         trace!(rkey = %rkey, title = %note.title, "cache: note upserted");
     }
 
     /// Delete a note.
     pub fn delete_note(&self, rkey: &str) {
         if self.notes.remove(rkey).is_some() {
-            if let Err(e) = self.updates_tx.send(CacheUpdate::NoteDeleted {
+            self.broadcast(CacheUpdate::NoteDeleted {
                 rkey: rkey.to_string(),
-            }) {
-                trace!(error = %e, "no subscribers for note delete");
-            }
+            });
             trace!(rkey = %rkey, "cache: note deleted");
         }
     }
@@ -698,20 +756,16 @@ impl RepoCache {
             }
         };
 
-        if let Err(e) = self.updates_tx.send(update) {
-            trace!(error = %e, "no subscribers for job update");
-        }
+        self.broadcast(update);
         trace!(rkey = %rkey, name = %job.name, "cache: job upserted");
     }
 
     /// Delete a job.
     pub fn delete_job(&self, rkey: &str) {
         if self.jobs.remove(rkey).is_some() {
-            if let Err(e) = self.updates_tx.send(CacheUpdate::JobDeleted {
+            self.broadcast(CacheUpdate::JobDeleted {
                 rkey: rkey.to_string(),
-            }) {
-                trace!(error = %e, "no subscribers for job delete");
-            }
+            });
             trace!(rkey = %rkey, "cache: job deleted");
         }
     }
@@ -746,23 +800,19 @@ impl RepoCache {
         };
         self.follows.insert(rkey.clone(), cached);
 
-        if let Err(e) = self.updates_tx.send(CacheUpdate::FollowCreated {
+        self.broadcast(CacheUpdate::FollowCreated {
             rkey: rkey.clone(),
             follow: follow.clone(),
-        }) {
-            trace!(error = %e, "no subscribers for follow create");
-        }
+        });
         trace!(rkey = %rkey, subject = %follow.subject, "cache: follow inserted");
     }
 
     /// Delete a follow.
     pub fn delete_follow(&self, rkey: &str) {
         if self.follows.remove(rkey).is_some() {
-            if let Err(e) = self.updates_tx.send(CacheUpdate::FollowDeleted {
+            self.broadcast(CacheUpdate::FollowDeleted {
                 rkey: rkey.to_string(),
-            }) {
-                trace!(error = %e, "no subscribers for follow delete");
-            }
+            });
             trace!(rkey = %rkey, "cache: follow deleted");
         }
     }
@@ -797,23 +847,19 @@ impl RepoCache {
         };
         self.likes.insert(rkey.clone(), cached);
 
-        if let Err(e) = self.updates_tx.send(CacheUpdate::LikeCreated {
+        self.broadcast(CacheUpdate::LikeCreated {
             rkey: rkey.clone(),
             like: like.clone(),
-        }) {
-            trace!(error = %e, "no subscribers for like create");
-        }
+        });
         trace!(rkey = %rkey, uri = %like.subject.uri, "cache: like inserted");
     }
 
     /// Delete a like.
     pub fn delete_like(&self, rkey: &str) {
         if self.likes.remove(rkey).is_some() {
-            if let Err(e) = self.updates_tx.send(CacheUpdate::LikeDeleted {
+            self.broadcast(CacheUpdate::LikeDeleted {
                 rkey: rkey.to_string(),
-            }) {
-                trace!(error = %e, "no subscribers for like delete");
-            }
+            });
             trace!(rkey = %rkey, "cache: like deleted");
         }
     }
@@ -848,23 +894,19 @@ impl RepoCache {
         };
         self.reposts.insert(rkey.clone(), cached);
 
-        if let Err(e) = self.updates_tx.send(CacheUpdate::RepostCreated {
+        self.broadcast(CacheUpdate::RepostCreated {
             rkey: rkey.clone(),
             repost: repost.clone(),
-        }) {
-            trace!(error = %e, "no subscribers for repost create");
-        }
+        });
         trace!(rkey = %rkey, uri = %repost.subject.uri, "cache: repost inserted");
     }
 
     /// Delete a repost.
     pub fn delete_repost(&self, rkey: &str) {
         if self.reposts.remove(rkey).is_some() {
-            if let Err(e) = self.updates_tx.send(CacheUpdate::RepostDeleted {
+            self.broadcast(CacheUpdate::RepostDeleted {
                 rkey: rkey.to_string(),
-            }) {
-                trace!(error = %e, "no subscribers for repost delete");
-            }
+            });
             trace!(rkey = %rkey, "cache: repost deleted");
         }
     }
@@ -923,20 +965,16 @@ impl RepoCache {
             }
         };
 
-        if let Err(e) = self.updates_tx.send(update) {
-            trace!(error = %e, "no subscribers for post update");
-        }
+        self.broadcast(update);
         trace!(rkey = %rkey, "cache: post upserted");
     }
 
     /// Delete a post.
     pub fn delete_post(&self, rkey: &str) {
         if self.posts.remove(rkey).is_some() {
-            if let Err(e) = self.updates_tx.send(CacheUpdate::PostDeleted {
+            self.broadcast(CacheUpdate::PostDeleted {
                 rkey: rkey.to_string(),
-            }) {
-                trace!(error = %e, "no subscribers for post delete");
-            }
+            });
             trace!(rkey = %rkey, "cache: post deleted");
         }
     }
@@ -1016,9 +1054,7 @@ impl RepoCache {
                 }
             };
 
-            if let Err(e) = self.updates_tx.send(update) {
-                trace!(error = %e, "no subscribers for directive update");
-            }
+            self.broadcast(update);
             trace!(rkey = %rkey, kind = %cached_ref.value().value.kind, "cache: directive upserted");
         }
     }
@@ -1026,11 +1062,9 @@ impl RepoCache {
     /// Delete a directive.
     pub fn delete_directive(&self, rkey: &str) {
         if self.directives.remove(rkey).is_some() {
-            if let Err(e) = self.updates_tx.send(CacheUpdate::DirectiveDeleted {
+            self.broadcast(CacheUpdate::DirectiveDeleted {
                 rkey: rkey.to_string(),
-            }) {
-                trace!(error = %e, "no subscribers for directive delete");
-            }
+            });
             trace!(rkey = %rkey, "cache: directive deleted");
         }
     }
@@ -1089,20 +1123,16 @@ impl RepoCache {
             }
         };
 
-        if let Err(e) = self.updates_tx.send(update) {
-            trace!(error = %e, "no subscribers for tool update");
-        }
+        self.broadcast(update);
         trace!(rkey = %rkey, name = %tool.name, "cache: tool upserted");
     }
 
     /// Delete a custom tool.
     pub fn delete_tool(&self, rkey: &str) {
         if self.tools.remove(rkey).is_some() {
-            if let Err(e) = self.updates_tx.send(CacheUpdate::ToolDeleted {
+            self.broadcast(CacheUpdate::ToolDeleted {
                 rkey: rkey.to_string(),
-            }) {
-                trace!(error = %e, "no subscribers for tool delete");
-            }
+            });
             trace!(rkey = %rkey, "cache: tool deleted");
         }
     }
@@ -1161,20 +1191,16 @@ impl RepoCache {
             }
         };
 
-        if let Err(e) = self.updates_tx.send(update) {
-            trace!(error = %e, "no subscribers for tool approval update");
-        }
+        self.broadcast(update);
         trace!(rkey = %rkey, tool_rkey = %approval.tool_rkey, "cache: tool approval upserted");
     }
 
     /// Delete a tool approval.
     pub fn delete_tool_approval(&self, rkey: &str) {
         if self.tool_approvals.remove(rkey).is_some() {
-            if let Err(e) = self.updates_tx.send(CacheUpdate::ToolApprovalDeleted {
+            self.broadcast(CacheUpdate::ToolApprovalDeleted {
                 rkey: rkey.to_string(),
-            }) {
-                trace!(error = %e, "no subscribers for tool approval delete");
-            }
+            });
             trace!(rkey = %rkey, "cache: tool approval deleted");
         }
     }
@@ -1233,20 +1259,16 @@ impl RepoCache {
             }
         };
 
-        if let Err(e) = self.updates_tx.send(update) {
-            trace!(error = %e, "no subscribers for blog entry update");
-        }
+        self.broadcast(update);
         trace!(rkey = %rkey, title = %entry.title, "cache: blog entry upserted");
     }
 
     /// Delete a blog entry.
     pub fn delete_blog_entry(&self, rkey: &str) {
         if self.blog_entries.remove(rkey).is_some() {
-            if let Err(e) = self.updates_tx.send(CacheUpdate::BlogEntryDeleted {
+            self.broadcast(CacheUpdate::BlogEntryDeleted {
                 rkey: rkey.to_string(),
-            }) {
-                trace!(error = %e, "no subscribers for blog entry delete");
-            }
+            });
             trace!(rkey = %rkey, "cache: blog entry deleted");
         }
     }
@@ -1305,20 +1327,16 @@ impl RepoCache {
             }
         };
 
-        if let Err(e) = self.updates_tx.send(update) {
-            trace!(error = %e, "no subscribers for declaration update");
-        }
+        self.broadcast(update);
         trace!(rkey = %rkey, predicate = %declaration.predicate, "cache: declaration upserted");
     }
 
     /// Delete a fact declaration.
     pub fn delete_declaration(&self, rkey: &str) {
         if self.declarations.remove(rkey).is_some() {
-            if let Err(e) = self.updates_tx.send(CacheUpdate::DeclarationDeleted {
+            self.broadcast(CacheUpdate::DeclarationDeleted {
                 rkey: rkey.to_string(),
-            }) {
-                trace!(error = %e, "no subscribers for declaration delete");
-            }
+            });
             trace!(rkey = %rkey, "cache: declaration deleted");
         }
     }
@@ -1336,11 +1354,9 @@ impl RepoCache {
         };
         *self.identity.write().await = Some(cached);
 
-        if let Err(e) = self.updates_tx.send(CacheUpdate::IdentityUpdated {
+        self.broadcast(CacheUpdate::IdentityUpdated {
             identity: identity.clone(),
-        }) {
-            trace!(error = %e, "no subscribers for identity update");
-        }
+        });
         trace!("cache: identity set");
     }
 
@@ -1357,11 +1373,9 @@ impl RepoCache {
         };
         *self.daemon_state.write().await = Some(cached);
 
-        if let Err(e) = self.updates_tx.send(CacheUpdate::StateUpdated {
+        self.broadcast(CacheUpdate::StateUpdated {
             state: state.clone(),
-        }) {
-            trace!(error = %e, "no subscribers for state update");
-        }
+        });
         trace!(followers = state.followers.len(), "cache: daemon state set");
     }
 
@@ -1395,16 +1409,57 @@ impl RepoCache {
     }
 
     /// Queue a firehose commit for later replay.
+    ///
+    /// If the queue exceeds `MAX_PENDING_EVENTS`, oldest commits are dropped
+    /// to prevent unbounded memory growth during slow syncs or reconnections.
     pub async fn queue_commit(&self, commit: FirehoseCommit) {
         let mut queue = self.pending_events.lock().await;
+
+        // Drop oldest events if queue is full to prevent memory exhaustion
+        while queue.len() >= MAX_PENDING_EVENTS {
+            queue.pop_front();
+            warn!(
+                max = MAX_PENDING_EVENTS,
+                "pending events queue full, dropping oldest commit"
+            );
+        }
+
         queue.push_back(commit);
-        trace!(queue_len = queue.len(), "queued firehose commit");
+
+        // Log at different levels based on queue size for diagnostics
+        let len = queue.len();
+        if len >= 5000 {
+            warn!(queue_len = len, "pending events queue is very large");
+        } else if len >= 1000 {
+            debug!(queue_len = len, "pending events queue growing");
+        } else {
+            trace!(queue_len = len, "queued firehose commit");
+        }
     }
 
-    /// Drain all pending commits.
+    /// Clear all pending firehose commits.
+    ///
+    /// Called when restarting sync to discard stale events from a previous
+    /// sync attempt that are no longer relevant.
+    pub async fn clear_pending(&self) {
+        let mut queue = self.pending_events.lock().await;
+        let count = queue.len();
+        queue.clear();
+        if count > 0 {
+            debug!(count, "cleared stale pending events");
+        }
+    }
+
+    /// Drain all pending commits for replay.
+    ///
+    /// Returns all queued commits, emptying the queue.
     pub async fn drain_pending(&self) -> Vec<FirehoseCommit> {
         let mut queue = self.pending_events.lock().await;
-        queue.drain(..).collect()
+        let commits: Vec<_> = queue.drain(..).collect();
+        if !commits.is_empty() {
+            debug!(count = commits.len(), "drained pending commits for replay");
+        }
+        commits
     }
 
     /// Populate cache from CAR parse result (legacy method for facts and rules only).
@@ -1524,10 +1579,10 @@ impl RepoCache {
         for (rkey, job, cid) in jobs {
             self.jobs.insert(rkey, CachedRecord { value: job, cid });
         }
-        if let Some((id, cid)) = identity {
-            if let Ok(mut guard) = self.identity.try_write() {
-                *guard = Some(CachedRecord { value: id, cid });
-            }
+        if let Some((id, cid)) = identity
+            && let Ok(mut guard) = self.identity.try_write()
+        {
+            *guard = Some(CachedRecord { value: id, cid });
         }
         for (rkey, directive, cid) in directives {
             self.directives.insert(
@@ -1603,7 +1658,7 @@ impl RepoCache {
 
 impl Default for RepoCache {
     fn default() -> Self {
-        let (updates_tx, _) = broadcast::channel(256);
+        let (updates_tx, _) = broadcast::channel(BROADCAST_CHANNEL_CAPACITY);
         Self {
             facts: DashMap::new(),
             rules: DashMap::new(),
@@ -1623,8 +1678,10 @@ impl Default for RepoCache {
             declarations: DashMap::new(),
             state: AtomicU8::new(SyncState::Disconnected as u8),
             repo_rev: RwLock::new(None),
+            firehose_seq: AtomicI64::new(0),
             pending_events: Mutex::new(VecDeque::new()),
             updates_tx,
+            suppress_broadcasts: AtomicBool::new(false),
         }
     }
 }
@@ -1934,10 +1991,12 @@ mod tests {
 
         // Queue some commits
         let commit1 = FirehoseCommit {
+            seq: 1,
             rev: "rev1".to_string(),
             ops: vec![],
         };
         let commit2 = FirehoseCommit {
+            seq: 2,
             rev: "rev2".to_string(),
             ops: vec![],
         };
@@ -1954,6 +2013,55 @@ mod tests {
         // Should be empty now
         let empty = cache.drain_pending().await;
         assert!(empty.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pending_events_queue_bounded() {
+        let cache = RepoCache::new();
+
+        // Queue more than MAX_PENDING_EVENTS commits
+        for i in 0..(MAX_PENDING_EVENTS + 100) {
+            let commit = FirehoseCommit {
+                seq: i as i64,
+                rev: format!("rev{}", i),
+                ops: vec![],
+            };
+            cache.queue_commit(commit).await;
+        }
+
+        // Drain and verify we only have MAX_PENDING_EVENTS
+        let drained = cache.drain_pending().await;
+        assert_eq!(drained.len(), MAX_PENDING_EVENTS);
+
+        // Verify oldest were dropped (first 100 should be missing)
+        // The remaining commits should be rev100 through rev10099
+        assert_eq!(drained[0].rev, "rev100");
+        assert_eq!(
+            drained[MAX_PENDING_EVENTS - 1].rev,
+            format!("rev{}", MAX_PENDING_EVENTS + 99)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_clear_pending() {
+        let cache = RepoCache::new();
+
+        // Queue some commits
+        for i in 0..10 {
+            let commit = FirehoseCommit {
+                seq: i as i64,
+                rev: format!("rev{}", i),
+                ops: vec![],
+            };
+            cache.queue_commit(commit).await;
+        }
+
+        // Clear pending
+        cache.clear_pending().await;
+
+        // Drain should return empty
+        let drained = cache.drain_pending().await;
+        assert!(drained.is_empty());
     }
 
     #[test]
@@ -1973,5 +2081,29 @@ mod tests {
             CacheUpdate::FactCreated { rkey, .. } => assert_eq!(rkey, "rkey1"),
             _ => panic!("Expected FactCreated"),
         }
+    }
+
+    #[test]
+    fn test_firehose_seq_tracking() {
+        let cache = RepoCache::new();
+
+        // Initially 0
+        assert_eq!(cache.firehose_seq(), 0);
+
+        // Update increases the value
+        cache.update_firehose_seq(100);
+        assert_eq!(cache.firehose_seq(), 100);
+
+        // Update with higher value succeeds
+        cache.update_firehose_seq(200);
+        assert_eq!(cache.firehose_seq(), 200);
+
+        // Update with lower value is ignored (monotonic increase)
+        cache.update_firehose_seq(150);
+        assert_eq!(cache.firehose_seq(), 200);
+
+        // Reset clears the value
+        cache.reset_firehose_seq();
+        assert_eq!(cache.firehose_seq(), 0);
     }
 }

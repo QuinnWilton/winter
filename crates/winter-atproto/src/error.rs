@@ -13,6 +13,10 @@ pub enum AtprotoError {
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// Network error (connection failed, timeout, etc.).
+    #[error("network error: {0}")]
+    Network(String),
+
     /// JSON serialization/deserialization failed.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
@@ -58,4 +62,12 @@ pub enum AtprotoError {
     /// Sync error.
     #[error("sync error: {0}")]
     Sync(String),
+
+    /// Blob too large.
+    #[error("blob too large: {size} bytes exceeds maximum of {max} bytes")]
+    BlobTooLarge { size: usize, max: usize },
+
+    /// Invalid MIME type.
+    #[error("invalid MIME type: {0}")]
+    InvalidMimeType(String),
 }

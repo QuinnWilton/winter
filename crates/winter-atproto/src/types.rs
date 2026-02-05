@@ -126,9 +126,8 @@ where
         {
             // Parse as CID from bytes
             use ipld_core::cid::Cid;
-            let cid = Cid::read_bytes(value).map_err(|e| {
-                de::Error::custom(format!("failed to parse CID from bytes: {}", e))
-            })?;
+            let cid = Cid::read_bytes(value)
+                .map_err(|e| de::Error::custom(format!("failed to parse CID from bytes: {}", e)))?;
             Ok(cid.to_string())
         }
 
@@ -343,6 +342,22 @@ pub struct GetRecordResponse<T> {
     pub value: T,
 }
 
+/// Response from getting multiple records.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetRecordsResponse<T> {
+    pub records: Vec<GetRecordsItem<T>>,
+}
+
+/// A single record in a batch get response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetRecordsItem<T> {
+    pub uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<T>,
+}
+
 /// Response from listing records.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListRecordsResponse<T> {
@@ -427,7 +442,10 @@ pub struct Fact {
 
 /// Serialize confidence as a string for ATProto compatibility.
 /// ATProto lexicons don't support floating-point numbers, so we store as string.
-fn serialize_confidence_as_string<S>(confidence: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_confidence_as_string<S>(
+    confidence: &Option<f64>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
@@ -439,7 +457,9 @@ where
 
 /// Deserialize confidence from string (new format) or number (legacy format).
 /// Handles backward compatibility with existing records that used number type.
-fn deserialize_confidence_from_string_or_number<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+fn deserialize_confidence_from_string_or_number<'de, D>(
+    deserializer: D,
+) -> Result<Option<f64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -1307,15 +1327,27 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["predicate"], "impression");
         assert_eq!(parsed["args"][0], "did:plc:lsebysg3dr42gobuybwqtyir");
-        assert_eq!(parsed["args"][1], "thoughtful agent on consciousness uncertainty");
+        assert_eq!(
+            parsed["args"][1],
+            "thoughtful agent on consciousness uncertainty"
+        );
         assert_eq!(parsed["confidence"], "0.7"); // Stored as string in ATProto
         assert_eq!(parsed["tags"][0], "agent");
         assert_eq!(parsed["tags"][1], "phenomenology");
         // createdAt should be present (camelCase due to rename_all)
-        assert!(parsed.get("createdAt").is_some(), "createdAt field should be present");
+        assert!(
+            parsed.get("createdAt").is_some(),
+            "createdAt field should be present"
+        );
         // source and supersedes should be absent (Option::None)
-        assert!(parsed.get("source").is_none(), "source should be absent when None");
-        assert!(parsed.get("supersedes").is_none(), "supersedes should be absent when None");
+        assert!(
+            parsed.get("source").is_none(),
+            "source should be absent when None"
+        );
+        assert!(
+            parsed.get("supersedes").is_none(),
+            "supersedes should be absent when None"
+        );
     }
 
     #[test]
@@ -1339,8 +1371,14 @@ mod tests {
         assert_eq!(parsed["predicate"], "noticed_agent");
         assert_eq!(parsed["args"][0], "did:plc:xxx");
         // confidence, tags should be absent
-        assert!(parsed.get("confidence").is_none(), "confidence should be absent when None");
-        assert!(parsed.get("tags").is_none(), "tags should be absent when empty");
+        assert!(
+            parsed.get("confidence").is_none(),
+            "confidence should be absent when None"
+        );
+        assert!(
+            parsed.get("tags").is_none(),
+            "tags should be absent when empty"
+        );
     }
 
     #[test]
@@ -1348,7 +1386,10 @@ mod tests {
         // Test deserialization from JSON (string CID)
         let json = r#"{"uri":"at://did:plc:test/app.bsky.feed.post/abc123","cid":"bafyreig6"}"#;
         let strong_ref: StrongRef = serde_json::from_str(json).unwrap();
-        assert_eq!(strong_ref.uri, "at://did:plc:test/app.bsky.feed.post/abc123");
+        assert_eq!(
+            strong_ref.uri,
+            "at://did:plc:test/app.bsky.feed.post/abc123"
+        );
         assert_eq!(strong_ref.cid, "bafyreig6");
     }
 
@@ -1373,9 +1414,15 @@ mod tests {
             "parent": {"uri": "at://did:plc:parent/app.bsky.feed.post/456", "cid": "bafyparent"}
         }"#;
         let reply_ref: ReplyRef = serde_json::from_str(json).unwrap();
-        assert_eq!(reply_ref.root.uri, "at://did:plc:root/app.bsky.feed.post/123");
+        assert_eq!(
+            reply_ref.root.uri,
+            "at://did:plc:root/app.bsky.feed.post/123"
+        );
         assert_eq!(reply_ref.root.cid, "bafyroot");
-        assert_eq!(reply_ref.parent.uri, "at://did:plc:parent/app.bsky.feed.post/456");
+        assert_eq!(
+            reply_ref.parent.uri,
+            "at://did:plc:parent/app.bsky.feed.post/456"
+        );
         assert_eq!(reply_ref.parent.cid, "bafyparent");
     }
 
@@ -1394,7 +1441,10 @@ mod tests {
         assert!(post.reply.is_some());
         let reply = post.reply.unwrap();
         assert_eq!(reply.root.uri, "at://did:plc:root/app.bsky.feed.post/123");
-        assert_eq!(reply.parent.uri, "at://did:plc:parent/app.bsky.feed.post/456");
+        assert_eq!(
+            reply.parent.uri,
+            "at://did:plc:parent/app.bsky.feed.post/456"
+        );
     }
 
     #[test]

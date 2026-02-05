@@ -193,6 +193,21 @@ impl AtprotoClient {
         )
     }
 
+    /// Check if an error is transient and worth retrying.
+    fn is_transient_error(err: &AtprotoError) -> bool {
+        match err {
+            AtprotoError::Xrpc { error, .. } => {
+                // Upstream errors from PDS
+                error == "UpstreamFailure"
+                    || error == "UpstreamTimeout"
+                    || error == "InternalServerError"
+                    || error == "ServiceUnavailable"
+            }
+            AtprotoError::Network(_) => true,
+            _ => false,
+        }
+    }
+
     /// Try to refresh the session if possible.
     /// Returns true if refresh succeeded, false if it failed or wasn't possible.
     async fn try_refresh(&self) -> bool {
@@ -253,7 +268,9 @@ impl AtprotoClient {
             debug!(collection = %collection, body = %json, "creating record");
         }
 
-        for attempt in 0..2 {
+        // Retry up to 4 times: initial + 3 retries with backoff
+        let mut last_error = None;
+        for attempt in 0..4 {
             let token = self.access_token().await?;
 
             let response = self
@@ -266,19 +283,31 @@ impl AtprotoClient {
 
             let result = self.handle_response(response).await;
 
-            // Retry once on expired token
-            if attempt == 0 {
-                if let Err(ref e) = result {
-                    if Self::is_expired_token_error(e) && self.try_refresh().await {
+            match result {
+                Ok(v) => return Ok(v),
+                Err(ref e) if Self::is_expired_token_error(e) => {
+                    if self.try_refresh().await {
                         continue;
                     }
+                    return result;
                 }
+                Err(ref e) if Self::is_transient_error(e) && attempt < 3 => {
+                    let backoff_ms = 500 * (1 << attempt); // 500ms, 1s, 2s
+                    warn!(
+                        attempt = attempt + 1,
+                        backoff_ms,
+                        error = %e,
+                        "transient error in create_record, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    last_error = Some(result);
+                    continue;
+                }
+                Err(_) => return result,
             }
-
-            return result;
         }
 
-        unreachable!()
+        last_error.unwrap_or_else(|| Err(AtprotoError::InvalidResponse("retry exhausted".into())))
     }
 
     /// Get a record by collection and rkey.
@@ -294,7 +323,9 @@ impl AtprotoClient {
 
         let url = format!("{}/xrpc/com.atproto.repo.getRecord", self.pds_url);
 
-        for attempt in 0..2 {
+        // Retry up to 4 times: initial + 3 retries with backoff
+        let mut last_error = None;
+        for attempt in 0..4 {
             let token = self.access_token().await?;
 
             let response = self
@@ -318,19 +349,90 @@ impl AtprotoClient {
 
             let result = self.handle_response(response).await;
 
-            // Retry once on expired token
-            if attempt == 0 {
-                if let Err(ref e) = result {
-                    if Self::is_expired_token_error(e) && self.try_refresh().await {
+            match result {
+                Ok(v) => return Ok(v),
+                Err(ref e) if Self::is_expired_token_error(e) => {
+                    if self.try_refresh().await {
                         continue;
                     }
+                    return result;
                 }
+                Err(ref e) if Self::is_transient_error(e) && attempt < 3 => {
+                    let backoff_ms = 500 * (1 << attempt); // 500ms, 1s, 2s
+                    debug!(
+                        attempt = attempt + 1,
+                        backoff_ms,
+                        error = %e,
+                        "transient error in get_record, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    last_error = Some(result);
+                    continue;
+                }
+                Err(_) => return result,
             }
-
-            return result;
         }
 
-        unreachable!()
+        last_error.unwrap_or_else(|| Err(AtprotoError::InvalidResponse("retry exhausted".into())))
+    }
+
+    /// Get multiple records by their AT URIs.
+    ///
+    /// Uses `com.atproto.repo.getRecords` to fetch multiple records in a single request.
+    /// Returns results for all requested URIs; missing records have `value: None`.
+    pub async fn get_records<T: DeserializeOwned>(
+        &self,
+        uris: &[&str],
+    ) -> Result<crate::GetRecordsResponse<T>, AtprotoError> {
+        if uris.is_empty() {
+            return Ok(crate::GetRecordsResponse { records: vec![] });
+        }
+
+        let url = format!("{}/xrpc/com.atproto.repo.getRecords", self.pds_url);
+
+        // Retry up to 4 times: initial + 3 retries with backoff
+        let mut last_error = None;
+        for attempt in 0..4 {
+            let token = self.access_token().await?;
+
+            // Build query parameters - multiple uris= params
+            let query_params: Vec<(&str, &str)> = uris.iter().map(|u| ("uris", *u)).collect();
+
+            let response = self
+                .http
+                .get(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .query(&query_params)
+                .send()
+                .await?;
+
+            let result = self.handle_response(response).await;
+
+            match result {
+                Ok(v) => return Ok(v),
+                Err(ref e) if Self::is_expired_token_error(e) => {
+                    if self.try_refresh().await {
+                        continue;
+                    }
+                    return result;
+                }
+                Err(ref e) if Self::is_transient_error(e) && attempt < 3 => {
+                    let backoff_ms = 500 * (1 << attempt); // 500ms, 1s, 2s
+                    debug!(
+                        attempt = attempt + 1,
+                        backoff_ms,
+                        error = %e,
+                        "transient error in get_records, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    last_error = Some(result);
+                    continue;
+                }
+                Err(_) => return result,
+            }
+        }
+
+        last_error.unwrap_or_else(|| Err(AtprotoError::InvalidResponse("retry exhausted".into())))
     }
 
     /// List records in a collection.
@@ -347,7 +449,9 @@ impl AtprotoClient {
 
         let url = format!("{}/xrpc/com.atproto.repo.listRecords", self.pds_url);
 
-        for attempt in 0..2 {
+        // Retry up to 4 times: initial + 3 retries with backoff
+        let mut last_error = None;
+        for attempt in 0..4 {
             let token = self.access_token().await?;
 
             let mut query_params: Vec<(&str, String)> = vec![
@@ -371,19 +475,31 @@ impl AtprotoClient {
 
             let result = self.handle_response(response).await;
 
-            // Retry once on expired token
-            if attempt == 0 {
-                if let Err(ref e) = result {
-                    if Self::is_expired_token_error(e) && self.try_refresh().await {
+            match result {
+                Ok(v) => return Ok(v),
+                Err(ref e) if Self::is_expired_token_error(e) => {
+                    if self.try_refresh().await {
                         continue;
                     }
+                    return result;
                 }
+                Err(ref e) if Self::is_transient_error(e) && attempt < 3 => {
+                    let backoff_ms = 500 * (1 << attempt); // 500ms, 1s, 2s
+                    debug!(
+                        attempt = attempt + 1,
+                        backoff_ms,
+                        error = %e,
+                        "transient error in list_records, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    last_error = Some(result);
+                    continue;
+                }
+                Err(_) => return result,
             }
-
-            return result;
         }
 
-        unreachable!()
+        last_error.unwrap_or_else(|| Err(AtprotoError::InvalidResponse("retry exhausted".into())))
     }
 
     /// List all records in a collection (handles pagination).
@@ -442,7 +558,9 @@ impl AtprotoClient {
 
         let url = format!("{}/xrpc/com.atproto.repo.putRecord", self.pds_url);
 
-        for attempt in 0..2 {
+        // Retry up to 4 times: initial + 3 retries with backoff
+        let mut last_error = None;
+        for attempt in 0..4 {
             let token = self.access_token().await?;
 
             let response = self
@@ -460,19 +578,31 @@ impl AtprotoClient {
 
             let result = self.handle_response(response).await;
 
-            // Retry once on expired token
-            if attempt == 0 {
-                if let Err(ref e) = result {
-                    if Self::is_expired_token_error(e) && self.try_refresh().await {
+            match result {
+                Ok(v) => return Ok(v),
+                Err(ref e) if Self::is_expired_token_error(e) => {
+                    if self.try_refresh().await {
                         continue;
                     }
+                    return result;
                 }
+                Err(ref e) if Self::is_transient_error(e) && attempt < 3 => {
+                    let backoff_ms = 500 * (1 << attempt); // 500ms, 1s, 2s
+                    warn!(
+                        attempt = attempt + 1,
+                        backoff_ms,
+                        error = %e,
+                        "transient error in put_record, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    last_error = Some(result);
+                    continue;
+                }
+                Err(_) => return result,
             }
-
-            return result;
         }
 
-        unreachable!()
+        last_error.unwrap_or_else(|| Err(AtprotoError::InvalidResponse("retry exhausted".into())))
     }
 
     /// Get the PDS URL.
@@ -489,11 +619,13 @@ impl AtprotoClient {
         for attempt in 0..2 {
             let token = self.access_token().await?;
 
+            // Use a longer timeout for CAR downloads - repos can be large
             let response = self
                 .http
                 .get(&url)
                 .header("Authorization", format!("Bearer {}", token))
                 .query(&[("did", did)])
+                .timeout(Duration::from_secs(120))
                 .send()
                 .await?;
 
@@ -571,7 +703,9 @@ impl AtprotoClient {
 
         let url = format!("{}/xrpc/com.atproto.repo.deleteRecord", self.pds_url);
 
-        for attempt in 0..2 {
+        // Retry up to 4 times: initial + 3 retries with backoff
+        let mut last_error: Option<AtprotoError> = None;
+        for attempt in 0..4 {
             let token = self.access_token().await?;
 
             let response = self
@@ -586,53 +720,69 @@ impl AtprotoClient {
                 .send()
                 .await?;
 
-            if !response.status().is_success() {
-                let status = response.status();
-                if status == reqwest::StatusCode::NOT_FOUND {
-                    return Err(AtprotoError::NotFound {
-                        collection: collection.to_string(),
-                        rkey: rkey.to_string(),
-                    });
-                }
-                let text = response.text().await.map_err(|e| {
-                    AtprotoError::InvalidResponse(format!(
-                        "delete failed ({}): failed to read response: {}",
-                        status, e
-                    ))
-                })?;
-
-                // Check for expired token before returning error
-                if let Ok(xrpc_error) = serde_json::from_str::<XrpcError>(&text) {
-                    let err = AtprotoError::Xrpc {
-                        error: xrpc_error.error.clone(),
-                        message: xrpc_error.message,
-                    };
-                    if attempt == 0
-                        && Self::is_expired_token_error(&err)
-                        && self.try_refresh().await
-                    {
-                        continue;
-                    }
-                    return Err(err);
-                }
-
-                return Err(AtprotoError::InvalidResponse(format!(
-                    "delete failed ({}): {}",
-                    status, text
-                )));
+            if response.status().is_success() {
+                return Ok(());
             }
 
-            return Ok(());
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(AtprotoError::NotFound {
+                    collection: collection.to_string(),
+                    rkey: rkey.to_string(),
+                });
+            }
+
+            let text = response.text().await.map_err(|e| {
+                AtprotoError::InvalidResponse(format!(
+                    "delete failed ({}): failed to read response: {}",
+                    status, e
+                ))
+            })?;
+
+            // Check for XRPC error
+            if let Ok(xrpc_error) = serde_json::from_str::<XrpcError>(&text) {
+                let err = AtprotoError::Xrpc {
+                    error: xrpc_error.error.clone(),
+                    message: xrpc_error.message,
+                };
+
+                if Self::is_expired_token_error(&err) && self.try_refresh().await {
+                    continue;
+                }
+
+                if Self::is_transient_error(&err) && attempt < 3 {
+                    let backoff_ms = 500 * (1 << attempt); // 500ms, 1s, 2s
+                    warn!(
+                        attempt = attempt + 1,
+                        backoff_ms,
+                        error = %err,
+                        "transient error in delete_record, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    last_error = Some(err);
+                    continue;
+                }
+
+                return Err(err);
+            }
+
+            return Err(AtprotoError::InvalidResponse(format!(
+                "delete failed ({}): {}",
+                status, text
+            )));
         }
 
-        unreachable!()
+        Err(last_error.unwrap_or_else(|| AtprotoError::InvalidResponse("retry exhausted".into())))
     }
 
     /// Apply multiple write operations atomically.
     ///
     /// This uses `com.atproto.repo.applyWrites` to batch multiple create, update,
     /// or delete operations into a single transaction.
-    pub async fn apply_writes(&self, writes: Vec<WriteOp>) -> Result<ApplyWritesResponse, AtprotoError> {
+    pub async fn apply_writes(
+        &self,
+        writes: Vec<WriteOp>,
+    ) -> Result<ApplyWritesResponse, AtprotoError> {
         if writes.is_empty() {
             return Err(AtprotoError::InvalidResponse(
                 "apply_writes requires at least one write operation".to_string(),
@@ -649,7 +799,11 @@ impl AtprotoClient {
             .into_iter()
             .map(|op| {
                 match op {
-                    WriteOp::Create { collection, rkey, mut value } => {
+                    WriteOp::Create {
+                        collection,
+                        rkey,
+                        mut value,
+                    } => {
                         // Add $type to the value if it's an object
                         if let serde_json::Value::Object(ref mut map) = value {
                             map.insert(
@@ -664,7 +818,11 @@ impl AtprotoClient {
                             "value": value
                         })
                     }
-                    WriteOp::Update { collection, rkey, mut value } => {
+                    WriteOp::Update {
+                        collection,
+                        rkey,
+                        mut value,
+                    } => {
                         if let serde_json::Value::Object(ref mut map) = value {
                             map.insert(
                                 "$type".to_string(),
@@ -704,7 +862,9 @@ impl AtprotoClient {
 
         debug!(count = request_body.writes.len(), "applying batch writes");
 
-        for attempt in 0..2 {
+        // Retry up to 4 times: initial + 3 retries with backoff
+        let mut last_error = None;
+        for attempt in 0..4 {
             let token = self.access_token().await?;
 
             let response = self
@@ -717,19 +877,104 @@ impl AtprotoClient {
 
             let result = self.handle_response(response).await;
 
-            // Retry once on expired token
-            if attempt == 0 {
-                if let Err(ref e) = result {
-                    if Self::is_expired_token_error(e) && self.try_refresh().await {
+            match result {
+                Ok(v) => return Ok(v),
+                Err(ref e) if Self::is_expired_token_error(e) => {
+                    if self.try_refresh().await {
                         continue;
                     }
+                    return result;
                 }
+                Err(ref e) if Self::is_transient_error(e) && attempt < 3 => {
+                    let backoff_ms = 500 * (1 << attempt); // 500ms, 1s, 2s
+                    warn!(
+                        attempt = attempt + 1,
+                        backoff_ms,
+                        error = %e,
+                        "transient error in apply_writes, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    last_error = Some(result);
+                    continue;
+                }
+                Err(_) => return result,
             }
-
-            return result;
         }
 
-        unreachable!()
+        last_error.unwrap_or_else(|| Err(AtprotoError::InvalidResponse("retry exhausted".into())))
+    }
+
+    /// Upload a blob to the PDS.
+    ///
+    /// Returns the blob reference JSON containing `$type`, `ref.$link`, `mimeType`, and `size`.
+    pub async fn upload_blob(
+        &self,
+        data: &[u8],
+        mime_type: &str,
+    ) -> Result<serde_json::Value, AtprotoError> {
+        // Validate MIME type
+        const ALLOWED_MIME_TYPES: &[&str] = &["image/jpeg", "image/png", "image/webp", "image/gif"];
+        if !ALLOWED_MIME_TYPES.contains(&mime_type) {
+            return Err(AtprotoError::InvalidMimeType(mime_type.to_string()));
+        }
+
+        // Validate size (max 1MB)
+        const MAX_BLOB_SIZE: usize = 1_000_000;
+        if data.len() > MAX_BLOB_SIZE {
+            return Err(AtprotoError::BlobTooLarge {
+                size: data.len(),
+                max: MAX_BLOB_SIZE,
+            });
+        }
+
+        let url = format!("{}/xrpc/com.atproto.repo.uploadBlob", self.pds_url);
+
+        // Retry up to 4 times: initial + 3 retries with backoff
+        let mut last_error = None;
+        for attempt in 0..4 {
+            let token = self.access_token().await?;
+
+            let response = self
+                .http
+                .post(&url)
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", mime_type)
+                .body(data.to_vec())
+                .send()
+                .await?;
+
+            let result = self.handle_response::<UploadBlobResponse>(response).await;
+
+            match result {
+                Ok(v) => {
+                    debug!(size = data.len(), mime_type = %mime_type, "uploaded blob");
+                    return Ok(v.blob);
+                }
+                Err(ref e) if Self::is_expired_token_error(e) => {
+                    if self.try_refresh().await {
+                        continue;
+                    }
+                    return Err(result.unwrap_err());
+                }
+                Err(ref e) if Self::is_transient_error(e) && attempt < 3 => {
+                    let backoff_ms = 500 * (1 << attempt); // 500ms, 1s, 2s
+                    warn!(
+                        attempt = attempt + 1,
+                        backoff_ms,
+                        error = %e,
+                        "transient error in upload_blob, retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    last_error = Some(result);
+                    continue;
+                }
+                Err(_) => return Err(result.unwrap_err()),
+            }
+        }
+
+        Err(last_error
+            .unwrap_or_else(|| Err(AtprotoError::InvalidResponse("retry exhausted".into())))
+            .unwrap_err())
     }
 
     /// Handle HTTP response and parse JSON.
@@ -783,6 +1028,12 @@ impl AtprotoClient {
 struct XrpcError {
     error: String,
     message: String,
+}
+
+/// Response from `com.atproto.repo.uploadBlob`.
+#[derive(Debug, serde::Deserialize)]
+struct UploadBlobResponse {
+    blob: serde_json::Value,
 }
 
 #[cfg(test)]

@@ -64,6 +64,10 @@ impl SyncCoordinator {
     ) -> Result<JoinHandle<()>, AtprotoError> {
         info!(did = %self.did, firehose = %self.firehose_url, "starting sync coordinator");
 
+        // Clear any stale pending events from a previous sync attempt
+        // This prevents unbounded queue growth on reconnection
+        self.cache.clear_pending().await;
+
         // Set state to syncing
         self.cache.set_state(SyncState::Syncing);
 
@@ -194,10 +198,18 @@ impl SyncCoordinator {
         );
 
         // 4. Replay queued firehose events
+        // Suppress broadcasts during replay to prevent broadcast channel lag,
+        // which would trigger expensive full TSV regeneration in DatalogCache.
+        // The Synchronized event (sent when going Live) will trigger
+        // populate_from_repo_cache() to do a full sync instead.
         let current_rev = self.cache.repo_rev().await;
         let pending = self.cache.drain_pending().await;
 
-        debug!(pending = pending.len(), "replaying pending firehose events");
+        debug!(
+            pending = pending.len(),
+            "replaying pending firehose events (broadcasts suppressed)"
+        );
+        self.cache.set_suppress_broadcasts(true);
 
         for commit in pending {
             // Skip events already included in CAR (based on revision comparison)
@@ -213,6 +225,9 @@ impl SyncCoordinator {
                 warn!(rev = %commit.rev, error = %e, "failed to apply pending commit");
             }
         }
+
+        // Re-enable broadcasts before going live
+        self.cache.set_suppress_broadcasts(false);
 
         // 5. Go live
         self.cache.set_state(SyncState::Live);

@@ -5,27 +5,45 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use futures_util::StreamExt;
+use backoff::ExponentialBackoff;
+use backoff::backoff::Backoff;
+use futures_util::stream::{SplitSink, SplitStream};
+use futures_util::{SinkExt, StreamExt};
 use iroh_car::CarReader;
 use serde::Deserialize;
-use tokio::sync::watch;
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, watch};
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::cache::{FirehoseCommit, FirehoseOp, RepoCache, SyncState};
-use crate::{
-    AtprotoError, BLOG_COLLECTION, BlogEntry, CustomTool, DIRECTIVE_COLLECTION, Directive,
-    FACT_COLLECTION, FACT_DECLARATION_COLLECTION, FOLLOW_COLLECTION, Fact, FactDeclaration, Follow,
-    IDENTITY_COLLECTION, IDENTITY_KEY, Identity, JOB_COLLECTION, Job, LIKE_COLLECTION, Like,
-    NOTE_COLLECTION, Note, POST_COLLECTION, Post, REPOST_COLLECTION, RULE_COLLECTION, Repost, Rule,
-    THOUGHT_COLLECTION, TOOL_APPROVAL_COLLECTION, TOOL_COLLECTION, Thought, ToolApproval,
-};
+use crate::dispatch::{dispatch_create_or_update, dispatch_delete, is_tracked_collection};
+use crate::{AtprotoError, IDENTITY_COLLECTION, IDENTITY_KEY, Identity};
 
 /// Default firehose URL (Bluesky relay).
 pub const DEFAULT_FIREHOSE_URL: &str = "wss://bsky.network";
+
+/// Channel buffer size for messages between reader and processor tasks.
+/// Large enough to absorb processing bursts without blocking the reader.
+const PROCESSOR_CHANNEL_SIZE: usize = 1000;
+
+/// Duration to wait after reconnection before re-enabling broadcasts.
+/// During this window, firehose events are applied to the cache but broadcasts
+/// are suppressed to prevent channel lag that triggers expensive TSV regeneration.
+const RECONNECTION_CATCHUP_DURATION: Duration = Duration::from_secs(3);
+
+/// Message sent from reader to processor task.
+enum ProcessorMessage {
+    /// Binary WebSocket message to process.
+    Binary(Vec<u8>),
+    /// Reader encountered an error.
+    ReaderError(AtprotoError),
+    /// Reader is shutting down (clean exit).
+    Shutdown,
+}
 
 /// Firehose client for subscribing to repository updates.
 pub struct FirehoseClient {
@@ -52,8 +70,12 @@ impl FirehoseClient {
     /// This runs in a loop, reconnecting on disconnection with exponential backoff.
     /// Events are either queued (during sync) or applied directly (when live).
     pub async fn run(&self, mut shutdown_rx: watch::Receiver<bool>) -> Result<(), AtprotoError> {
-        let mut backoff = Duration::from_secs(1);
-        let max_backoff = Duration::from_secs(60);
+        let mut backoff = ExponentialBackoff {
+            initial_interval: Duration::from_secs(1),
+            max_interval: Duration::from_secs(60),
+            max_elapsed_time: None, // Retry forever
+            ..Default::default()
+        };
 
         loop {
             if *shutdown_rx.borrow() {
@@ -61,13 +83,26 @@ impl FirehoseClient {
                 return Ok(());
             }
 
-            match self.connect_and_process(&mut shutdown_rx).await {
+            match self
+                .connect_and_process(&mut shutdown_rx, &mut backoff)
+                .await
+            {
                 Ok(()) => {
                     // Clean shutdown
                     return Ok(());
                 }
                 Err(e) => {
                     error!(error = %e, "firehose connection error, reconnecting");
+
+                    // Set state to Syncing so tools fall back to HTTP during reconnection
+                    // This prevents serving stale data during the gap
+                    if self.cache.state() == SyncState::Live {
+                        self.cache.set_state(SyncState::Syncing);
+                        warn!("firehose disconnected, cache set to Syncing until reconnection");
+                    }
+
+                    // Get next backoff duration (always Some since max_elapsed_time is None)
+                    let wait_duration = backoff.next_backoff().unwrap_or(Duration::from_secs(60));
 
                     // Wait with backoff
                     tokio::select! {
@@ -76,11 +111,167 @@ impl FirehoseClient {
                                 return Ok(());
                             }
                         }
-                        _ = tokio::time::sleep(backoff) => {}
+                        _ = tokio::time::sleep(wait_duration) => {}
                     }
+                }
+            }
+        }
+    }
 
-                    // Increase backoff
-                    backoff = std::cmp::min(backoff * 2, max_backoff);
+    /// Reader task: reads WebSocket messages and immediately responds to pings.
+    ///
+    /// This task is lightweight and never blocks on message processing. Binary messages
+    /// are forwarded to the processor task via a channel. If the channel is full,
+    /// messages are dropped (cursor-based reconnection will replay them).
+    async fn reader_task(
+        mut read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+        mut write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+        msg_tx: mpsc::Sender<ProcessorMessage>,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) -> Result<(), AtprotoError> {
+        const READ_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+
+        loop {
+            tokio::select! {
+                biased;
+
+                // Check for shutdown first (highest priority)
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!("firehose reader received shutdown signal");
+                        // Best-effort send; processor may already be gone
+                        let _ = msg_tx.send(ProcessorMessage::Shutdown).await;
+                        return Ok(());
+                    }
+                }
+
+                // Read from WebSocket
+                result = timeout(READ_TIMEOUT, read.next()) => {
+                    match result {
+                        Ok(Some(Ok(Message::Ping(data)))) => {
+                            // Respond to pings immediately - this is the critical path
+                            trace!("received ping, sending pong");
+                            if let Err(e) = write.send(Message::Pong(data)).await {
+                                warn!(error = %e, "failed to send pong");
+                                let err = AtprotoError::WebSocket(format!("pong failed: {}", e));
+                                let _ = msg_tx.send(ProcessorMessage::ReaderError(
+                                    AtprotoError::WebSocket(format!("pong failed: {}", e))
+                                )).await;
+                                return Err(err);
+                            }
+                        }
+                        Ok(Some(Ok(Message::Binary(data)))) => {
+                            // Forward binary messages to processor (non-blocking)
+                            match msg_tx.try_send(ProcessorMessage::Binary(data)) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    // Channel full - drop message, cursor will replay on reconnect
+                                    warn!("processor channel full, dropping firehose message");
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    // Processor has shut down
+                                    debug!("processor channel closed, reader exiting");
+                                    return Ok(());
+                                }
+                            }
+                        }
+                        Ok(Some(Ok(Message::Close(_)))) => {
+                            info!("firehose connection closed by server");
+                            let err = AtprotoError::WebSocket("connection closed".to_string());
+                            let _ = msg_tx.send(ProcessorMessage::ReaderError(
+                                AtprotoError::WebSocket("connection closed".to_string())
+                            )).await;
+                            return Err(err);
+                        }
+                        Ok(Some(Ok(_))) => {
+                            // Ignore other message types (text, pong)
+                        }
+                        Ok(Some(Err(e))) => {
+                            let err = AtprotoError::WebSocket(format!("read error: {}", e));
+                            let _ = msg_tx.send(ProcessorMessage::ReaderError(
+                                AtprotoError::WebSocket(format!("read error: {}", e))
+                            )).await;
+                            return Err(err);
+                        }
+                        Ok(None) => {
+                            let err = AtprotoError::WebSocket("stream ended".to_string());
+                            let _ = msg_tx.send(ProcessorMessage::ReaderError(
+                                AtprotoError::WebSocket("stream ended".to_string())
+                            )).await;
+                            return Err(err);
+                        }
+                        Err(_) => {
+                            warn!("firehose read timeout after {}s - connection may be stale", READ_TIMEOUT.as_secs());
+                            let err = AtprotoError::WebSocket("read timeout".to_string());
+                            let _ = msg_tx.send(ProcessorMessage::ReaderError(
+                                AtprotoError::WebSocket("read timeout".to_string())
+                            )).await;
+                            return Err(err);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Processor task: receives messages from the reader and handles them.
+    ///
+    /// This task can take time to process messages (CAR parsing, cache updates)
+    /// without affecting ping/pong latency.
+    ///
+    /// If `catchup_until` is provided, broadcasts are suppressed until that instant,
+    /// then re-enabled with a `Synchronized` event to trigger full TSV regeneration.
+    async fn processor_task(
+        &self,
+        mut msg_rx: mpsc::Receiver<ProcessorMessage>,
+        catchup_until: Option<Instant>,
+    ) -> Result<(), AtprotoError> {
+        let mut catchup_complete = catchup_until.is_none();
+
+        loop {
+            // Check if catchup period has elapsed
+            if !catchup_complete
+                && let Some(until) = catchup_until
+                && Instant::now() >= until
+            {
+                debug!("reconnection catchup complete, re-enabling broadcasts");
+                self.cache.set_suppress_broadcasts(false);
+                // Send Synchronized to trigger populate_from_repo_cache
+                self.cache.set_state(SyncState::Live);
+                catchup_complete = true;
+            }
+
+            match msg_rx.recv().await {
+                Some(ProcessorMessage::Binary(data)) => {
+                    if let Err(e) = self.handle_message(&data).await {
+                        warn!(error = %e, "failed to handle firehose message");
+                    }
+                }
+                Some(ProcessorMessage::ReaderError(e)) => {
+                    // Reader encountered an error, propagate it
+                    // Make sure broadcasts are re-enabled before returning
+                    if !catchup_complete {
+                        self.cache.set_suppress_broadcasts(false);
+                    }
+                    return Err(e);
+                }
+                Some(ProcessorMessage::Shutdown) => {
+                    // Clean shutdown requested
+                    // Make sure broadcasts are re-enabled before returning
+                    if !catchup_complete {
+                        self.cache.set_suppress_broadcasts(false);
+                    }
+                    info!("firehose processor received shutdown");
+                    return Ok(());
+                }
+                None => {
+                    // Channel closed, reader must have exited
+                    // Make sure broadcasts are re-enabled before returning
+                    if !catchup_complete {
+                        self.cache.set_suppress_broadcasts(false);
+                    }
+                    debug!("processor channel closed, exiting");
+                    return Ok(());
                 }
             }
         }
@@ -90,56 +281,86 @@ impl FirehoseClient {
     async fn connect_and_process(
         &self,
         shutdown_rx: &mut watch::Receiver<bool>,
+        backoff: &mut ExponentialBackoff,
     ) -> Result<(), AtprotoError> {
-        let url = format!("{}/xrpc/com.atproto.sync.subscribeRepos", self.url);
+        // Use cursor-based reconnection if we have a known sequence number
+        let cursor = self.cache.firehose_seq();
+        let url = if cursor > 0 {
+            format!(
+                "{}/xrpc/com.atproto.sync.subscribeRepos?cursor={}",
+                self.url, cursor
+            )
+        } else {
+            format!("{}/xrpc/com.atproto.sync.subscribeRepos", self.url)
+        };
 
-        info!(url = %url, did = %self.did, "connecting to firehose");
+        info!(url = %url, did = %self.did, cursor = cursor, "connecting to firehose");
 
         let (ws_stream, _) = connect_async(&url)
             .await
             .map_err(|e| AtprotoError::WebSocket(format!("connection failed: {}", e)))?;
 
-        let (mut _write, mut read) = ws_stream.split();
+        let (write, read) = ws_stream.split();
 
         info!("firehose connected");
 
-        const READ_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+        // Reset backoff on successful connection
+        backoff.reset();
 
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
-                        info!("firehose received shutdown signal");
-                        return Ok(());
-                    }
-                }
-                result = timeout(READ_TIMEOUT, read.next()) => {
-                    match result {
-                        Ok(Some(Ok(Message::Binary(data)))) => {
-                            if let Err(e) = self.handle_message(&data).await {
-                                warn!(error = %e, "failed to handle firehose message");
-                            }
-                        }
-                        Ok(Some(Ok(Message::Close(_)))) => {
-                            info!("firehose connection closed by server");
-                            return Err(AtprotoError::WebSocket("connection closed".to_string()));
-                        }
-                        Ok(Some(Ok(_))) => {
-                            // Ignore other message types (text, ping, pong)
-                        }
-                        Ok(Some(Err(e))) => {
-                            return Err(AtprotoError::WebSocket(format!("read error: {}", e)));
-                        }
-                        Ok(None) => {
-                            return Err(AtprotoError::WebSocket("stream ended".to_string()));
-                        }
-                        Err(_) => {
-                            warn!("firehose read timeout after {}s - connection may be stale", READ_TIMEOUT.as_secs());
-                            return Err(AtprotoError::WebSocket("read timeout".to_string()));
-                        }
-                    }
+        // Determine if we need to suppress broadcasts during reconnection catchup.
+        // If we were in Syncing state due to a disconnection and have a cursor,
+        // the firehose will replay missed events. Suppress broadcasts during this
+        // replay to prevent channel lag that triggers expensive TSV regeneration.
+        let was_syncing = self.cache.state() == SyncState::Syncing;
+        let catchup_until = if was_syncing && cursor > 0 {
+            debug!("suppressing broadcasts during reconnection replay");
+            self.cache.set_suppress_broadcasts(true);
+            // Don't set state to Live yet - processor will do it after catchup
+            info!(
+                "firehose reconnected with cursor (seq={}), entering catchup mode",
+                cursor
+            );
+            Some(Instant::now() + RECONNECTION_CATCHUP_DURATION)
+        } else if was_syncing {
+            // No cursor means we may have missed events, go Live immediately
+            warn!("firehose reconnected without cursor, cache may have missed events");
+            self.cache.set_state(SyncState::Live);
+            None
+        } else {
+            // Not syncing (e.g., initial connection during SyncCoordinator startup)
+            // Don't change state, let SyncCoordinator manage it
+            None
+        };
+
+        // Create channel for reader -> processor communication
+        let (msg_tx, msg_rx) = mpsc::channel(PROCESSOR_CHANNEL_SIZE);
+
+        // Spawn reader task (handles pings immediately, forwards messages to processor)
+        let reader_shutdown_rx = shutdown_rx.clone();
+        let reader_handle = tokio::spawn(async move {
+            Self::reader_task(read, write, msg_tx, reader_shutdown_rx).await
+        });
+
+        // Run processor in current task (handles message processing)
+        let processor_result = self.processor_task(msg_rx, catchup_until).await;
+
+        // Wait for reader to finish (it will exit when channel closes or on error)
+        let reader_result = reader_handle.await;
+
+        // Determine final result: prefer processor error, then reader error
+        match processor_result {
+            Ok(()) => {
+                // Processor exited cleanly, check reader
+                match reader_result {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(AtprotoError::WebSocket(format!(
+                        "reader task panicked: {}",
+                        e
+                    ))),
                 }
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -161,6 +382,23 @@ impl FirehoseClient {
                             message = ?err.message,
                             "firehose error frame received"
                         );
+
+                        // Handle cursor-related errors that require a full re-sync
+                        if let Some(ref error_type) = err.error
+                            && (error_type == "FutureCursor" || error_type == "ConsumerTooSlow")
+                        {
+                            warn!(
+                                error_type = %error_type,
+                                "cursor is invalid/stale, will trigger full re-sync"
+                            );
+                            // Reset cursor so next connection starts fresh
+                            self.cache.reset_firehose_seq();
+                            // Return error to trigger reconnection
+                            return Err(AtprotoError::WebSocket(format!(
+                                "cursor invalid: {}",
+                                error_type
+                            )));
+                        }
                     }
                     Err(_) => {
                         error!("firehose error frame received (could not decode error details)");
@@ -276,9 +514,13 @@ impl FirehoseClient {
         }
 
         let firehose_commit = FirehoseCommit {
+            seq: commit.seq,
             rev: commit.rev.clone(),
             ops,
         };
+
+        // Update the sequence number tracking
+        self.cache.update_firehose_seq(commit.seq);
 
         // If we're still syncing, queue the commit; otherwise apply directly
         match self.cache.state() {
@@ -337,30 +579,7 @@ fn parse_record_path(path: &str) -> Option<(&str, &str)> {
     Some((collection, rkey))
 }
 
-/// Check if a collection is one we track in the cache.
-fn is_tracked_collection(collection: &str) -> bool {
-    matches!(
-        collection,
-        // Winter collections
-        FACT_COLLECTION
-            | RULE_COLLECTION
-            | THOUGHT_COLLECTION
-            | NOTE_COLLECTION
-            | JOB_COLLECTION
-            | IDENTITY_COLLECTION
-            | DIRECTIVE_COLLECTION
-            | FACT_DECLARATION_COLLECTION
-            | TOOL_COLLECTION
-            | TOOL_APPROVAL_COLLECTION
-            // Bluesky collections
-            | FOLLOW_COLLECTION
-            | LIKE_COLLECTION
-            | REPOST_COLLECTION
-            | POST_COLLECTION
-            // WhiteWind blog
-            | BLOG_COLLECTION
-    )
-}
+// is_tracked_collection is now generated by the dispatch macro
 
 /// Apply a commit to the cache.
 pub fn apply_commit(cache: &RepoCache, commit: &FirehoseCommit) -> Result<(), AtprotoError> {
@@ -391,131 +610,27 @@ fn apply_create_or_update(
     cid: &str,
     record: &[u8],
 ) -> Result<(), AtprotoError> {
-    match collection {
-        // Winter collections
-        FACT_COLLECTION => {
-            let fact: Fact = serde_ipld_dagcbor::from_slice(record)
-                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode fact: {}", e)))?;
-            cache.upsert_fact(rkey.to_string(), fact, cid.to_string());
-        }
-        RULE_COLLECTION => {
-            let rule: Rule = serde_ipld_dagcbor::from_slice(record)
-                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode rule: {}", e)))?;
-            cache.upsert_rule(rkey.to_string(), rule, cid.to_string());
-        }
-        THOUGHT_COLLECTION => {
-            let thought: Thought = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
-                AtprotoError::CborDecode(format!("failed to decode thought: {}", e))
-            })?;
-            cache.upsert_thought(rkey.to_string(), thought, cid.to_string());
-        }
-        NOTE_COLLECTION => {
-            let note: Note = serde_ipld_dagcbor::from_slice(record)
-                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode note: {}", e)))?;
-            cache.upsert_note(rkey.to_string(), note, cid.to_string());
-        }
-        JOB_COLLECTION => {
-            let job: Job = serde_ipld_dagcbor::from_slice(record)
-                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode job: {}", e)))?;
-            cache.upsert_job(rkey.to_string(), job, cid.to_string());
-        }
-        IDENTITY_COLLECTION => {
-            if rkey == IDENTITY_KEY {
-                let identity: Identity = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
-                    AtprotoError::CborDecode(format!("failed to decode identity: {}", e))
-                })?;
-                // Use a blocking approach since this is sync code
-                if let Ok(rt) = tokio::runtime::Handle::try_current() {
-                    rt.block_on(cache.set_identity(identity, cid.to_string()));
-                }
-            }
-        }
-        DIRECTIVE_COLLECTION => {
-            let directive: Directive = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
-                AtprotoError::CborDecode(format!("failed to decode directive: {}", e))
-            })?;
-            cache.upsert_directive(rkey.to_string(), directive, cid.to_string());
-        }
-        FACT_DECLARATION_COLLECTION => {
-            let declaration: FactDeclaration =
-                serde_ipld_dagcbor::from_slice(record).map_err(|e| {
-                    AtprotoError::CborDecode(format!("failed to decode fact declaration: {}", e))
-                })?;
-            cache.upsert_declaration(rkey.to_string(), declaration, cid.to_string());
-        }
-        TOOL_COLLECTION => {
-            let tool: CustomTool = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
-                AtprotoError::CborDecode(format!("failed to decode custom tool: {}", e))
-            })?;
-            cache.upsert_tool(rkey.to_string(), tool, cid.to_string());
-        }
-        TOOL_APPROVAL_COLLECTION => {
-            let approval: ToolApproval = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
-                AtprotoError::CborDecode(format!("failed to decode tool approval: {}", e))
-            })?;
-            cache.upsert_tool_approval(rkey.to_string(), approval, cid.to_string());
-        }
-        // Bluesky collections
-        FOLLOW_COLLECTION => {
-            let follow: Follow = serde_ipld_dagcbor::from_slice(record)
-                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode follow: {}", e)))?;
-            cache.insert_follow(rkey.to_string(), follow, cid.to_string());
-        }
-        LIKE_COLLECTION => {
-            let like: Like = serde_ipld_dagcbor::from_slice(record)
-                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode like: {}", e)))?;
-            cache.insert_like(rkey.to_string(), like, cid.to_string());
-        }
-        REPOST_COLLECTION => {
-            let repost: Repost = serde_ipld_dagcbor::from_slice(record)
-                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode repost: {}", e)))?;
-            cache.insert_repost(rkey.to_string(), repost, cid.to_string());
-        }
-        POST_COLLECTION => {
-            let post: Post = serde_ipld_dagcbor::from_slice(record)
-                .map_err(|e| AtprotoError::CborDecode(format!("failed to decode post: {}", e)))?;
-            cache.upsert_post(rkey.to_string(), post, cid.to_string());
-        }
-        BLOG_COLLECTION => {
-            let entry: BlogEntry = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
-                AtprotoError::CborDecode(format!("failed to decode blog entry: {}", e))
-            })?;
-            cache.upsert_blog_entry(rkey.to_string(), entry, cid.to_string());
-        }
-        _ => {
-            // Unknown collection - shouldn't happen if is_tracked_collection is correct
-            trace!(collection = %collection, rkey = %rkey, "ignoring unknown collection in apply");
+    // Use the dispatch macro for most record types
+    let handled = dispatch_create_or_update(cache, collection, rkey, cid, record)?;
+
+    // Handle special cases (identity) that need async or singleton logic
+    if !handled && collection == IDENTITY_COLLECTION && rkey == IDENTITY_KEY {
+        let identity: Identity = serde_ipld_dagcbor::from_slice(record)
+            .map_err(|e| AtprotoError::CborDecode(format!("failed to decode identity: {}", e)))?;
+        // Use a blocking approach since this is sync code
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.block_on(cache.set_identity(identity, cid.to_string()));
         }
     }
+
     Ok(())
 }
 
 /// Apply a delete operation to the cache.
 fn apply_delete(cache: &RepoCache, collection: &str, rkey: &str) {
-    match collection {
-        // Winter collections
-        FACT_COLLECTION => cache.delete_fact(rkey),
-        RULE_COLLECTION => cache.delete_rule(rkey),
-        THOUGHT_COLLECTION => cache.delete_thought(rkey),
-        NOTE_COLLECTION => cache.delete_note(rkey),
-        JOB_COLLECTION => cache.delete_job(rkey),
-        DIRECTIVE_COLLECTION => cache.delete_directive(rkey),
-        FACT_DECLARATION_COLLECTION => cache.delete_declaration(rkey),
-        TOOL_COLLECTION => cache.delete_tool(rkey),
-        TOOL_APPROVAL_COLLECTION => cache.delete_tool_approval(rkey),
-        // Bluesky collections
-        FOLLOW_COLLECTION => cache.delete_follow(rkey),
-        LIKE_COLLECTION => cache.delete_like(rkey),
-        REPOST_COLLECTION => cache.delete_repost(rkey),
-        POST_COLLECTION => cache.delete_post(rkey),
-        // WhiteWind blog
-        BLOG_COLLECTION => cache.delete_blog_entry(rkey),
-        // Identity is a singleton and typically not deleted
-        IDENTITY_COLLECTION => {}
-        _ => {
-            trace!(collection = %collection, rkey = %rkey, "ignoring unknown collection in delete");
-        }
-    }
+    // Use the dispatch macro for all record types
+    // Special collections (identity, state) are handled as no-ops in dispatch
+    dispatch_delete(cache, collection, rkey);
 }
 
 // Firehose frame header (first CBOR value in each message)

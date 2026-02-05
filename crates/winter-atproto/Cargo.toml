@@ -42,8 +42,12 @@ serde_bytes = { workspace = true }
 dashmap = { workspace = true }
 crossbeam = { workspace = true }
 
+# Retry with backoff
+backoff = { workspace = true }
+
 [dev-dependencies]
 proptest = { workspace = true }
+proptest-state-machine = { workspace = true }
 insta = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }

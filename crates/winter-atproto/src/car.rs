@@ -10,13 +10,11 @@ use iroh_car::CarReader;
 use serde::de::DeserializeOwned;
 use tracing::{debug, trace, warn};
 
+use crate::dispatch::extract_record_to_result;
 use crate::{
-    AtprotoError, BLOG_COLLECTION, BlogEntry, CustomTool, DIRECTIVE_COLLECTION, DaemonState,
-    Directive, FACT_COLLECTION, FACT_DECLARATION_COLLECTION, FOLLOW_COLLECTION, Fact,
-    FactDeclaration, Follow, IDENTITY_COLLECTION, IDENTITY_KEY, Identity, JOB_COLLECTION, Job,
-    LIKE_COLLECTION, Like, NOTE_COLLECTION, Note, POST_COLLECTION, Post, REPOST_COLLECTION,
-    RULE_COLLECTION, Repost, Rule, STATE_COLLECTION, STATE_KEY, THOUGHT_COLLECTION,
-    TOOL_APPROVAL_COLLECTION, TOOL_COLLECTION, Thought, ToolApproval,
+    AtprotoError, BlogEntry, CustomTool, DaemonState, Directive, Fact, FactDeclaration, Follow,
+    IDENTITY_COLLECTION, IDENTITY_KEY, Identity, Job, Like, Note, Post, Repost, Rule,
+    STATE_COLLECTION, STATE_KEY, Thought, ToolApproval,
 };
 
 /// Result of parsing a CAR file.
@@ -357,198 +355,41 @@ fn extract_record(
         }
     };
 
-    match collection {
-        FACT_COLLECTION => match parse_cbor::<Fact>(data) {
-            Ok(fact) => {
-                trace!(rkey = %rkey, predicate = %fact.predicate, "extracted fact");
-                result
-                    .facts
-                    .insert(rkey.to_string(), (fact, value_cid.to_string()));
-            }
-            Err(e) => {
-                warn!(rkey = %rkey, error = %e, "failed to parse fact");
-            }
-        },
-        RULE_COLLECTION => match parse_cbor::<Rule>(data) {
-            Ok(rule) => {
-                trace!(rkey = %rkey, name = %rule.name, "extracted rule");
-                result
-                    .rules
-                    .insert(rkey.to_string(), (rule, value_cid.to_string()));
-            }
-            Err(e) => {
-                warn!(rkey = %rkey, error = %e, "failed to parse rule");
-            }
-        },
-        THOUGHT_COLLECTION => match parse_cbor::<Thought>(data) {
-            Ok(thought) => {
-                trace!(rkey = %rkey, kind = ?thought.kind, "extracted thought");
-                result
-                    .thoughts
-                    .insert(rkey.to_string(), (thought, value_cid.to_string()));
-            }
-            Err(e) => {
-                warn!(rkey = %rkey, error = %e, "failed to parse thought");
-            }
-        },
-        NOTE_COLLECTION => match parse_cbor::<Note>(data) {
-            Ok(note) => {
-                trace!(rkey = %rkey, title = %note.title, "extracted note");
-                result
-                    .notes
-                    .insert(rkey.to_string(), (note, value_cid.to_string()));
-            }
-            Err(e) => {
-                warn!(rkey = %rkey, error = %e, "failed to parse note");
-            }
-        },
-        JOB_COLLECTION => match parse_cbor::<Job>(data) {
-            Ok(job) => {
-                trace!(rkey = %rkey, name = %job.name, "extracted job");
-                result
-                    .jobs
-                    .insert(rkey.to_string(), (job, value_cid.to_string()));
-            }
-            Err(e) => {
-                warn!(rkey = %rkey, error = %e, "failed to parse job");
-            }
-        },
-        IDENTITY_COLLECTION => {
-            // Only parse if rkey is the expected singleton key
-            if rkey == IDENTITY_KEY {
-                match parse_cbor::<Identity>(data) {
-                    Ok(identity) => {
-                        trace!("extracted identity");
-                        result.identity = Some((identity, value_cid.to_string()));
-                    }
-                    Err(e) => {
-                        warn!(rkey = %rkey, error = %e, "failed to parse identity");
+    // Use the dispatch macro for most record types
+    let handled = extract_record_to_result(collection, rkey, value_cid, data, result);
+
+    // Handle special cases (singletons with key checks)
+    if !handled {
+        match collection {
+            IDENTITY_COLLECTION => {
+                if rkey == IDENTITY_KEY {
+                    match parse_cbor::<Identity>(data) {
+                        Ok(identity) => {
+                            trace!("extracted identity");
+                            result.identity = Some((identity, value_cid.to_string()));
+                        }
+                        Err(e) => {
+                            warn!(rkey = %rkey, error = %e, "failed to parse identity");
+                        }
                     }
                 }
             }
-        }
-        STATE_COLLECTION => {
-            // Only parse if rkey is the expected singleton key
-            if rkey == STATE_KEY {
-                match parse_cbor::<DaemonState>(data) {
-                    Ok(state) => {
-                        trace!(followers = state.followers.len(), "extracted daemon state");
-                        result.daemon_state = Some((state, value_cid.to_string()));
-                    }
-                    Err(e) => {
-                        warn!(rkey = %rkey, error = %e, "failed to parse daemon state");
+            STATE_COLLECTION => {
+                if rkey == STATE_KEY {
+                    match parse_cbor::<DaemonState>(data) {
+                        Ok(state) => {
+                            trace!(followers = state.followers.len(), "extracted daemon state");
+                            result.daemon_state = Some((state, value_cid.to_string()));
+                        }
+                        Err(e) => {
+                            warn!(rkey = %rkey, error = %e, "failed to parse daemon state");
+                        }
                     }
                 }
             }
-        }
-        // =====================================================================
-        // Bluesky collections (for derived facts)
-        // =====================================================================
-        FOLLOW_COLLECTION => match parse_cbor::<Follow>(data) {
-            Ok(follow) => {
-                trace!(rkey = %rkey, subject = %follow.subject, "extracted follow");
-                result
-                    .follows
-                    .insert(rkey.to_string(), (follow, value_cid.to_string()));
+            _ => {
+                trace!(collection = %collection, rkey = %rkey, "skipping unknown collection");
             }
-            Err(e) => {
-                warn!(rkey = %rkey, error = %e, "failed to parse follow");
-            }
-        },
-        LIKE_COLLECTION => match parse_cbor::<Like>(data) {
-            Ok(like) => {
-                trace!(rkey = %rkey, uri = %like.subject.uri, "extracted like");
-                result
-                    .likes
-                    .insert(rkey.to_string(), (like, value_cid.to_string()));
-            }
-            Err(e) => {
-                warn!(rkey = %rkey, error = %e, "failed to parse like");
-            }
-        },
-        REPOST_COLLECTION => match parse_cbor::<Repost>(data) {
-            Ok(repost) => {
-                trace!(rkey = %rkey, uri = %repost.subject.uri, "extracted repost");
-                result
-                    .reposts
-                    .insert(rkey.to_string(), (repost, value_cid.to_string()));
-            }
-            Err(e) => {
-                warn!(rkey = %rkey, error = %e, "failed to parse repost");
-            }
-        },
-        POST_COLLECTION => match parse_cbor::<Post>(data) {
-            Ok(post) => {
-                trace!(rkey = %rkey, "extracted post");
-                result
-                    .posts
-                    .insert(rkey.to_string(), (post, value_cid.to_string()));
-            }
-            Err(e) => {
-                warn!(rkey = %rkey, error = %e, "failed to parse post");
-            }
-        },
-        // =====================================================================
-        // Winter collections (for derived facts)
-        // =====================================================================
-        DIRECTIVE_COLLECTION => match parse_cbor::<Directive>(data) {
-            Ok(directive) => {
-                trace!(rkey = %rkey, kind = %directive.kind, "extracted directive");
-                result
-                    .directives
-                    .insert(rkey.to_string(), (directive, value_cid.to_string()));
-            }
-            Err(e) => {
-                warn!(rkey = %rkey, error = %e, "failed to parse directive");
-            }
-        },
-        FACT_DECLARATION_COLLECTION => match parse_cbor::<FactDeclaration>(data) {
-            Ok(declaration) => {
-                trace!(rkey = %rkey, predicate = %declaration.predicate, "extracted fact declaration");
-                result
-                    .declarations
-                    .insert(rkey.to_string(), (declaration, value_cid.to_string()));
-            }
-            Err(e) => {
-                warn!(rkey = %rkey, error = %e, "failed to parse fact declaration");
-            }
-        },
-        TOOL_COLLECTION => match parse_cbor::<CustomTool>(data) {
-            Ok(tool) => {
-                trace!(rkey = %rkey, name = %tool.name, "extracted custom tool");
-                result
-                    .tools
-                    .insert(rkey.to_string(), (tool, value_cid.to_string()));
-            }
-            Err(e) => {
-                warn!(rkey = %rkey, error = %e, "failed to parse custom tool");
-            }
-        },
-        TOOL_APPROVAL_COLLECTION => match parse_cbor::<ToolApproval>(data) {
-            Ok(approval) => {
-                trace!(rkey = %rkey, tool_rkey = %approval.tool_rkey, "extracted tool approval");
-                result
-                    .tool_approvals
-                    .insert(rkey.to_string(), (approval, value_cid.to_string()));
-            }
-            Err(e) => {
-                warn!(rkey = %rkey, error = %e, "failed to parse tool approval");
-            }
-        },
-        BLOG_COLLECTION => match parse_cbor::<BlogEntry>(data) {
-            Ok(entry) => {
-                trace!(rkey = %rkey, title = %entry.title, "extracted blog entry");
-                result
-                    .blog_entries
-                    .insert(rkey.to_string(), (entry, value_cid.to_string()));
-            }
-            Err(e) => {
-                warn!(rkey = %rkey, error = %e, "failed to parse blog entry");
-            }
-        },
-        _ => {
-            // Skip other collections
-            trace!(collection = %collection, rkey = %rkey, "skipping unknown collection");
         }
     }
 
