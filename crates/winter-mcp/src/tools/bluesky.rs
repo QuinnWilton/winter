@@ -3,23 +3,155 @@
 use std::collections::HashMap;
 
 use serde_json::{Value, json};
+use winter_atproto::{ByteSlice, Facet, FacetFeature};
 
-use crate::bluesky::PostRef;
+use crate::bluesky::{ImageInput, PostRef};
 use crate::protocol::{CallToolResult, ToolDefinition};
 
-use super::ToolState;
+use super::{ToolMeta, ToolState};
+
+use base64::Engine;
+
+/// Parse images from the JSON arguments.
+fn parse_images(arguments: &HashMap<String, Value>) -> Result<Vec<ImageInput>, String> {
+    let images_value = match arguments.get("images") {
+        Some(v) => v,
+        None => return Ok(Vec::new()),
+    };
+
+    let images_array = match images_value.as_array() {
+        Some(arr) => arr,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut images = Vec::new();
+    for (i, img) in images_array.iter().enumerate() {
+        let data_b64 = img
+            .get("data")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("images[{}]: missing 'data' field", i))?;
+
+        let alt = img
+            .get("alt")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("images[{}]: missing 'alt' field", i))?;
+
+        let mime_type = img
+            .get("mime_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("image/jpeg")
+            .to_string();
+
+        // Decode base64 data
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(data_b64)
+            .map_err(|e| format!("images[{}]: invalid base64: {}", i, e))?;
+
+        images.push(ImageInput {
+            data,
+            mime_type,
+            alt: alt.to_string(),
+        });
+    }
+
+    Ok(images)
+}
+
+/// Parse facets from the JSON arguments.
+fn parse_facets(arguments: &HashMap<String, Value>) -> Option<Vec<Facet>> {
+    let facets_value = arguments.get("facets")?;
+    let facets_array = facets_value.as_array()?;
+
+    let facets: Vec<Facet> = facets_array
+        .iter()
+        .filter_map(|f| {
+            let byte_start = f.get("byte_start")?.as_u64()?;
+            let byte_end = f.get("byte_end")?.as_u64()?;
+
+            let mut features = Vec::new();
+
+            // Check for mention
+            if let Some(did) = f.get("mention_did").and_then(|v| v.as_str()) {
+                features.push(FacetFeature::Mention {
+                    did: did.to_string(),
+                });
+            }
+
+            // Check for link
+            if let Some(uri) = f.get("link_uri").and_then(|v| v.as_str()) {
+                features.push(FacetFeature::Link {
+                    uri: uri.to_string(),
+                });
+            }
+
+            // Check for tag
+            if let Some(tag) = f.get("tag").and_then(|v| v.as_str()) {
+                features.push(FacetFeature::Tag {
+                    tag: tag.to_string(),
+                });
+            }
+
+            // Must have at least one feature
+            if features.is_empty() {
+                return None;
+            }
+
+            Some(Facet {
+                index: ByteSlice {
+                    byte_start,
+                    byte_end,
+                },
+                features,
+            })
+        })
+        .collect();
+
+    if facets.is_empty() {
+        None
+    } else {
+        Some(facets)
+    }
+}
 
 pub fn definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "post_to_bluesky".to_string(),
-            description: "Post a new message to Bluesky".to_string(),
+            description: "Post a new message to Bluesky, optionally with images".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "The text content of the post (max 300 characters)"
+                        "description": "The text content of the post (max 300 graphemes)"
+                    },
+                    "images": {
+                        "type": "array",
+                        "description": "Images to attach (max 4). Each image requires base64-encoded data and alt text.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "data": { "type": "string", "description": "Base64-encoded image data" },
+                                "alt": { "type": "string", "description": "Alt text description (required for accessibility)" },
+                                "mime_type": { "type": "string", "description": "MIME type (default: image/jpeg). Supported: image/jpeg, image/png, image/webp, image/gif" }
+                            },
+                            "required": ["data", "alt"]
+                        }
+                    },
+                    "facets": {
+                        "type": "array",
+                        "description": "Rich text facets for mentions, links, and hashtags. If provided, auto-detection is skipped.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "byte_start": { "type": "integer", "description": "Start byte index in the text" },
+                                "byte_end": { "type": "integer", "description": "End byte index in the text" },
+                                "mention_did": { "type": "string", "description": "DID for mention facet (e.g., did:plc:xxx)" },
+                                "link_uri": { "type": "string", "description": "URI for link facet" },
+                                "tag": { "type": "string", "description": "Hashtag (without #)" }
+                            },
+                            "required": ["byte_start", "byte_end"]
+                        }
                     }
                 },
                 "required": ["text"]
@@ -27,13 +159,13 @@ pub fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "reply_to_bluesky".to_string(),
-            description: "Reply to an existing Bluesky post".to_string(),
+            description: "Reply to an existing Bluesky post, optionally with images".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "The text content of the reply"
+                        "description": "The text content of the reply (max 300 graphemes)"
                     },
                     "parent_uri": {
                         "type": "string",
@@ -50,6 +182,34 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "root_cid": {
                         "type": "string",
                         "description": "CID of the thread root"
+                    },
+                    "images": {
+                        "type": "array",
+                        "description": "Images to attach (max 4). Each image requires base64-encoded data and alt text.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "data": { "type": "string", "description": "Base64-encoded image data" },
+                                "alt": { "type": "string", "description": "Alt text description (required for accessibility)" },
+                                "mime_type": { "type": "string", "description": "MIME type (default: image/jpeg). Supported: image/jpeg, image/png, image/webp, image/gif" }
+                            },
+                            "required": ["data", "alt"]
+                        }
+                    },
+                    "facets": {
+                        "type": "array",
+                        "description": "Rich text facets for mentions, links, and hashtags. If provided, auto-detection is skipped.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "byte_start": { "type": "integer", "description": "Start byte index in the text" },
+                                "byte_end": { "type": "integer", "description": "End byte index in the text" },
+                                "mention_did": { "type": "string", "description": "DID for mention facet (e.g., did:plc:xxx)" },
+                                "link_uri": { "type": "string", "description": "URI for link facet" },
+                                "tag": { "type": "string", "description": "Hashtag (without #)" }
+                            },
+                            "required": ["byte_start", "byte_end"]
+                        }
                     }
                 },
                 "required": ["text", "parent_uri", "parent_cid", "root_uri", "root_cid"]
@@ -68,6 +228,21 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "text": {
                         "type": "string",
                         "description": "The message text"
+                    },
+                    "facets": {
+                        "type": "array",
+                        "description": "Rich text facets for mentions, links, and hashtags. If provided, auto-detection is skipped.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "byte_start": { "type": "integer", "description": "Start byte index in the text" },
+                                "byte_end": { "type": "integer", "description": "End byte index in the text" },
+                                "mention_did": { "type": "string", "description": "DID for mention facet (e.g., did:plc:xxx)" },
+                                "link_uri": { "type": "string", "description": "URI for link facet" },
+                                "tag": { "type": "string", "description": "Hashtag (without #)" }
+                            },
+                            "required": ["byte_start", "byte_end"]
+                        }
                     }
                 },
                 "required": ["recipient_did", "text"]
@@ -86,6 +261,21 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "text": {
                         "type": "string",
                         "description": "The message text"
+                    },
+                    "facets": {
+                        "type": "array",
+                        "description": "Rich text facets for mentions, links, and hashtags. If provided, auto-detection is skipped.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "byte_start": { "type": "integer", "description": "Start byte index in the text" },
+                                "byte_end": { "type": "integer", "description": "End byte index in the text" },
+                                "mention_did": { "type": "string", "description": "DID for mention facet (e.g., did:plc:xxx)" },
+                                "link_uri": { "type": "string", "description": "URI for link facet" },
+                                "tag": { "type": "string", "description": "Hashtag (without #)" }
+                            },
+                            "required": ["byte_start", "byte_end"]
+                        }
                     }
                 },
                 "required": ["convo_id", "text"]
@@ -321,7 +511,27 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["root_uri"]
             }),
         },
+        ToolDefinition {
+            name: "delete_post".to_string(),
+            description: "Delete a Bluesky post or reply. This action is irreversible.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "post_uri": {
+                        "type": "string",
+                        "description": "AT URI of the post to delete (e.g., at://did:plc:xxx/app.bsky.feed.post/rkey)"
+                    }
+                },
+                "required": ["post_uri"]
+            }),
+        },
     ]
+}
+
+/// Get all Bluesky tools with their permission metadata.
+/// All Bluesky tools are allowed for the autonomous agent.
+pub fn tools() -> Vec<ToolMeta> {
+    definitions().into_iter().map(ToolMeta::allowed).collect()
 }
 
 pub async fn post_to_bluesky(
@@ -333,12 +543,26 @@ pub async fn post_to_bluesky(
         None => return CallToolResult::error("Missing required parameter: text"),
     };
 
+    let facets = parse_facets(arguments);
+
+    let images = match parse_images(arguments) {
+        Ok(imgs) => imgs,
+        Err(e) => return CallToolResult::error(e),
+    };
+
     let client = match &state.bluesky {
         Some(c) => c,
         None => return CallToolResult::error("Bluesky client not configured"),
     };
 
-    match client.post(text).await {
+    // Use the appropriate method based on whether we have images
+    let result = if images.is_empty() {
+        client.post(text, facets).await
+    } else {
+        client.post_with_images(text, images, facets).await
+    };
+
+    match result {
         Ok(post_ref) => CallToolResult::success(
             json!({
                 "uri": post_ref.uri,
@@ -379,6 +603,13 @@ pub async fn reply_to_bluesky(
         None => return CallToolResult::error("Missing required parameter: root_cid"),
     };
 
+    let facets = parse_facets(arguments);
+
+    let images = match parse_images(arguments) {
+        Ok(imgs) => imgs,
+        Err(e) => return CallToolResult::error(e),
+    };
+
     let client = match &state.bluesky {
         Some(c) => c,
         None => return CallToolResult::error("Bluesky client not configured"),
@@ -394,7 +625,16 @@ pub async fn reply_to_bluesky(
         cid: root_cid.to_string(),
     };
 
-    match client.reply(text, &parent, &root).await {
+    // Use the appropriate method based on whether we have images
+    let result = if images.is_empty() {
+        client.reply(text, &parent, &root, facets).await
+    } else {
+        client
+            .reply_with_images(text, &parent, &root, images, facets)
+            .await
+    };
+
+    match result {
         Ok(post_ref) => CallToolResult::success(
             json!({
                 "uri": post_ref.uri,
@@ -420,12 +660,14 @@ pub async fn send_bluesky_dm(
         None => return CallToolResult::error("Missing required parameter: text"),
     };
 
+    let facets = parse_facets(arguments);
+
     let client = match &state.bluesky {
         Some(c) => c,
         None => return CallToolResult::error("Bluesky client not configured"),
     };
 
-    match client.send_dm(recipient_did, text).await {
+    match client.send_dm(recipient_did, text, facets).await {
         Ok(message_id) => CallToolResult::success(
             json!({
                 "message_id": message_id
@@ -447,12 +689,14 @@ pub async fn reply_to_dm(state: &ToolState, arguments: &HashMap<String, Value>) 
         None => return CallToolResult::error("Missing required parameter: text"),
     };
 
+    let facets = parse_facets(arguments);
+
     let client = match &state.bluesky {
         Some(c) => c,
         None => return CallToolResult::error("Bluesky client not configured"),
     };
 
-    match client.send_dm_to_convo(convo_id, text).await {
+    match client.send_dm_to_convo(convo_id, text, facets).await {
         Ok(message_id) => CallToolResult::success(
             json!({
                 "message_id": message_id
@@ -860,7 +1104,10 @@ pub async fn mute_thread(state: &ToolState, arguments: &HashMap<String, Value>) 
     }
 }
 
-pub async fn unmute_thread(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+pub async fn unmute_thread(
+    state: &ToolState,
+    arguments: &HashMap<String, Value>,
+) -> CallToolResult {
     let root_uri = match arguments.get("root_uri").and_then(|v| v.as_str()) {
         Some(u) => u,
         None => return CallToolResult::error("Missing required parameter: root_uri"),
@@ -879,5 +1126,28 @@ pub async fn unmute_thread(state: &ToolState, arguments: &HashMap<String, Value>
             .to_string(),
         ),
         Err(e) => CallToolResult::error(format!("Failed to unmute thread: {}", e)),
+    }
+}
+
+pub async fn delete_post(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+    let post_uri = match arguments.get("post_uri").and_then(|v| v.as_str()) {
+        Some(u) => u,
+        None => return CallToolResult::error("Missing required parameter: post_uri"),
+    };
+
+    let client = match &state.bluesky {
+        Some(c) => c,
+        None => return CallToolResult::error("Bluesky client not configured"),
+    };
+
+    match client.delete_post(post_uri).await {
+        Ok(()) => CallToolResult::success(
+            json!({
+                "deleted": true,
+                "post_uri": post_uri
+            })
+            .to_string(),
+        ),
+        Err(e) => CallToolResult::error(format!("Failed to delete post: {}", e)),
     }
 }

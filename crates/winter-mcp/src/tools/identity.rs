@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use crate::protocol::{CallToolResult, ToolDefinition};
 use winter_atproto::Identity;
 
-use super::ToolState;
+use super::{ToolMeta, ToolState};
 
 /// Collection name for identity.
 const IDENTITY_COLLECTION: &str = "diy.razorgirl.winter.identity";
@@ -27,6 +27,12 @@ pub fn definitions() -> Vec<ToolDefinition> {
             "properties": {}
         }),
     }]
+}
+
+/// Get all identity tools with their permission metadata.
+/// All identity tools are allowed for the autonomous agent.
+pub fn tools() -> Vec<ToolMeta> {
+    definitions().into_iter().map(ToolMeta::allowed).collect()
 }
 
 pub async fn get_identity(

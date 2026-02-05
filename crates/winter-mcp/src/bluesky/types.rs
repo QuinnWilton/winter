@@ -13,6 +13,17 @@ pub struct PostRef {
     pub cid: String,
 }
 
+/// Input for posting an image to Bluesky.
+#[derive(Debug, Clone)]
+pub struct ImageInput {
+    /// Raw image bytes.
+    pub data: Vec<u8>,
+    /// MIME type (e.g., "image/jpeg", "image/png").
+    pub mime_type: String,
+    /// Alt text description (required for accessibility).
+    pub alt: String,
+}
+
 /// A notification received from Bluesky.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlueskyNotification {
@@ -220,4 +231,67 @@ pub struct ThreadContext {
     pub my_last_reply_at: Option<String>,
     /// Number of posts added after the querying account's last reply
     pub posts_since_my_last_reply: usize,
+}
+
+/// A Bluesky user profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Profile {
+    /// DID of the user
+    pub did: String,
+    /// Handle of the user
+    pub handle: String,
+    /// Display name
+    pub display_name: Option<String>,
+    /// User bio/description
+    pub description: Option<String>,
+    /// Avatar URL
+    pub avatar: Option<String>,
+    /// Banner URL
+    pub banner: Option<String>,
+    /// Number of followers
+    pub followers_count: Option<i64>,
+    /// Number of accounts followed
+    pub follows_count: Option<i64>,
+    /// Number of posts
+    pub posts_count: Option<i64>,
+    /// When the profile was indexed
+    pub indexed_at: Option<String>,
+}
+
+/// A post from an author's feed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeedPost {
+    /// AT URI of the post
+    pub uri: String,
+    /// Content hash
+    pub cid: String,
+    /// Post text content
+    pub text: Option<String>,
+    /// When the post was created
+    pub created_at: Option<String>,
+    /// Number of likes
+    pub like_count: Option<i64>,
+    /// Number of reposts
+    pub repost_count: Option<i64>,
+    /// Number of replies
+    pub reply_count: Option<i64>,
+    /// Whether this is a reply
+    pub is_reply: bool,
+    /// Whether this is a repost
+    pub is_repost: bool,
+}
+
+/// Information about a follow relationship.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FollowInfo {
+    /// DID of the followed/follower
+    pub did: String,
+    /// Handle of the followed/follower
+    pub handle: String,
+    /// Display name
+    pub display_name: Option<String>,
+    /// User bio/description
+    pub description: Option<String>,
+    /// Avatar URL
+    pub avatar: Option<String>,
 }

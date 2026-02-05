@@ -8,8 +8,9 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 
 use crate::protocol::{CallToolResult, ToolDefinition};
+use winter_atproto::AtUri;
 
-use super::ToolState;
+use super::{ToolMeta, ToolState};
 
 pub fn definitions() -> Vec<ToolDefinition> {
     vec![
@@ -95,7 +96,28 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["collection", "rkey"]
             }),
         },
+        ToolDefinition {
+            name: "pds_get_records".to_string(),
+            description: "Get multiple records by AT URI. Returns all records in a single call. Missing records have null value.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "uris": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Array of AT URIs (e.g., 'at://did:plc:xxx/collection/rkey')"
+                    }
+                },
+                "required": ["uris"]
+            }),
+        },
     ]
+}
+
+/// Get all PDS tools with their permission metadata.
+/// All PDS tools are allowed for the autonomous agent.
+pub fn tools() -> Vec<ToolMeta> {
+    definitions().into_iter().map(ToolMeta::allowed).collect()
 }
 
 /// List records in a collection.
@@ -259,9 +281,67 @@ pub async fn pds_delete_record(
     }
 }
 
+/// Get multiple records by AT URI.
+pub async fn pds_get_records(
+    state: &ToolState,
+    arguments: &HashMap<String, Value>,
+) -> CallToolResult {
+    let uris = match arguments.get("uris").and_then(|v| v.as_array()) {
+        Some(arr) => {
+            let strs: Result<Vec<&str>, _> = arr
+                .iter()
+                .map(|v| v.as_str().ok_or("Invalid URI in array"))
+                .collect();
+            match strs {
+                Ok(s) => s,
+                Err(e) => return CallToolResult::error(format!("Invalid uris parameter: {}", e)),
+            }
+        }
+        None => return CallToolResult::error("Missing required parameter: uris"),
+    };
+
+    if uris.is_empty() {
+        return CallToolResult::success(
+            json!({
+                "count": 0,
+                "records": []
+            })
+            .to_string(),
+        );
+    }
+
+    match state.atproto.get_records::<Value>(&uris).await {
+        Ok(response) => {
+            let records: Vec<Value> = response
+                .records
+                .into_iter()
+                .map(|item| {
+                    json!({
+                        "uri": item.uri,
+                        "cid": item.cid,
+                        "rkey": extract_rkey(&item.uri),
+                        "value": item.value
+                    })
+                })
+                .collect();
+
+            let count = records.len();
+
+            CallToolResult::success(
+                json!({
+                    "count": count,
+                    "records": records
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => CallToolResult::error(format!("Failed to get records: {}", e)),
+    }
+}
+
 /// Extract the rkey from an AT URI.
 fn extract_rkey(uri: &str) -> String {
-    uri.rsplit('/').next().unwrap_or("").to_string()
+    AtUri::extract_rkey(uri).to_string()
 }
 
 #[cfg(test)]
@@ -284,7 +364,7 @@ mod tests {
     #[test]
     fn test_definitions_count() {
         let defs = definitions();
-        assert_eq!(defs.len(), 4);
+        assert_eq!(defs.len(), 5);
     }
 
     #[test]
@@ -295,5 +375,6 @@ mod tests {
         assert!(names.contains(&"pds_get_record"));
         assert!(names.contains(&"pds_put_record"));
         assert!(names.contains(&"pds_delete_record"));
+        assert!(names.contains(&"pds_get_records"));
     }
 }

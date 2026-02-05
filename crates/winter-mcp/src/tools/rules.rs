@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::protocol::{CallToolResult, ToolDefinition};
 use winter_atproto::{Rule, Tid, WriteOp, WriteResult};
 
-use super::ToolState;
+use super::{MAX_BATCH_SIZE, ToolMeta, ToolState, parse_string_array};
 
 /// Collection name for rules.
 const RULE_COLLECTION: &str = "diy.razorgirl.winter.rule";
@@ -148,6 +148,12 @@ pub fn definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Get all rule tools with their permission metadata.
+/// All rule tools are allowed for the autonomous agent.
+pub fn tools() -> Vec<ToolMeta> {
+    definitions().into_iter().map(ToolMeta::allowed).collect()
+}
+
 pub async fn create_rule(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
     let name = match arguments.get("name").and_then(|v| v.as_str()) {
         Some(n) => n,
@@ -234,6 +240,14 @@ pub async fn create_rules(state: &ToolState, arguments: &HashMap<String, Value>)
         return CallToolResult::error("rules array cannot be empty");
     }
 
+    if rules_array.len() > MAX_BATCH_SIZE {
+        return CallToolResult::error(format!(
+            "Batch size {} exceeds maximum of {}",
+            rules_array.len(),
+            MAX_BATCH_SIZE
+        ));
+    }
+
     // Validate and parse all rules first
     let mut validated: Vec<(String, Rule)> = Vec::with_capacity(rules_array.len());
     let now = Utc::now();
@@ -275,10 +289,7 @@ pub async fn create_rules(state: &ToolState, arguments: &HashMap<String, Value>)
             None => Vec::new(),
         };
 
-        let priority = obj
-            .get("priority")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0) as i32;
+        let priority = obj.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
 
         let rule = Rule {
             name: name.to_string(),
@@ -310,10 +321,10 @@ pub async fn create_rules(state: &ToolState, arguments: &HashMap<String, Value>)
         Ok(response) => {
             // Update cache for each created record
             for ((rkey, rule), result) in validated.iter().zip(response.results.iter()) {
-                if let WriteResult::Create { cid, .. } = result {
-                    if let Some(cache) = &state.cache {
-                        cache.upsert_rule(rkey.clone(), rule.clone(), cid.clone());
-                    }
+                if let WriteResult::Create { cid, .. } = result
+                    && let Some(cache) = &state.cache
+                {
+                    cache.upsert_rule(rkey.clone(), rule.clone(), cid.clone());
                 }
             }
 
@@ -400,21 +411,34 @@ pub async fn list_rules(state: &ToolState, arguments: &HashMap<String, Value>) -
                 return false;
             }
             // Filter by name (case-insensitive substring)
-            if let Some(name) = name_filter {
-                if !item.value.name.to_lowercase().contains(&name.to_lowercase()) {
-                    return false;
-                }
+            if let Some(name) = name_filter
+                && !item
+                    .value
+                    .name
+                    .to_lowercase()
+                    .contains(&name.to_lowercase())
+            {
+                return false;
             }
             // Filter by head predicate (case-insensitive substring)
-            if let Some(head) = head_filter {
-                if !item.value.head.to_lowercase().contains(&head.to_lowercase()) {
-                    return false;
-                }
+            if let Some(head) = head_filter
+                && !item
+                    .value
+                    .head
+                    .to_lowercase()
+                    .contains(&head.to_lowercase())
+            {
+                return false;
             }
             // Filter by body (case-insensitive substring, matches any body item)
             if let Some(body) = body_filter {
                 let body_lower = body.to_lowercase();
-                if !item.value.body.iter().any(|b| b.to_lowercase().contains(&body_lower)) {
+                if !item
+                    .value
+                    .body
+                    .iter()
+                    .any(|b| b.to_lowercase().contains(&body_lower))
+                {
                     return false;
                 }
             }
@@ -451,31 +475,6 @@ pub async fn list_rules(state: &ToolState, arguments: &HashMap<String, Value>) -
         })
         .to_string(),
     )
-}
-
-/// Parse a JSON array into a Vec<String>, returning an error if any element is not a string.
-fn parse_string_array(arr: &[Value], field_name: &str) -> Result<Vec<String>, CallToolResult> {
-    let mut result = Vec::with_capacity(arr.len());
-    for (i, v) in arr.iter().enumerate() {
-        match v.as_str() {
-            Some(s) => result.push(s.to_string()),
-            None => {
-                let type_name = match v {
-                    Value::Null => "null",
-                    Value::Bool(_) => "boolean",
-                    Value::Number(_) => "number",
-                    Value::Array(_) => "array",
-                    Value::Object(_) => "object",
-                    Value::String(_) => unreachable!(),
-                };
-                return Err(CallToolResult::error(format!(
-                    "Invalid {}[{}]: expected string, got {}",
-                    field_name, i, type_name
-                )));
-            }
-        }
-    }
-    Ok(result)
 }
 
 pub async fn toggle_rule(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {

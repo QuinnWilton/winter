@@ -11,6 +11,7 @@ thiserror = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }
+futures-util = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
@@ -21,6 +22,9 @@ chrono = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+
+# Web framework (for HTTP transport)
+axum = { workspace = true }
 
 # Internal
 winter-atproto = { workspace = true }
@@ -35,9 +39,11 @@ tempfile = { workspace = true }
 
 # Platform directories for secrets storage
 dirs = "5"
+base64.workspace = true
 
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 wiremock = { workspace = true }
+tower = { workspace = true }

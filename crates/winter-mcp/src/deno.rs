@@ -117,6 +117,11 @@ impl DenoExecutor {
         let tool_file = NamedTempFile::new()?;
         tokio::fs::write(tool_file.path(), code).await?;
 
+        // Build list of secret env var names for the context object
+        let secret_names: Vec<&str> = permissions.secrets.keys().map(|s| s.as_str()).collect();
+        let secret_names_json =
+            serde_json::to_string(&secret_names).unwrap_or_else(|_| "[]".to_string());
+
         // Create wrapper that imports the tool and handles stdin/stdout
         let wrapper_code = format!(
             r#"
@@ -144,17 +149,35 @@ async function readStdin(): Promise<string> {{
     return new TextDecoder().decode(combined);
 }}
 
+// Build context object with secrets
+const secretNames: string[] = {secret_names};
+const secrets: Record<string, string> = {{}};
+for (const name of secretNames) {{
+    const value = Deno.env.get(name);
+    if (value !== undefined) {{
+        // Strip WINTER_SECRET_ prefix for cleaner access
+        const shortName = name.replace(/^WINTER_SECRET_/, "");
+        secrets[shortName] = value;
+    }}
+}}
+
+const context = {{
+    secrets,
+    workspace: Deno.env.get("WINTER_WORKSPACE") || null,
+}};
+
 const inputText = await readStdin();
 const input = JSON.parse(inputText);
 
 try {{
-    const result = await tool(input);
+    const result = await tool(input, context);
     console.log(JSON.stringify({{ success: true, result }}));
 }} catch (error) {{
     console.log(JSON.stringify({{ success: false, error: error.message || String(error) }}));
 }}
 "#,
-            tool_file.path().display()
+            tool_file.path().display(),
+            secret_names = secret_names_json
         );
 
         let wrapper_file = NamedTempFile::new()?;
@@ -191,10 +214,8 @@ try {{
             env_vars.push(key.as_str());
         }
 
-        // Add WINTER_WORKSPACE env var permission if workspace is granted
-        if permissions.workspace.is_some() {
-            env_vars.push("WINTER_WORKSPACE");
-        }
+        // Always allow WINTER_WORKSPACE read (will be empty if not granted)
+        env_vars.push("WINTER_WORKSPACE");
 
         if !env_vars.is_empty() {
             cmd.arg(format!("--allow-env={}", env_vars.join(",")));
@@ -217,20 +238,20 @@ try {{
         );
 
         // Add workspace read permission if granted
-        if let Some(ref workspace) = permissions.workspace {
-            if workspace.read {
-                read_paths.push(',');
-                read_paths.push_str(&workspace.path.display().to_string());
-            }
+        if let Some(ref workspace) = permissions.workspace
+            && workspace.read
+        {
+            read_paths.push(',');
+            read_paths.push_str(&workspace.path.display().to_string());
         }
 
         cmd.arg(format!("--allow-read={}", read_paths));
 
         // Add workspace write permission if granted
-        if let Some(ref workspace) = permissions.workspace {
-            if workspace.write {
-                cmd.arg(format!("--allow-write={}", workspace.path.display()));
-            }
+        if let Some(ref workspace) = permissions.workspace
+            && workspace.write
+        {
+            cmd.arg(format!("--allow-write={}", workspace.path.display()));
         }
 
         // Add subprocess command permissions if granted
@@ -426,6 +447,43 @@ export default async function(_input: {}): Promise<{ key: string }> {
             .unwrap();
 
         assert_eq!(result.result, json!({ "key": "secret123" }));
+    }
+
+    #[tokio::test]
+    async fn tool_with_context_secrets() {
+        if !deno_available().await {
+            eprintln!("Skipping test - Deno not available");
+            return;
+        }
+
+        let executor = DenoExecutor::default();
+
+        // Tool uses context.secrets with stripped prefix
+        let code = r#"
+export default async function(_input: {}, context: { secrets: Record<string, string> }): Promise<{ key: string }> {
+    return { key: context.secrets["TEST_KEY"] || "not_found" };
+}
+"#;
+
+        let mut secrets = HashMap::new();
+        secrets.insert(
+            "WINTER_SECRET_TEST_KEY".to_string(),
+            "secret456".to_string(),
+        );
+
+        let permissions = DenoPermissions {
+            network: false,
+            secrets,
+            workspace: None,
+            allowed_commands: Vec::new(),
+        };
+
+        let result = executor
+            .execute(code, &json!({}), permissions)
+            .await
+            .unwrap();
+
+        assert_eq!(result.result, json!({ "key": "secret456" }));
     }
 
     #[tokio::test]

@@ -15,12 +15,12 @@ use crate::deno::{DenoExecutor, DenoPermissions, WorkspacePermission};
 use crate::protocol::{CallToolResult, ToolDefinition};
 use crate::secrets::SecretManager;
 use winter_atproto::{
-    CustomTool, IDENTITY_COLLECTION, IDENTITY_KEY, Identity, SECRET_META_COLLECTION,
-    SECRET_META_KEY, SecretEntry, SecretMeta, TOOL_APPROVAL_COLLECTION, TOOL_COLLECTION, Tid,
-    ToolApproval, ToolApprovalStatus,
+    ByteSlice, CustomTool, Facet, FacetFeature, IDENTITY_COLLECTION, IDENTITY_KEY, Identity,
+    SECRET_META_COLLECTION, SECRET_META_KEY, SecretEntry, SecretMeta, TOOL_APPROVAL_COLLECTION,
+    TOOL_COLLECTION, Tid, ToolApproval, ToolApprovalStatus,
 };
 
-use super::ToolState;
+use super::{ToolMeta, ToolState};
 
 /// Maximum code size (64KB).
 const MAX_CODE_SIZE: usize = 64 * 1024;
@@ -209,6 +209,12 @@ pub fn definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Get all custom tools management tools with their permission metadata.
+/// All custom tools management tools are allowed for the autonomous agent.
+pub fn tools() -> Vec<ToolMeta> {
+    definitions().into_iter().map(ToolMeta::allowed).collect()
+}
+
 /// Find a tool by name.
 async fn find_tool_by_name(
     state: &ToolState,
@@ -293,17 +299,35 @@ async fn notify_operator(
         format!("\nRequired commands: {}", required_commands.join(", "))
     };
 
-    let message = format!(
-        "I created/updated a tool \"{}\" that needs your approval.\n\nRequired secrets: {}{}{}\n\nPlease review at {}/tools/{}",
-        tool_name,
-        secrets_list,
-        workspace_info,
-        commands_info,
-        web_url(),
-        tool_rkey
+    // Build the URL and create explicit facet for it
+    let review_url = format!("{}/tools/{}", web_url(), tool_rkey);
+    info!(url = %review_url, "Tool approval notification URL");
+    let message_prefix = format!(
+        "I created/updated a tool \"{}\" that needs your approval.\n\nRequired secrets: {}{}{}\n\nPlease review at ",
+        tool_name, secrets_list, workspace_info, commands_info
     );
+    let message = format!("{}{}", message_prefix, review_url);
 
-    if let Err(e) = bluesky.send_dm(&operator_did, &message).await {
+    // Create explicit facet for the URL to avoid auto-detection issues with ports
+    let url_start = message_prefix.len();
+    let url_end = url_start + review_url.len();
+    let facets = vec![Facet {
+        index: ByteSlice {
+            byte_start: url_start as u64,
+            byte_end: url_end as u64,
+        },
+        features: vec![FacetFeature::Link {
+            uri: review_url.clone(),
+        }],
+    }];
+
+    info!(
+        facet_uri = %review_url,
+        byte_start = %url_start,
+        byte_end = %url_end,
+        "Sending tool approval DM with facet"
+    );
+    if let Err(e) = bluesky.send_dm(&operator_did, &message, Some(facets)).await {
         warn!(error = %e, "Failed to notify operator about tool");
     } else {
         info!(tool = %tool_name, "Notified operator about tool needing approval");
@@ -570,10 +594,14 @@ pub async fn list_custom_tools(
 
     for item in tools {
         // Filter by name (case-insensitive substring)
-        if let Some(name) = name_filter {
-            if !item.value.name.to_lowercase().contains(&name.to_lowercase()) {
-                continue;
-            }
+        if let Some(name) = name_filter
+            && !item
+                .value
+                .name
+                .to_lowercase()
+                .contains(&name.to_lowercase())
+        {
+            continue;
         }
 
         let rkey = item.uri.split('/').next_back().unwrap_or("");
@@ -589,17 +617,17 @@ pub async fn list_custom_tools(
         };
 
         // Filter by status
-        if let Some(filter) = status_filter {
-            if status != filter {
-                continue;
-            }
+        if let Some(filter) = status_filter
+            && status != filter
+        {
+            continue;
         }
 
         // Apply limit
-        if let Some(lim) = limit {
-            if formatted.len() >= lim as usize {
-                break;
-            }
+        if let Some(lim) = limit
+            && formatted.len() >= lim as usize
+        {
+            break;
         }
 
         formatted.push(json!({
@@ -712,7 +740,10 @@ pub async fn run_custom_tool(
     let permissions = if approved {
         let approval = approval.unwrap();
         let secret_values = if let Some(secrets) = secrets {
-            let mgr = secrets.read().await;
+            let mut mgr = secrets.write().await;
+            if let Err(e) = mgr.reload().await {
+                tracing::warn!(error = %e, "failed to reload secrets");
+            }
             mgr.get_subset(&approval.allowed_secrets)
         } else {
             HashMap::new()
@@ -800,10 +831,9 @@ pub async fn delete_custom_tool(
         .delete_record(TOOL_APPROVAL_COLLECTION, &rkey)
         .await
         .is_ok()
+        && let Some(cache) = &state.cache
     {
-        if let Some(cache) = &state.cache {
-            cache.delete_tool_approval(&rkey);
-        }
+        cache.delete_tool_approval(&rkey);
     }
 
     // Delete tool
@@ -887,18 +917,32 @@ pub async fn request_secret(
                 .atproto
                 .get_record::<Identity>(IDENTITY_COLLECTION, IDENTITY_KEY)
                 .await
+                && let Some(ref bluesky) = state.bluesky
             {
-                if let Some(ref bluesky) = state.bluesky {
-                    let message = format!(
-                        "I need a new secret \"{}\".\n\nDescription: {}\n\nPlease add it at {}/secrets",
-                        name,
-                        description,
-                        web_url()
-                    );
-                    let _ = bluesky
-                        .send_dm(&identity.value.operator_did, &message)
-                        .await;
-                }
+                // Build URL and create explicit facet for it
+                let secrets_url = format!("{}/secrets", web_url());
+                let message_prefix = format!(
+                    "I need a new secret \"{}\".\n\nDescription: {}\n\nPlease add it at ",
+                    name, description
+                );
+                let message = format!("{}{}", message_prefix, secrets_url);
+
+                // Create explicit facet for the URL
+                let url_start = message_prefix.len();
+                let url_end = url_start + secrets_url.len();
+                let facets = vec![Facet {
+                    index: ByteSlice {
+                        byte_start: url_start as u64,
+                        byte_end: url_end as u64,
+                    },
+                    features: vec![FacetFeature::Link {
+                        uri: secrets_url.clone(),
+                    }],
+                }];
+
+                let _ = bluesky
+                    .send_dm(&identity.value.operator_did, &message, Some(facets))
+                    .await;
             }
 
             CallToolResult::success(

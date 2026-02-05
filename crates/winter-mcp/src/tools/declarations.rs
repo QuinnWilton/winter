@@ -9,12 +9,22 @@ use chrono::Utc;
 use serde_json::{Value, json};
 
 use crate::protocol::{CallToolResult, ToolDefinition};
-use winter_atproto::{FactDeclArg, FactDeclaration, Tid, WriteOp, WriteResult};
+use winter_atproto::{AtUri, FactDeclArg, FactDeclaration, Tid, WriteOp, WriteResult};
 
-use super::ToolState;
+use super::{ToolMeta, ToolState};
 
 /// Collection name for fact declarations.
 const DECLARATION_COLLECTION: &str = "diy.razorgirl.winter.factDeclaration";
+
+/// Safely truncate a string to a maximum number of characters.
+/// This handles UTF-8 correctly by counting characters, not bytes.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        s.chars().take(max_chars).collect()
+    }
+}
 
 pub fn definitions() -> Vec<ToolDefinition> {
     vec![
@@ -201,6 +211,12 @@ create_fact_declaration(
     ]
 }
 
+/// Get all fact declaration tools with their permission metadata.
+/// All fact declaration tools are allowed for the autonomous agent.
+pub fn tools() -> Vec<ToolMeta> {
+    definitions().into_iter().map(ToolMeta::allowed).collect()
+}
+
 pub async fn create_fact_declaration(
     state: &ToolState,
     arguments: &HashMap<String, Value>,
@@ -235,13 +251,7 @@ pub async fn create_fact_declaration(
     };
 
     let description = match arguments.get("description").and_then(|v| v.as_str()) {
-        Some(d) => {
-            if d.len() > 1024 {
-                d[..1024].to_string()
-            } else {
-                d.to_string()
-            }
-        }
+        Some(d) => truncate_chars(d, 1024),
         None => return CallToolResult::error("Missing required parameter: description"),
     };
 
@@ -252,7 +262,7 @@ pub async fn create_fact_declaration(
             a.iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .take(20)
-                .map(|s| if s.len() > 64 { s[..64].to_string() } else { s })
+                .map(|s| truncate_chars(&s, 64))
                 .collect()
         })
         .unwrap_or_default();
@@ -321,12 +331,15 @@ pub async fn create_fact_declarations(
                 if p.len() > 64 {
                     return CallToolResult::error(format!(
                         "declarations[{}]: predicate name too long: {} chars (max 64)",
-                        i, p.len()
+                        i,
+                        p.len()
                     ));
                 }
                 p.to_string()
             }
-            None => return CallToolResult::error(format!("declarations[{}]: missing predicate", i)),
+            None => {
+                return CallToolResult::error(format!("declarations[{}]: missing predicate", i));
+            }
         };
 
         let args = match obj.get("args").and_then(|v| v.as_array()) {
@@ -334,14 +347,16 @@ pub async fn create_fact_declarations(
                 if arr.len() > 10 {
                     return CallToolResult::error(format!(
                         "declarations[{}]: too many arguments: {} (max 10)",
-                        i, arr.len()
+                        i,
+                        arr.len()
                     ));
                 }
                 match parse_args(arr) {
                     Ok(args) => args,
                     Err(e) => {
                         // Extract error message from CallToolResult
-                        if let Some(crate::protocol::ToolContent::Text { text }) = e.content.first() {
+                        if let Some(crate::protocol::ToolContent::Text { text }) = e.content.first()
+                        {
                             return CallToolResult::error(format!("declarations[{}].{}", i, text));
                         }
                         return CallToolResult::error(format!("declarations[{}]: invalid args", i));
@@ -352,14 +367,10 @@ pub async fn create_fact_declarations(
         };
 
         let description = match obj.get("description").and_then(|v| v.as_str()) {
-            Some(d) => {
-                if d.len() > 1024 {
-                    d[..1024].to_string()
-                } else {
-                    d.to_string()
-                }
+            Some(d) => truncate_chars(d, 1024),
+            None => {
+                return CallToolResult::error(format!("declarations[{}]: missing description", i));
             }
-            None => return CallToolResult::error(format!("declarations[{}]: missing description", i)),
         };
 
         let tags: Vec<String> = obj
@@ -369,7 +380,7 @@ pub async fn create_fact_declarations(
                 a.iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .take(20)
-                    .map(|s| if s.len() > 64 { s[..64].to_string() } else { s })
+                    .map(|s| truncate_chars(&s, 64))
                     .collect()
             })
             .unwrap_or_default();
@@ -402,10 +413,10 @@ pub async fn create_fact_declarations(
         Ok(response) => {
             // Update cache for each created record
             for ((rkey, decl), result) in validated.iter().zip(response.results.iter()) {
-                if let WriteResult::Create { cid, .. } = result {
-                    if let Some(cache) = &state.cache {
-                        cache.upsert_declaration(rkey.clone(), decl.clone(), cid.clone());
-                    }
+                if let WriteResult::Create { cid, .. } = result
+                    && let Some(cache) = &state.cache
+                {
+                    cache.upsert_declaration(rkey.clone(), decl.clone(), cid.clone());
                 }
             }
 
@@ -479,11 +490,7 @@ pub async fn update_fact_declaration(
 
     // Update description if provided
     if let Some(desc) = arguments.get("description").and_then(|v| v.as_str()) {
-        declaration.description = if desc.len() > 1024 {
-            desc[..1024].to_string()
-        } else {
-            desc.to_string()
-        };
+        declaration.description = truncate_chars(desc, 1024);
         changes.push("description");
     }
 
@@ -493,7 +500,7 @@ pub async fn update_fact_declaration(
             .iter()
             .filter_map(|v| v.as_str().map(String::from))
             .take(20)
-            .map(|s| if s.len() > 64 { s[..64].to_string() } else { s })
+            .map(|s| truncate_chars(&s, 64))
             .collect();
         changes.push("tags");
     }
@@ -514,7 +521,11 @@ pub async fn update_fact_declaration(
         Ok(response) => {
             // Update cache with the modified declaration
             if let Some(cache) = &state.cache {
-                cache.upsert_declaration(rkey.to_string(), declaration.clone(), response.cid.clone());
+                cache.upsert_declaration(
+                    rkey.to_string(),
+                    declaration.clone(),
+                    response.cid.clone(),
+                );
             }
             CallToolResult::success(
                 json!({
@@ -577,9 +588,7 @@ pub async fn list_fact_declarations(
         .await
     {
         Ok(records) => records,
-        Err(e) => {
-            return CallToolResult::error(format!("Failed to list fact declarations: {}", e))
-        }
+        Err(e) => return CallToolResult::error(format!("Failed to list fact declarations: {}", e)),
     };
 
     // Filter and format
@@ -587,23 +596,27 @@ pub async fn list_fact_declarations(
         .into_iter()
         .filter(|r| {
             // Filter by tag if specified
-            if let Some(tag) = tag_filter {
-                if !r.value.tags.contains(&tag.to_string()) {
-                    return false;
-                }
+            if let Some(tag) = tag_filter
+                && !r.value.tags.contains(&tag.to_string())
+            {
+                return false;
             }
             // Filter by predicate name (case-insensitive substring)
-            if let Some(pred) = predicate_filter {
-                if !r.value.predicate.to_lowercase().contains(&pred.to_lowercase()) {
-                    return false;
-                }
+            if let Some(pred) = predicate_filter
+                && !r
+                    .value
+                    .predicate
+                    .to_lowercase()
+                    .contains(&pred.to_lowercase())
+            {
+                return false;
             }
             true
         })
         .take(limit.unwrap_or(usize::MAX as u64) as usize)
         .map(|r| {
             // Extract rkey from URI (at://did/collection/rkey)
-            let rkey = r.uri.rsplit('/').next().unwrap_or("").to_string();
+            let rkey = AtUri::extract_rkey(&r.uri).to_string();
             json!({
                 "rkey": rkey,
                 "predicate": r.value.predicate,
@@ -646,13 +659,7 @@ fn parse_args(arr: &[Value]) -> Result<Vec<FactDeclArg>, CallToolResult> {
         };
 
         let name = match obj.get("name").and_then(|v| v.as_str()) {
-            Some(n) => {
-                if n.len() > 64 {
-                    n[..64].to_string()
-                } else {
-                    n.to_string()
-                }
-            }
+            Some(n) => truncate_chars(n, 64),
             None => {
                 return Err(CallToolResult::error(format!(
                     "args[{}] missing required field: name",
@@ -664,22 +671,13 @@ fn parse_args(arr: &[Value]) -> Result<Vec<FactDeclArg>, CallToolResult> {
         let r#type = obj
             .get("type")
             .and_then(|v| v.as_str())
-            .map(|t| {
-                if t.len() > 32 {
-                    t[..32].to_string()
-                } else {
-                    t.to_string()
-                }
-            })
+            .map(|t| truncate_chars(t, 32))
             .unwrap_or_else(|| "symbol".to_string());
 
-        let description = obj.get("description").and_then(|v| v.as_str()).map(|d| {
-            if d.len() > 256 {
-                d[..256].to_string()
-            } else {
-                d.to_string()
-            }
-        });
+        let description = obj
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|d| truncate_chars(d, 256));
 
         args.push(FactDeclArg {
             name,

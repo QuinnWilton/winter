@@ -78,6 +78,20 @@ impl SecretManager {
             .join("secrets.json")
     }
 
+    /// Reload secrets from disk.
+    ///
+    /// Call this before accessing secrets to pick up changes made by other processes.
+    pub async fn reload(&mut self) -> Result<(), SecretError> {
+        let data = if self.path.exists() {
+            let content = fs::read_to_string(&self.path).await?;
+            serde_json::from_str(&content)?
+        } else {
+            SecretFile::default()
+        };
+        self.data = data;
+        Ok(())
+    }
+
     /// Get a secret value by name.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.data.secrets.get(name).map(|s| s.as_str())
@@ -265,5 +279,27 @@ mod tests {
             let mgr = SecretManager::load(Some(path)).await.unwrap();
             assert_eq!(mgr.get("PERSISTENT"), Some("value"));
         }
+    }
+
+    #[tokio::test]
+    async fn secret_manager_reload() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+
+        // Create initial manager
+        let mut mgr1 = SecretManager::load(Some(path.clone())).await.unwrap();
+        mgr1.set("INITIAL", "value1").await.unwrap();
+
+        // Simulate another process (web UI) adding a secret
+        let mut mgr2 = SecretManager::load(Some(path.clone())).await.unwrap();
+        mgr2.set("NEW_SECRET", "value2").await.unwrap();
+
+        // mgr1 doesn't see the new secret yet
+        assert!(mgr1.get("NEW_SECRET").is_none());
+
+        // After reload, mgr1 sees the new secret
+        mgr1.reload().await.unwrap();
+        assert_eq!(mgr1.get("NEW_SECRET"), Some("value2"));
+        assert_eq!(mgr1.get("INITIAL"), Some("value1"));
     }
 }

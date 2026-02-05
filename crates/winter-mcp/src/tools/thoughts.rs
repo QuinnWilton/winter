@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::protocol::{CallToolResult, ToolDefinition};
 use winter_atproto::{Thought, ThoughtKind, Tid};
 
-use super::ToolState;
+use super::{ToolMeta, ToolState};
 
 /// Collection name for thoughts.
 const THOUGHT_COLLECTION: &str = "diy.razorgirl.winter.thought";
@@ -88,6 +88,12 @@ pub fn definitions() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+/// Get all thought tools with their permission metadata.
+/// All thought tools are allowed for the autonomous agent.
+pub fn tools() -> Vec<ToolMeta> {
+    definitions().into_iter().map(ToolMeta::allowed).collect()
 }
 
 pub async fn record_thought(
@@ -234,22 +240,26 @@ pub async fn list_thoughts(
         .into_iter()
         .filter(|item| {
             // Filter by kind
-            if let Some(filter) = kind_filter {
-                if thought_kind_to_str(&item.value.kind) != filter {
-                    return false;
-                }
+            if let Some(filter) = kind_filter
+                && thought_kind_to_str(&item.value.kind) != filter
+            {
+                return false;
             }
             // Filter by tag (exact match)
-            if let Some(tag) = tag_filter {
-                if !item.value.tags.contains(&tag.to_string()) {
-                    return false;
-                }
+            if let Some(tag) = tag_filter
+                && !item.value.tags.contains(&tag.to_string())
+            {
+                return false;
             }
             // Filter by content (case-insensitive substring)
-            if let Some(search) = search_filter {
-                if !item.value.content.to_lowercase().contains(&search.to_lowercase()) {
-                    return false;
-                }
+            if let Some(search) = search_filter
+                && !item
+                    .value
+                    .content
+                    .to_lowercase()
+                    .contains(&search.to_lowercase())
+            {
+                return false;
             }
             // Filter by trigger (case-insensitive substring)
             if let Some(trigger) = trigger_filter {
@@ -264,9 +274,10 @@ pub async fn list_thoughts(
         .take(limit)
         .map(|item| {
             let rkey = item.uri.split('/').next_back().unwrap_or("");
-            // Truncate content for listing
-            let preview = if item.value.content.len() > 200 {
-                format!("{}...", &item.value.content[..200])
+            // Truncate content for listing (safely handle UTF-8 by using char boundaries)
+            let preview = if item.value.content.chars().count() > 200 {
+                let truncated: String = item.value.content.chars().take(200).collect();
+                format!("{}...", truncated)
             } else {
                 item.value.content.clone()
             };

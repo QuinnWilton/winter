@@ -1,10 +1,204 @@
 //! Tool definitions and implementations for the MCP server.
+//!
+//! # Adding a New Tool
+//!
+//! This guide walks through creating a new MCP tool from scratch.
+//!
+//! ## 1. Create the tool module (if needed)
+//!
+//! For a new category of tools, create a new file in `src/tools/`:
+//!
+//! ```ignore
+//! // src/tools/my_tools.rs
+//! use std::collections::HashMap;
+//! use serde_json::{Value, json};
+//! use crate::protocol::{CallToolResult, ToolDefinition};
+//! use super::{ToolMeta, ToolState};
+//! ```
+//!
+//! ## 2. Define the tool schema
+//!
+//! Create a `definitions()` function that returns tool schemas:
+//!
+//! ```ignore
+//! pub fn definitions() -> Vec<ToolDefinition> {
+//!     vec![
+//!         ToolDefinition {
+//!             name: "my_tool".to_string(),
+//!             description: "Does something useful. Returns the result.".to_string(),
+//!             input_schema: json!({
+//!                 "type": "object",
+//!                 "properties": {
+//!                     "required_param": {
+//!                         "type": "string",
+//!                         "description": "A required parameter"
+//!                     },
+//!                     "optional_param": {
+//!                         "type": "integer",
+//!                         "description": "An optional parameter with default",
+//!                         "default": 10
+//!                     }
+//!                 },
+//!                 "required": ["required_param"]
+//!             }),
+//!         },
+//!     ]
+//! }
+//! ```
+//!
+//! ## 3. Set tool permissions
+//!
+//! Create a `tools()` function that wraps definitions with permission metadata:
+//!
+//! ```ignore
+//! /// Get all tools with their permission metadata.
+//! pub fn tools() -> Vec<ToolMeta> {
+//!     // For tools the autonomous agent can use:
+//!     definitions().into_iter().map(ToolMeta::allowed).collect()
+//!
+//!     // Or for operator-only tools (agent cannot use):
+//!     // definitions().into_iter().map(ToolMeta::operator_only).collect()
+//!
+//!     // Or mixed permissions:
+//!     // vec![
+//!     //     ToolMeta::allowed(my_tool_definition()),
+//!     //     ToolMeta::operator_only(dangerous_tool_definition()),
+//!     // ]
+//! }
+//! ```
+//!
+//! ## 4. Implement the tool function
+//!
+//! ```ignore
+//! pub async fn my_tool(
+//!     state: &ToolState,
+//!     arguments: &HashMap<String, Value>,
+//! ) -> CallToolResult {
+//!     // Extract required parameters
+//!     let required_param = match arguments.get("required_param").and_then(|v| v.as_str()) {
+//!         Some(p) => p,
+//!         None => return CallToolResult::error("Missing required parameter: required_param"),
+//!     };
+//!
+//!     // Extract optional parameters with defaults
+//!     let optional_param = arguments
+//!         .get("optional_param")
+//!         .and_then(|v| v.as_i64())
+//!         .unwrap_or(10);
+//!
+//!     // Do the work (use state.atproto, state.cache, etc.)
+//!     match do_something(state, required_param, optional_param).await {
+//!         Ok(result) => CallToolResult::success(
+//!             json!({
+//!                 "rkey": result.rkey,
+//!                 "status": "success"
+//!             }).to_string()
+//!         ),
+//!         Err(e) => CallToolResult::error(format!("Failed: {}", e)),
+//!     }
+//! }
+//! ```
+//!
+//! ## 5. Register the module
+//!
+//! In `src/tools/mod.rs`:
+//!
+//! ```ignore
+//! // Add the module declaration at the top
+//! mod my_tools;
+//!
+//! // In ToolRegistry::all_tools(), add:
+//! tools.extend(my_tools::tools());
+//!
+//! // In ToolRegistry::execute(), add the dispatch:
+//! "my_tool" => my_tools::my_tool(&state, arguments).await,
+//! ```
+//!
+//! ## 6. Add result summarization (optional but recommended)
+//!
+//! In `get_tool_category()`, add your tool's category for thought recording:
+//!
+//! ```ignore
+//! // For single record mutations:
+//! "my_tool" => SingleMutation {
+//!     key_fields: &["rkey", "status"],
+//!     web_path: Some("my_records"),  // or None if no web UI
+//! },
+//!
+//! // For list operations:
+//! "list_my_things" => List {
+//!     count_field: "count",
+//!     items_field: "items",
+//!     sample_key: "name",
+//! },
+//!
+//! // For batch operations:
+//! "create_my_things" => BatchMutation {
+//!     count_field: "created",
+//!     sample_field: "results",
+//!     sample_key: "name",
+//! },
+//! ```
+//!
+//! ## Permission Guidelines
+//!
+//! Use `ToolMeta::allowed()` for tools that:
+//! - Read data (queries, lists, gets)
+//! - Create/update Winter records (facts, notes, jobs, etc.)
+//! - Post to Bluesky (the agent's primary communication channel)
+//! - Are safe for autonomous operation
+//!
+//! Use `ToolMeta::operator_only()` for tools that:
+//! - Delete data destructively
+//! - Access sensitive secrets
+//! - Perform irreversible operations
+//! - Require human oversight
+//!
+//! ## Testing
+//!
+//! Add tests in the module to verify:
+//! - Tool definitions are valid
+//! - Required parameters are validated
+//! - Success and error paths work correctly
+//!
+//! ```ignore
+//! #[cfg(test)]
+//! mod tests {
+//!     use super::*;
+//!
+//!     #[test]
+//!     fn test_definitions() {
+//!         let defs = definitions();
+//!         assert!(!defs.is_empty());
+//!         for def in defs {
+//!             assert!(!def.name.is_empty());
+//!             assert!(!def.description.is_empty());
+//!         }
+//!     }
+//!
+//!     #[test]
+//!     fn test_tools_have_permissions() {
+//!         let tools = tools();
+//!         assert!(!tools.is_empty());
+//!         // All tools should have the expected permission
+//!         for tool in tools {
+//!             assert!(tool.agent_allowed); // or !tool.agent_allowed for operator-only
+//!         }
+//!     }
+//! }
+//! ```
+//!
+//! ## Example: Complete Tool Module
+//!
+//! See `src/tools/notes.rs` for a simple example, or `src/tools/facts.rs`
+//! for a more complex example with queries and batch operations.
 
 mod blog;
 mod bluesky;
 mod custom_tools;
 mod declarations;
 mod directives;
+mod enrich;
 mod facts;
 mod identity;
 mod jobs;
@@ -15,10 +209,11 @@ mod thoughts;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use chrono::Utc;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::{RwLock, mpsc};
 use tracing::warn;
 
@@ -28,6 +223,40 @@ use crate::protocol::{CallToolResult, ToolContent, ToolDefinition};
 use crate::secrets::SecretManager;
 use winter_atproto::{AtprotoClient, RepoCache, Thought, ThoughtKind, Tid};
 use winter_datalog::{DatalogCache, DatalogCoordinatorHandle};
+
+// ============================================================================
+// Tool Metadata with Permissions
+// ============================================================================
+
+/// Metadata about a tool including its definition and permission settings.
+///
+/// This struct colocates tool definitions with their permission metadata,
+/// eliminating the need to maintain separate permission lists in the agent.
+#[derive(Debug, Clone)]
+pub struct ToolMeta {
+    /// The tool definition (name, description, input schema).
+    pub definition: ToolDefinition,
+    /// Whether the autonomous agent is allowed to use this tool.
+    pub agent_allowed: bool,
+}
+
+impl ToolMeta {
+    /// Create a tool that the agent is allowed to use.
+    pub fn allowed(definition: ToolDefinition) -> Self {
+        Self {
+            definition,
+            agent_allowed: true,
+        }
+    }
+
+    /// Create a tool that the agent is NOT allowed to use (operator-only).
+    pub fn operator_only(definition: ToolDefinition) -> Self {
+        Self {
+            definition,
+            agent_allowed: false,
+        }
+    }
+}
 
 // ============================================================================
 // Tool Result Summarization
@@ -220,6 +449,10 @@ fn get_tool_category(tool_name: &str) -> ToolResultCategory {
             key_fields: &["success"],
             web_path: None,
         },
+        "delete_post" => SingleMutation {
+            key_fields: &["deleted", "post_uri"],
+            web_path: None,
+        },
 
         // === Batch Mutations ===
         "create_facts" => BatchMutation {
@@ -294,14 +527,25 @@ fn get_tool_category(tool_name: &str) -> ToolResultCategory {
             items_field: "records",
             sample_key: "rkey",
         },
+        "pds_get_records" => List {
+            count_field: "count",
+            items_field: "records",
+            sample_key: "uri",
+        },
         "list_predicates" => List {
             count_field: "total",
             items_field: "predicates",
             sample_key: "name",
         },
+        "list_validation_errors" => List {
+            count_field: "count",
+            items_field: "errors",
+            sample_key: "predicate",
+        },
 
         // === Query ===
         "query_facts" => Query,
+        "query_and_enrich" => Query,
 
         // === Get Operations ===
         "get_note" => Get {
@@ -345,6 +589,12 @@ fn get_tool_category(tool_name: &str) -> ToolResultCategory {
         // === Excluded ===
         "record_thought" => Excluded,
 
+        // === Session Management ===
+        "check_interruption" => Get {
+            key_fields: &["interrupted", "reason"],
+            size_field: None,
+        },
+
         // Default to Custom for unknown tools
         _ => Custom,
     }
@@ -360,14 +610,55 @@ fn make_web_link(web_path: &str, rkey: &str) -> Option<String> {
     get_web_url().map(|base| format!("{}/{}/{}", base.trim_end_matches('/'), web_path, rkey))
 }
 
-/// Truncate a string for summary display.
-fn truncate_for_summary(s: &str, max_chars: usize) -> String {
+/// Maximum batch size for batch create operations.
+pub(crate) const MAX_BATCH_SIZE: usize = 100;
+
+/// Truncate a string for summary display (UTF-8 safe).
+pub(crate) fn truncate_for_summary(s: &str, max_chars: usize) -> String {
     let char_count = s.chars().count();
     if char_count <= max_chars {
         s.to_string()
     } else {
         format!("{}...", s.chars().take(max_chars).collect::<String>())
     }
+}
+
+/// Truncate a string without adding "..." suffix (UTF-8 safe).
+pub(crate) fn truncate_string(s: &str, max_chars: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_chars {
+        s.to_string()
+    } else {
+        s.chars().take(max_chars).collect()
+    }
+}
+
+/// Parse a JSON array into a Vec<String>, returning an error if any element is not a string.
+pub(crate) fn parse_string_array(
+    arr: &[serde_json::Value],
+    field_name: &str,
+) -> Result<Vec<String>, crate::protocol::CallToolResult> {
+    let mut result = Vec::with_capacity(arr.len());
+    for (i, v) in arr.iter().enumerate() {
+        match v.as_str() {
+            Some(s) => result.push(s.to_string()),
+            None => {
+                let type_name = match v {
+                    serde_json::Value::Null => "null",
+                    serde_json::Value::Bool(_) => "boolean",
+                    serde_json::Value::Number(_) => "number",
+                    serde_json::Value::Array(_) => "array",
+                    serde_json::Value::Object(_) => "object",
+                    serde_json::Value::String(_) => unreachable!(),
+                };
+                return Err(crate::protocol::CallToolResult::error(format!(
+                    "Invalid {}[{}]: expected string, got {}",
+                    field_name, i, type_name
+                )));
+            }
+        }
+    }
+    Ok(result)
 }
 
 /// Extract a string value from JSON, with optional truncation.
@@ -431,12 +722,11 @@ fn summarize_single_mutation(
     let mut summary = parts.join(", ");
 
     // Add web link if available
-    if let Some(path) = web_path {
-        if let Some(rkey) = extract_string(result, "rkey", None) {
-            if let Some(link) = make_web_link(path, &rkey) {
-                summary.push_str(&format!("\nView: {}", link));
-            }
-        }
+    if let Some(path) = web_path
+        && let Some(rkey) = extract_string(result, "rkey", None)
+        && let Some(link) = make_web_link(path, &rkey)
+    {
+        summary.push_str(&format!("\nView: {}", link));
     }
 
     summary
@@ -497,8 +787,7 @@ fn summarize_list(
             arr.iter()
                 .take(3)
                 .filter_map(|item| {
-                    extract_string(item, sample_key, Some(30))
-                        .map(|s| format!("\"{}\"", s))
+                    extract_string(item, sample_key, Some(30)).map(|s| format!("\"{}\"", s))
                 })
                 .collect()
         })
@@ -561,10 +850,10 @@ fn summarize_get(result: &Value, key_fields: &[&str], size_field: Option<&str>) 
     }
 
     // Add content size if requested
-    if let Some(field) = size_field {
-        if let Some(Value::String(content)) = result.get(field) {
-            parts.push(format!("{}_length={}", field, content.len()));
-        }
+    if let Some(field) = size_field
+        && let Some(Value::String(content)) = result.get(field)
+    {
+        parts.push(format!("{}_length={}", field, content.len()));
     }
 
     parts.join(", ")
@@ -654,7 +943,10 @@ fn summarize_bluesky_read(result: &Value, read_type: BlueskyReadType) -> String 
                 .and_then(|a| a.get("handle"))
                 .and_then(|h| h.as_str())
             {
-                parts.push(format!("root_author={}", truncate_for_summary(root_author, 25)));
+                parts.push(format!(
+                    "root_author={}",
+                    truncate_for_summary(root_author, 25)
+                ));
             }
 
             if let Some(total) = result.get("total_replies").and_then(|v| v.as_u64()) {
@@ -706,6 +998,54 @@ const THOUGHT_COLLECTION: &str = "diy.razorgirl.winter.thought";
 /// Bounded channel size for async thought writing.
 const THOUGHT_CHANNEL_SIZE: usize = 100;
 
+/// State for background session interruption signaling.
+///
+/// This is shared between the daemon (which sets the interrupt flag when
+/// queue pressure builds) and the MCP server (which exposes it via
+/// `check_interruption` tool).
+#[derive(Debug, Default)]
+pub struct InterruptionState {
+    /// Whether the current session should interrupt.
+    pub should_interrupt: AtomicBool,
+    /// Reason for interruption (e.g., "queue_pressure").
+    pub reason: RwLock<Option<String>>,
+}
+
+impl InterruptionState {
+    /// Create a new interruption state with no pending interrupt.
+    pub fn new() -> Self {
+        Self {
+            should_interrupt: AtomicBool::new(false),
+            reason: RwLock::new(None),
+        }
+    }
+
+    /// Signal that the session should interrupt.
+    pub async fn set_interrupt(&self, reason: &str) {
+        self.should_interrupt.store(true, Ordering::SeqCst);
+        let mut guard = self.reason.write().await;
+        *guard = Some(reason.to_string());
+    }
+
+    /// Check if interrupted and get the reason.
+    pub async fn check(&self) -> (bool, Option<String>) {
+        let interrupted = self.should_interrupt.load(Ordering::SeqCst);
+        if interrupted {
+            let guard = self.reason.read().await;
+            (true, guard.clone())
+        } else {
+            (false, None)
+        }
+    }
+
+    /// Clear the interruption state.
+    pub async fn clear(&self) {
+        self.should_interrupt.store(false, Ordering::SeqCst);
+        let mut guard = self.reason.write().await;
+        *guard = None;
+    }
+}
+
 /// Shared state for tools.
 pub struct ToolState {
     pub atproto: Arc<AtprotoClient>,
@@ -723,6 +1063,8 @@ pub struct ToolState {
     pub secrets: Option<Arc<RwLock<SecretManager>>>,
     /// Deno executor for custom tool sandboxing (optional).
     pub deno: Option<DenoExecutor>,
+    /// Interruption state for background sessions (optional).
+    pub interruption: Option<Arc<InterruptionState>>,
 }
 
 /// Registry of available tools.
@@ -731,6 +1073,27 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    /// Create an empty tool registry for testing purposes.
+    ///
+    /// This creates a registry with no ATProto client connection.
+    /// Only useful for testing the MCP protocol layer.
+    #[cfg(test)]
+    pub fn empty() -> Self {
+        Self {
+            state: Arc::new(RwLock::new(ToolState {
+                atproto: Arc::new(AtprotoClient::new("https://unused.test")),
+                bluesky: None,
+                cache: None,
+                datalog_cache: None,
+                datalog_coordinator: None,
+                thought_tx: None,
+                secrets: None,
+                deno: None,
+                interruption: None,
+            })),
+        }
+    }
+
     /// Create a new tool registry.
     pub fn new(atproto: AtprotoClient) -> Self {
         let atproto = Arc::new(atproto);
@@ -753,6 +1116,7 @@ impl ToolRegistry {
                 thought_tx: Some(thought_tx),
                 secrets: None,
                 deno: None,
+                interruption: None,
             })),
         }
     }
@@ -779,6 +1143,7 @@ impl ToolRegistry {
                 thought_tx: Some(thought_tx),
                 secrets: None,
                 deno: None,
+                interruption: None,
             })),
         }
     }
@@ -833,52 +1198,110 @@ impl ToolRegistry {
         guard.deno = Some(deno);
     }
 
-    /// Get all tool definitions.
-    pub fn definitions(&self) -> Vec<ToolDefinition> {
-        let mut defs = Vec::new();
+    /// Set the interruption state for background sessions.
+    pub async fn set_interruption(&self, interruption: Arc<InterruptionState>) {
+        let mut guard = self.state.write().await;
+        guard.interruption = Some(interruption);
+    }
+
+    /// Get all tool metadata (definitions + permissions).
+    fn all_tools() -> Vec<ToolMeta> {
+        let mut tools = Vec::new();
 
         // Bluesky tools
-        defs.extend(bluesky::definitions());
+        tools.extend(bluesky::tools());
 
         // Fact tools
-        defs.extend(facts::definitions());
+        tools.extend(facts::tools());
+
+        // Enrich tools (query + API enrichment)
+        tools.extend(enrich::tools());
 
         // Rule tools
-        defs.extend(rules::definitions());
+        tools.extend(rules::tools());
 
         // Note tools
-        defs.extend(notes::definitions());
+        tools.extend(notes::tools());
 
         // Job tools
-        defs.extend(jobs::definitions());
+        tools.extend(jobs::tools());
 
         // Identity tools
-        defs.extend(identity::definitions());
+        tools.extend(identity::tools());
 
         // Thought tools
-        defs.extend(thoughts::definitions());
+        tools.extend(thoughts::tools());
 
         // Blog tools
-        defs.extend(blog::definitions());
+        tools.extend(blog::tools());
 
         // Custom tools
-        defs.extend(custom_tools::definitions());
+        tools.extend(custom_tools::tools());
 
         // Directive tools
-        defs.extend(directives::definitions());
+        tools.extend(directives::tools());
 
         // Fact declaration tools
-        defs.extend(declarations::definitions());
+        tools.extend(declarations::tools());
 
         // PDS raw access tools
-        defs.extend(pds::definitions());
+        tools.extend(pds::tools());
 
-        defs
+        // Session management tools (check_interruption for background sessions)
+        tools.push(ToolMeta::allowed(ToolDefinition {
+            name: "check_interruption".to_string(),
+            description: "Check if this background session should wrap up. Call this periodically during background sessions. Returns whether notifications are waiting and the session should exit gracefully.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }));
+
+        tools
+    }
+
+    /// Get all tool definitions (for MCP protocol).
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        Self::all_tools()
+            .into_iter()
+            .map(|t| t.definition)
+            .collect()
+    }
+
+    /// Get the list of tool names allowed for the autonomous agent.
+    ///
+    /// Returns tool names in the MCP format: `mcp__winter__{tool_name}`.
+    pub fn agent_allowed_tools() -> Vec<String> {
+        Self::all_tools()
+            .into_iter()
+            .filter(|t| t.agent_allowed)
+            .map(|t| format!("mcp__winter__{}", t.definition.name))
+            .collect()
     }
 
     /// Execute a tool by name.
     pub async fn execute(&self, name: &str, arguments: &HashMap<String, Value>) -> CallToolResult {
+        self.execute_with_trigger(name, arguments, None).await
+    }
+
+    /// Execute a tool by name with an optional trigger context.
+    ///
+    /// The trigger is used for thought recording, allowing tool calls to be
+    /// associated with their originating session (notification, DM, job, etc.).
+    pub async fn execute_with_trigger(
+        &self,
+        name: &str,
+        arguments: &HashMap<String, Value>,
+        trigger: Option<String>,
+    ) -> CallToolResult {
         let start = Instant::now();
+
+        // Record a "starting" thought for potentially slow tools
+        // This provides immediate feedback that work is happening
+        if is_potentially_slow_tool(name) {
+            self.record_tool_starting(name, trigger.clone()).await;
+        }
 
         // Some tools need write access (e.g., get_notifications updates cursor)
         let needs_write = matches!(name, "get_notifications");
@@ -903,7 +1326,9 @@ impl ToolRegistry {
             .await
             {
                 let duration_ms = start.elapsed().as_millis() as u64;
-                return self.finalize_result(name, arguments, result, duration_ms).await;
+                return self
+                    .finalize_result(name, arguments, result, duration_ms, trigger)
+                    .await;
             }
 
             match name {
@@ -924,6 +1349,7 @@ impl ToolRegistry {
                 "unblock_user" => bluesky::unblock_user(&state, arguments).await,
                 "mute_thread" => bluesky::mute_thread(&state, arguments).await,
                 "unmute_thread" => bluesky::unmute_thread(&state, arguments).await,
+                "delete_post" => bluesky::delete_post(&state, arguments).await,
 
                 // Fact tools
                 "create_fact" => facts::create_fact(&state, arguments).await,
@@ -932,6 +1358,10 @@ impl ToolRegistry {
                 "delete_fact" => facts::delete_fact(&state, arguments).await,
                 "query_facts" => facts::query_facts(&state, arguments).await,
                 "list_predicates" => facts::list_predicates(&state, arguments).await,
+                "list_validation_errors" => facts::list_validation_errors(&state, arguments).await,
+
+                // Enrich tool
+                "query_and_enrich" => enrich::query_and_enrich(&state, arguments).await,
 
                 // Rule tools
                 "create_rule" => rules::create_rule(&state, arguments).await,
@@ -975,6 +1405,7 @@ impl ToolRegistry {
                 // PDS raw access tools
                 "pds_list_records" => pds::pds_list_records(&state, arguments).await,
                 "pds_get_record" => pds::pds_get_record(&state, arguments).await,
+                "pds_get_records" => pds::pds_get_records(&state, arguments).await,
                 "pds_put_record" => pds::pds_put_record(&state, arguments).await,
                 "pds_delete_record" => pds::pds_delete_record(&state, arguments).await,
 
@@ -995,12 +1426,36 @@ impl ToolRegistry {
                     declarations::list_fact_declarations(&state, arguments).await
                 }
 
+                // Session management tools
+                "check_interruption" => {
+                    if let Some(ref interruption) = state.interruption {
+                        let (interrupted, reason) = interruption.check().await;
+                        CallToolResult::success(
+                            json!({
+                                "interrupted": interrupted,
+                                "reason": reason
+                            })
+                            .to_string(),
+                        )
+                    } else {
+                        // No interruption state means not a background session
+                        CallToolResult::success(
+                            json!({
+                                "interrupted": false,
+                                "reason": null
+                            })
+                            .to_string(),
+                        )
+                    }
+                }
+
                 _ => CallToolResult::error(format!("Unknown tool: {}", name)),
             }
         };
 
         let duration_ms = start.elapsed().as_millis() as u64;
-        self.finalize_result(name, arguments, result, duration_ms).await
+        self.finalize_result(name, arguments, result, duration_ms, trigger)
+            .await
     }
 
     /// Finalize a result by recording the tool call thought.
@@ -1010,38 +1465,73 @@ impl ToolRegistry {
         arguments: &HashMap<String, Value>,
         result: CallToolResult,
         duration_ms: u64,
+        trigger: Option<String>,
     ) -> CallToolResult {
         // Record a tool_call thought (skip for record_thought to avoid recursion)
         if name != "record_thought" {
-            self.record_tool_call(name, arguments, &result, duration_ms).await;
+            self.record_tool_call(name, arguments, &result, duration_ms, trigger)
+                .await;
         }
 
         result
+    }
+
+    /// Record a "starting" thought for potentially slow tools.
+    ///
+    /// This provides immediate feedback in the thoughtstream that a tool
+    /// is executing, rather than waiting until completion.
+    async fn record_tool_starting(&self, name: &str, trigger: Option<String>) {
+        let thought = Thought {
+            kind: ThoughtKind::ToolCall,
+            content: serde_json::json!({
+                "tool": name,
+                "status": "starting"
+            })
+            .to_string(),
+            trigger: trigger.or_else(|| Some("internal:tool_call".to_string())),
+            tags: Vec::new(),
+            duration_ms: None,
+            created_at: Utc::now(),
+        };
+
+        let state = self.state.read().await;
+
+        // Fire and forget - don't block on write
+        if let Some(ref tx) = state.thought_tx
+            && let Err(e) = tx.try_send(thought)
+        {
+            warn!(error = %e, tool = %name, "failed to queue tool_starting thought");
+        }
     }
 
     /// Record a thought about a tool call for transparency.
     ///
     /// This uses fire-and-forget semantics via a bounded channel.
     /// The thought is sent asynchronously and written by a background task.
+    ///
+    /// The trigger parameter allows tool calls to be associated with their
+    /// originating session (notification, DM, job, etc.). If no trigger is
+    /// provided, falls back to "internal:tool_call".
     async fn record_tool_call(
         &self,
         name: &str,
         arguments: &HashMap<String, Value>,
         result: &CallToolResult,
         duration_ms: u64,
+        trigger: Option<String>,
     ) {
         let is_error = result.is_error.unwrap_or(false);
 
         // Format the tool call in structured format for web UI rendering
         let content = format_tool_call_content(name, arguments, result, is_error);
 
-        // Use static trigger for tool calls - they're recorded for debugging
-        // but shouldn't appear in any conversation context (not relevant to
-        // notification handling, DM responses, or awaken reflections)
+        // Use the session trigger if provided, otherwise fall back to static trigger
+        let thought_trigger = trigger.unwrap_or_else(|| "internal:tool_call".to_string());
+
         let thought = Thought {
             kind: ThoughtKind::ToolCall,
             content,
-            trigger: Some("internal:tool_call".to_string()),
+            trigger: Some(thought_trigger),
             tags: Vec::new(),
             duration_ms: Some(duration_ms),
             created_at: Utc::now(),
@@ -1050,59 +1540,172 @@ impl ToolRegistry {
         let state = self.state.read().await;
 
         // Fire and forget - don't block on write
-        if let Some(ref tx) = state.thought_tx {
-            if let Err(e) = tx.try_send(thought) {
-                warn!(error = %e, tool = %name, "failed to queue tool_call thought");
-            }
+        if let Some(ref tx) = state.thought_tx
+            && let Err(e) = tx.try_send(thought)
+        {
+            warn!(error = %e, tool = %name, "failed to queue tool_call thought");
+        }
+    }
+
+    /// Record a built-in Claude tool call as a Thought.
+    ///
+    /// This is called via HTTP from the agent after each Claude invocation to log
+    /// built-in tool usage (WebSearch, Read, WebFetch, etc.) as Thought records.
+    /// Unlike MCP tools which have results available, built-in tools execute inside
+    /// Claude's process so we only have the input arguments.
+    pub async fn record_builtin_tool_call(
+        &self,
+        name: &str,
+        tool_id: &str,
+        input: &Value,
+        trigger: Option<String>,
+    ) {
+        // Format as structured JSON matching the MCP tool call format
+        let content = serde_json::json!({
+            "tool": name,
+            "args": input,
+            "builtin": true,
+            "claude_id": tool_id,
+        });
+
+        let thought_trigger = trigger.unwrap_or_else(|| "internal:tool_call".to_string());
+
+        let thought = Thought {
+            kind: ThoughtKind::ToolCall,
+            content: serde_json::to_string(&content)
+                .unwrap_or_else(|_| format!("{{\"tool\":\"{}\"}}", name)),
+            trigger: Some(thought_trigger),
+            tags: vec!["builtin".to_string()],
+            duration_ms: None, // We don't have timing info for built-in tools
+            created_at: Utc::now(),
+        };
+
+        let state = self.state.read().await;
+
+        // Fire and forget - don't block on write
+        if let Some(ref tx) = state.thought_tx
+            && let Err(e) = tx.try_send(thought)
+        {
+            warn!(error = %e, tool = %name, "failed to queue builtin tool_call thought");
         }
     }
 }
 
-/// Format a tool call into structured content for web UI rendering.
+/// Structured content for tool call thoughts.
+///
+/// This is serialized to JSON for storage, allowing the web UI to render
+/// each component (tool name, args, result, link) as separate UI elements.
+#[derive(serde::Serialize)]
+struct ToolCallContent {
+    tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    args: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    failed: bool,
+}
+
+/// Check if a tool is potentially slow and should have a "starting" thought recorded.
+///
+/// This helps provide immediate feedback in the thoughtstream for tools that
+/// may take significant time to execute.
+fn is_potentially_slow_tool(name: &str) -> bool {
+    matches!(
+        name,
+        // Datalog queries can be slow, especially on first run
+        "query_facts" | "list_validation_errors" | "list_predicates"
+        // Network calls to resolve handles/DIDs
+        | "resolve_handle" | "resolve_did" | "get_profile"
+        // Bluesky API calls that may be slow
+        | "get_timeline" | "search_posts" | "search_users" | "get_thread_context"
+        // Getting notifications can be slow with many items
+        | "get_notifications"
+    )
+}
+
+/// Format a tool call into structured JSON content for web UI rendering.
 fn format_tool_call_content(
     name: &str,
     arguments: &HashMap<String, Value>,
     result: &CallToolResult,
     is_error: bool,
 ) -> String {
-    let mut content = format!("Called {}", name);
-    if is_error {
-        content.push_str(" - FAILED");
-    }
-    content.push('\n');
+    let args = if arguments.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_value(arguments).unwrap_or(Value::Null))
+    };
 
-    // Pretty-print arguments as JSON
-    if !arguments.is_empty() {
-        let args_json = serde_json::to_value(arguments).unwrap_or(Value::Null);
-        if let Ok(pretty) = serde_json::to_string_pretty(&args_json) {
-            content.push_str("Args:\n");
-            content.push_str(&pretty);
-            content.push('\n');
-        }
-    }
+    let (result_value, summary, link, error) =
+        if let Some(ToolContent::Text { text }) = result.content.first() {
+            if is_error {
+                (None, None, None, Some(text.clone()))
+            } else if let Ok(json) = serde_json::from_str::<Value>(text) {
+                let category = get_tool_category(name);
 
-    // Include result summary (or full error)
-    if let Some(ToolContent::Text { text }) = result.content.first() {
-        if is_error {
-            // Show full error message
-            content.push_str("Error:\n");
-            content.push_str(text);
-        } else if let Ok(json) = serde_json::from_str::<Value>(text) {
-            // Generate category-based summary
-            let summary = summarize_result(name, &json);
-            if !summary.is_empty() {
-                content.push_str("Result: ");
-                content.push_str(&summary);
+                // Generate summary and link based on category
+                let (summary, link) = match &category {
+                    ToolResultCategory::Excluded => (None, None),
+                    ToolResultCategory::SingleMutation { web_path, .. } => {
+                        let sum = summarize_result(name, &json);
+                        let link = web_path.and_then(|path| {
+                            extract_string(&json, "rkey", None)
+                                .and_then(|rkey| make_web_link(path, &rkey))
+                        });
+                        (Some(sum).filter(|s| !s.is_empty()), link)
+                    }
+                    _ => {
+                        let sum = summarize_result(name, &json);
+                        (Some(sum).filter(|s| !s.is_empty()), None)
+                    }
+                };
+
+                (Some(json), summary, link, None)
+            } else {
+                // Non-JSON text result
+                (Some(Value::String(text.clone())), None, None, None)
             }
-        }
-    }
+        } else {
+            (None, None, None, None)
+        };
 
-    content
+    let content = ToolCallContent {
+        tool: name.to_string(),
+        args,
+        result: result_value,
+        summary,
+        link,
+        error,
+        failed: is_error,
+    };
+
+    serde_json::to_string(&content).unwrap_or_else(|_| format!("{{\"tool\":\"{}\"}}", name))
 }
+
+/// Maximum byte size for thought content to avoid PayloadTooLargeError.
+/// ATProto records have size limits; 32KB is a safe limit for thought content.
+const MAX_THOUGHT_CONTENT_BYTES: usize = 32_000;
 
 /// Background task that writes thoughts to the PDS.
 async fn thought_writer_loop(client: Arc<AtprotoClient>, mut rx: mpsc::Receiver<Thought>) {
-    while let Some(thought) = rx.recv().await {
+    while let Some(mut thought) = rx.recv().await {
+        // Truncate content if too large to avoid PayloadTooLargeError
+        if thought.content.len() > MAX_THOUGHT_CONTENT_BYTES {
+            // Find a safe UTF-8 boundary for truncation
+            let mut end = MAX_THOUGHT_CONTENT_BYTES;
+            while end > 0 && !thought.content.is_char_boundary(end) {
+                end -= 1;
+            }
+            thought.content = format!("{}...[truncated]", &thought.content[..end]);
+        }
+
         let rkey = Tid::now().to_string();
         if let Err(e) = client
             .create_record(THOUGHT_COLLECTION, Some(&rkey), &thought)
@@ -1446,7 +2049,10 @@ mod tests {
             ]
         });
         let summary = summarize_list(&result, "count", "notes", "title");
-        assert_eq!(summary, "count=15, sample=[\"Note 1\", \"Note 2\", \"Note 3\"]");
+        assert_eq!(
+            summary,
+            "count=15, sample=[\"Note 1\", \"Note 2\", \"Note 3\"]"
+        );
     }
 
     #[test]
@@ -1653,9 +2259,18 @@ mod tests {
             "number_field": 42,
             "null_field": null
         });
-        assert_eq!(extract_string(&result, "string_field", None), Some("hello".to_string()));
-        assert_eq!(extract_string(&result, "bool_field", None), Some("true".to_string()));
-        assert_eq!(extract_string(&result, "number_field", None), Some("42".to_string()));
+        assert_eq!(
+            extract_string(&result, "string_field", None),
+            Some("hello".to_string())
+        );
+        assert_eq!(
+            extract_string(&result, "bool_field", None),
+            Some("true".to_string())
+        );
+        assert_eq!(
+            extract_string(&result, "number_field", None),
+            Some("42".to_string())
+        );
         assert_eq!(extract_string(&result, "null_field", None), None);
         assert_eq!(extract_string(&result, "missing", None), None);
     }
@@ -1663,14 +2278,22 @@ mod tests {
     #[test]
     fn format_tool_call_content_with_summary() {
         let args = HashMap::new();
-        let result = CallToolResult::success(serde_json::to_string(&json!({
-            "rkey": "3abc123",
-            "predicate": "test_pred"
-        })).unwrap());
+        let result = CallToolResult::success(
+            serde_json::to_string(&json!({
+                "rkey": "3abc123",
+                "predicate": "test_pred"
+            }))
+            .unwrap(),
+        );
 
         let content = format_tool_call_content("create_fact", &args, &result, false);
-        assert!(content.contains("Called create_fact"));
-        assert!(content.contains("Result: rkey=3abc123, predicate=test_pred"));
+        let parsed: Value = serde_json::from_str(&content).expect("should be valid JSON");
+
+        assert_eq!(parsed["tool"], "create_fact");
+        assert_eq!(parsed["result"]["rkey"], "3abc123");
+        assert_eq!(parsed["result"]["predicate"], "test_pred");
+        assert!(parsed["summary"].as_str().unwrap().contains("rkey=3abc123"));
+        assert!(parsed.get("failed").is_none()); // false values are skipped
     }
 
     #[test]
@@ -1680,21 +2303,152 @@ mod tests {
         let result = CallToolResult::error(error_text);
 
         let content = format_tool_call_content("create_fact", &args, &result, true);
-        assert!(content.contains("Called create_fact - FAILED"));
-        assert!(content.contains("Error:"));
-        assert!(content.contains(error_text));
+        let parsed: Value = serde_json::from_str(&content).expect("should be valid JSON");
+
+        assert_eq!(parsed["tool"], "create_fact");
+        assert_eq!(parsed["error"], error_text);
+        assert_eq!(parsed["failed"], true);
+        assert!(parsed.get("result").is_none());
     }
 
     #[test]
-    fn format_tool_call_content_excluded_tool_no_result() {
+    fn format_tool_call_content_excluded_tool_has_result_no_summary() {
         let args = HashMap::new();
-        let result = CallToolResult::success(serde_json::to_string(&json!({
-            "rkey": "3abc123",
-            "kind": "insight"
-        })).unwrap());
+        let result = CallToolResult::success(
+            serde_json::to_string(&json!({
+                "rkey": "3abc123",
+                "kind": "insight"
+            }))
+            .unwrap(),
+        );
 
         let content = format_tool_call_content("record_thought", &args, &result, false);
-        assert!(content.contains("Called record_thought"));
-        assert!(!content.contains("Result:"));
+        let parsed: Value = serde_json::from_str(&content).expect("should be valid JSON");
+
+        assert_eq!(parsed["tool"], "record_thought");
+        // Excluded tools still have result, just no summary
+        assert!(parsed.get("result").is_some());
+        assert!(parsed.get("summary").is_none());
+    }
+
+    #[test]
+    fn format_tool_call_content_includes_args() {
+        let mut args = HashMap::new();
+        args.insert("predicate".to_string(), json!("test"));
+        args.insert("args".to_string(), json!(["a", "b"]));
+
+        let result = CallToolResult::success(
+            serde_json::to_string(&json!({
+                "rkey": "abc123",
+                "predicate": "test"
+            }))
+            .unwrap(),
+        );
+
+        let content = format_tool_call_content("create_fact", &args, &result, false);
+        let parsed: Value = serde_json::from_str(&content).expect("should be valid JSON");
+
+        assert_eq!(parsed["args"]["predicate"], "test");
+        assert_eq!(parsed["args"]["args"], json!(["a", "b"]));
+    }
+
+    #[test]
+    fn format_tool_call_content_empty_args_omitted() {
+        let args = HashMap::new();
+        let result = CallToolResult::success(
+            serde_json::to_string(&json!({
+                "count": 0,
+                "notes": []
+            }))
+            .unwrap(),
+        );
+
+        let content = format_tool_call_content("list_notes", &args, &result, false);
+        let parsed: Value = serde_json::from_str(&content).expect("should be valid JSON");
+
+        assert!(parsed.get("args").is_none());
+    }
+
+    // ========================================================================
+    // Tests for ToolMeta and permission colocating
+    // ========================================================================
+
+    #[test]
+    fn all_tools_have_permission_metadata() {
+        // Ensure all tools returned by all_tools() have valid metadata
+        let tools = ToolRegistry::all_tools();
+        assert!(!tools.is_empty(), "Should have at least one tool");
+
+        for tool in &tools {
+            assert!(
+                !tool.definition.name.is_empty(),
+                "Tool name should not be empty"
+            );
+            assert!(
+                !tool.definition.description.is_empty(),
+                "Tool description should not be empty"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_allowed_tools_returns_mcp_format() {
+        let allowed = ToolRegistry::agent_allowed_tools();
+        assert!(!allowed.is_empty(), "Should have at least one allowed tool");
+
+        // All tool names should be in MCP format
+        for name in &allowed {
+            assert!(
+                name.starts_with("mcp__winter__"),
+                "Tool name '{}' should start with 'mcp__winter__'",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn agent_allowed_tools_includes_expected_tools() {
+        let allowed = ToolRegistry::agent_allowed_tools();
+
+        // Check a sample of expected tools
+        let expected = [
+            "mcp__winter__post_to_bluesky",
+            "mcp__winter__create_fact",
+            "mcp__winter__query_facts",
+            "mcp__winter__create_note",
+            "mcp__winter__schedule_job",
+            "mcp__winter__record_thought",
+            "mcp__winter__create_directive",
+        ];
+
+        for tool in expected {
+            assert!(
+                allowed.contains(&tool.to_string()),
+                "Expected tool '{}' to be allowed",
+                tool
+            );
+        }
+    }
+
+    #[test]
+    fn definitions_and_all_tools_count_match() {
+        let all_tools = ToolRegistry::all_tools();
+
+        // Create a temp registry to get definitions
+        // Note: definitions() requires an instance, but all_tools() is static
+        // We verify by comparing tool metadata count
+        let tool_count = all_tools.len();
+
+        // Should have a reasonable number of tools
+        assert!(
+            tool_count > 50,
+            "Expected at least 50 tools, got {}",
+            tool_count
+        );
+        assert!(
+            tool_count < 200,
+            "Unexpected number of tools: {}",
+            tool_count
+        );
     }
 }

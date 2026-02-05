@@ -9,9 +9,9 @@ use chrono::Utc;
 use serde_json::{Value, json};
 
 use crate::protocol::{CallToolResult, ToolDefinition};
-use winter_atproto::{Directive, DirectiveKind, Tid, WriteOp, WriteResult};
+use winter_atproto::{AtUri, Directive, DirectiveKind, Tid, WriteOp, WriteResult};
 
-use super::ToolState;
+use super::{MAX_BATCH_SIZE, ToolMeta, ToolState, truncate_string};
 
 /// Collection name for directives.
 const DIRECTIVE_COLLECTION: &str = "diy.razorgirl.winter.directive";
@@ -207,6 +207,12 @@ Kinds:
     ]
 }
 
+/// Get all directive tools with their permission metadata.
+/// All directive tools are allowed for the autonomous agent.
+pub fn tools() -> Vec<ToolMeta> {
+    definitions().into_iter().map(ToolMeta::allowed).collect()
+}
+
 fn parse_directive_kind(s: &str) -> Option<DirectiveKind> {
     match s {
         "value" => Some(DirectiveKind::Value),
@@ -251,26 +257,20 @@ pub async fn create_directive(
         ));
     }
 
-    let summary = arguments.get("summary").and_then(|v| v.as_str()).map(|s| {
-        if s.len() > 256 {
-            s[..256].to_string()
-        } else {
-            s.to_string()
-        }
-    });
+    let summary = arguments
+        .get("summary")
+        .and_then(|v| v.as_str())
+        .map(|s| truncate_string(s, 256));
 
     let confidence = arguments
         .get("confidence")
         .and_then(|v| v.as_f64())
         .map(|c| c.clamp(0.0, 1.0));
 
-    let source = arguments.get("source").and_then(|v| v.as_str()).map(|s| {
-        if s.len() > 500 {
-            s[..500].to_string()
-        } else {
-            s.to_string()
-        }
-    });
+    let source = arguments
+        .get("source")
+        .and_then(|v| v.as_str())
+        .map(|s| truncate_string(s, 500));
 
     let supersedes = arguments
         .get("supersedes")
@@ -284,7 +284,7 @@ pub async fn create_directive(
             a.iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .take(10)
-                .map(|s| if s.len() > 64 { s[..64].to_string() } else { s })
+                .map(|s| truncate_string(&s, 64))
                 .collect()
         })
         .unwrap_or_default();
@@ -350,8 +350,17 @@ pub async fn create_directives(
         return CallToolResult::error("directives array cannot be empty");
     }
 
+    if directives_array.len() > MAX_BATCH_SIZE {
+        return CallToolResult::error(format!(
+            "Batch size {} exceeds maximum of {}",
+            directives_array.len(),
+            MAX_BATCH_SIZE
+        ));
+    }
+
     // Validate and parse all directives first
-    let mut validated: Vec<(String, Directive, String)> = Vec::with_capacity(directives_array.len());
+    let mut validated: Vec<(String, Directive, String)> =
+        Vec::with_capacity(directives_array.len());
     let now = Utc::now();
 
     for (i, dir_val) in directives_array.iter().enumerate() {
@@ -383,30 +392,25 @@ pub async fn create_directives(
         if content.len() > 2000 {
             return CallToolResult::error(format!(
                 "directives[{}]: content too long: {} chars (max 2000)",
-                i, content.len()
+                i,
+                content.len()
             ));
         }
 
-        let summary = obj.get("summary").and_then(|v| v.as_str()).map(|s| {
-            if s.len() > 256 {
-                s[..256].to_string()
-            } else {
-                s.to_string()
-            }
-        });
+        let summary = obj
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(|s| truncate_string(s, 256));
 
         let confidence = obj
             .get("confidence")
             .and_then(|v| v.as_f64())
             .map(|c| c.clamp(0.0, 1.0));
 
-        let source = obj.get("source").and_then(|v| v.as_str()).map(|s| {
-            if s.len() > 500 {
-                s[..500].to_string()
-            } else {
-                s.to_string()
-            }
-        });
+        let source = obj
+            .get("source")
+            .and_then(|v| v.as_str())
+            .map(|s| truncate_string(s, 500));
 
         let tags: Vec<String> = obj
             .get("tags")
@@ -415,7 +419,7 @@ pub async fn create_directives(
                 a.iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .take(10)
-                    .map(|s| if s.len() > 64 { s[..64].to_string() } else { s })
+                    .map(|s| truncate_string(&s, 64))
                     .collect()
             })
             .unwrap_or_default();
@@ -459,10 +463,10 @@ pub async fn create_directives(
         Ok(response) => {
             // Update cache for each created record
             for ((rkey, directive, _), result) in validated.iter().zip(response.results.iter()) {
-                if let WriteResult::Create { cid, .. } = result {
-                    if let Some(cache) = &state.cache {
-                        cache.upsert_directive(rkey.clone(), directive.clone(), cid.clone());
-                    }
+                if let WriteResult::Create { cid, .. } = result
+                    && let Some(cache) = &state.cache
+                {
+                    cache.upsert_directive(rkey.clone(), directive.clone(), cid.clone());
                 }
             }
 
@@ -534,11 +538,7 @@ pub async fn update_directive(
 
     // Update summary if provided
     if let Some(summary) = arguments.get("summary").and_then(|v| v.as_str()) {
-        directive.summary = Some(if summary.len() > 256 {
-            summary[..256].to_string()
-        } else {
-            summary.to_string()
-        });
+        directive.summary = Some(truncate_string(summary, 256));
         changes.push("summary");
     }
 
@@ -550,11 +550,7 @@ pub async fn update_directive(
 
     // Update source if provided
     if let Some(source) = arguments.get("source").and_then(|v| v.as_str()) {
-        directive.source = Some(if source.len() > 500 {
-            source[..500].to_string()
-        } else {
-            source.to_string()
-        });
+        directive.source = Some(truncate_string(source, 500));
         changes.push("source");
     }
 
@@ -564,7 +560,7 @@ pub async fn update_directive(
             .iter()
             .filter_map(|v| v.as_str().map(String::from))
             .take(10)
-            .map(|s| if s.len() > 64 { s[..64].to_string() } else { s })
+            .map(|s| truncate_string(&s, 64))
             .collect();
         changes.push("tags");
     }
@@ -707,29 +703,33 @@ pub async fn list_directives(
                 return false;
             }
             // Filter by kind if specified
-            if let Some(ref filter_kind) = kind_filter {
-                if &r.value.kind != filter_kind {
-                    return false;
-                }
+            if let Some(ref filter_kind) = kind_filter
+                && &r.value.kind != filter_kind
+            {
+                return false;
             }
             // Filter by content (case-insensitive substring)
-            if let Some(search) = search_filter {
-                if !r.value.content.to_lowercase().contains(&search.to_lowercase()) {
-                    return false;
-                }
+            if let Some(search) = search_filter
+                && !r
+                    .value
+                    .content
+                    .to_lowercase()
+                    .contains(&search.to_lowercase())
+            {
+                return false;
             }
             // Filter by tag
-            if let Some(tag) = tag_filter {
-                if !r.value.tags.contains(&tag.to_string()) {
-                    return false;
-                }
+            if let Some(tag) = tag_filter
+                && !r.value.tags.contains(&tag.to_string())
+            {
+                return false;
             }
             true
         })
         .take(limit.unwrap_or(usize::MAX as u64) as usize)
         .map(|r| {
             // Extract rkey from URI (at://did/collection/rkey)
-            let rkey = r.uri.rsplit('/').next().unwrap_or("").to_string();
+            let rkey = AtUri::extract_rkey(&r.uri).to_string();
             json!({
                 "rkey": rkey,
                 "kind": r.value.kind.to_string(),

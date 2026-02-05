@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::protocol::{CallToolResult, ToolDefinition};
 use winter_atproto::{Note, Tid};
 
-use super::ToolState;
+use super::{ToolMeta, ToolState, truncate_for_summary};
 
 /// Collection name for notes.
 const NOTE_COLLECTION: &str = "diy.razorgirl.winter.note";
@@ -85,6 +85,12 @@ pub fn definitions() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+/// Get all note tools with their permission metadata.
+/// All note tools are allowed for the autonomous agent.
+pub fn tools() -> Vec<ToolMeta> {
+    definitions().into_iter().map(ToolMeta::allowed).collect()
 }
 
 pub async fn create_note(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
@@ -254,12 +260,8 @@ pub async fn list_notes(state: &ToolState, arguments: &HashMap<String, Value>) -
         .take(limit)
         .map(|item| {
             let rkey = item.uri.split('/').next_back().unwrap_or("");
-            // Truncate content for listing
-            let preview = if item.value.content.len() > 100 {
-                format!("{}...", &item.value.content[..100])
-            } else {
-                item.value.content.clone()
-            };
+            // Truncate content for listing (UTF-8 safe)
+            let preview = truncate_for_summary(&item.value.content, 100);
             json!({
                 "rkey": rkey,
                 "title": item.value.title,

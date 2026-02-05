@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::protocol::{CallToolResult, ToolDefinition};
 use winter_atproto::{Job, JobSchedule, JobStatus, Tid};
 
-use super::ToolState;
+use super::{ToolMeta, ToolState};
 
 /// Collection name for jobs.
 const JOB_COLLECTION: &str = "diy.razorgirl.winter.job";
@@ -109,6 +109,12 @@ pub fn definitions() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+/// Get all job tools with their permission metadata.
+/// All job tools are allowed for the autonomous agent.
+pub fn tools() -> Vec<ToolMeta> {
+    definitions().into_iter().map(ToolMeta::allowed).collect()
 }
 
 pub async fn schedule_job(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
@@ -279,10 +285,14 @@ pub async fn list_jobs(state: &ToolState, arguments: &HashMap<String, Value>) ->
                 }
             }
             // Filter by name (case-insensitive substring)
-            if let Some(name) = name_filter {
-                if !item.value.name.to_lowercase().contains(&name.to_lowercase()) {
-                    return false;
-                }
+            if let Some(name) = name_filter
+                && !item
+                    .value
+                    .name
+                    .to_lowercase()
+                    .contains(&name.to_lowercase())
+            {
+                return false;
             }
             true
         })
@@ -296,6 +306,7 @@ pub async fn list_jobs(state: &ToolState, arguments: &HashMap<String, Value>) ->
             json!({
                 "rkey": rkey,
                 "name": item.value.name,
+                "instructions": item.value.instructions,
                 "schedule": schedule_desc,
                 "status": format!("{:?}", item.value.status).to_lowercase(),
                 "next_run": item.value.next_run.map(|dt| dt.to_rfc3339()),

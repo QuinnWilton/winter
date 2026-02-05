@@ -10,7 +10,7 @@ use crate::protocol::{CallToolResult, ToolDefinition};
 use winter_atproto::{Fact, ListRecordItem, Rule, SyncState, Tid, WriteOp, WriteResult};
 use winter_datalog::{DerivedFactGenerator, FactExtractor, RuleCompiler, SouffleExecutor};
 
-use super::ToolState;
+use super::{MAX_BATCH_SIZE, ToolMeta, ToolState, parse_string_array};
 
 /// Collection name for facts.
 const FACT_COLLECTION: &str = "diy.razorgirl.winter.fact";
@@ -218,7 +218,21 @@ For each predicate, shows:
                 }
             }),
         },
+        ToolDefinition {
+            name: "list_validation_errors".to_string(),
+            description: "List facts that don't conform to their declared schema. Returns rkey, predicate, and error message for each invalid fact.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
     ]
+}
+
+/// Get all fact tools with their permission metadata.
+/// All fact tools are allowed for the autonomous agent.
+pub fn tools() -> Vec<ToolMeta> {
+    definitions().into_iter().map(ToolMeta::allowed).collect()
 }
 
 pub async fn create_fact(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
@@ -305,6 +319,14 @@ pub async fn create_facts(state: &ToolState, arguments: &HashMap<String, Value>)
         return CallToolResult::error("facts array cannot be empty");
     }
 
+    if facts_array.len() > MAX_BATCH_SIZE {
+        return CallToolResult::error(format!(
+            "Batch size {} exceeds maximum of {}",
+            facts_array.len(),
+            MAX_BATCH_SIZE
+        ));
+    }
+
     // Validate and parse all facts first
     let mut validated: Vec<(String, Fact)> = Vec::with_capacity(facts_array.len());
     let now = Utc::now();
@@ -371,7 +393,7 @@ pub async fn create_facts(state: &ToolState, arguments: &HashMap<String, Value>)
         .map(|(rkey, fact)| WriteOp::Create {
             collection: FACT_COLLECTION.to_string(),
             rkey: rkey.clone(),
-            value: serde_json::to_value(fact).unwrap(),
+            value: serde_json::to_value(fact).expect("Fact struct should always serialize"),
         })
         .collect();
 
@@ -380,10 +402,10 @@ pub async fn create_facts(state: &ToolState, arguments: &HashMap<String, Value>)
         Ok(response) => {
             // Update cache for each created record
             for ((rkey, fact), result) in validated.iter().zip(response.results.iter()) {
-                if let WriteResult::Create { cid, .. } = result {
-                    if let Some(cache) = &state.cache {
-                        cache.upsert_fact(rkey.clone(), fact.clone(), cid.clone());
-                    }
+                if let WriteResult::Create { cid, .. } = result
+                    && let Some(cache) = &state.cache
+                {
+                    cache.upsert_fact(rkey.clone(), fact.clone(), cid.clone());
                 }
             }
 
@@ -820,9 +842,7 @@ pub async fn query_facts(state: &ToolState, arguments: &HashMap<String, Value>) 
         let heads = RuleCompiler::parse_extra_rules_heads(extra);
         for (name, arity) in heads {
             if !declared_predicates.contains(&name) {
-                let params: Vec<String> = (0..arity)
-                    .map(|i| format!("arg{}: symbol", i))
-                    .collect();
+                let params: Vec<String> = (0..arity).map(|i| format!("arg{}: symbol", i)).collect();
                 program.push_str(&format!(".decl {}({})\n", name, params.join(", ")));
                 declared_predicates.insert(name);
             }
@@ -862,7 +882,50 @@ pub async fn query_facts(state: &ToolState, arguments: &HashMap<String, Value>) 
     )
 }
 
-pub async fn list_predicates(state: &ToolState, arguments: &HashMap<String, Value>) -> CallToolResult {
+pub async fn list_validation_errors(
+    state: &ToolState,
+    _arguments: &HashMap<String, Value>,
+) -> CallToolResult {
+    // Query the _validation_error predicate via datalog
+    let query = "_validation_error(R, P, E)";
+
+    let results = if let Some(ref coordinator) = state.datalog_coordinator {
+        coordinator.query(query, None).await
+    } else if let Some(ref datalog_cache) = state.datalog_cache {
+        datalog_cache.execute_query(query, None).await
+    } else {
+        return CallToolResult::error("No datalog cache available");
+    };
+
+    match results {
+        Ok(tuples) => {
+            let errors: Vec<Value> = tuples
+                .iter()
+                .map(|row| {
+                    json!({
+                        "rkey": row.first().map(String::as_str).unwrap_or(""),
+                        "predicate": row.get(1).map(String::as_str).unwrap_or(""),
+                        "error": row.get(2).map(String::as_str).unwrap_or("")
+                    })
+                })
+                .collect();
+
+            CallToolResult::success(
+                json!({
+                    "count": errors.len(),
+                    "errors": errors
+                })
+                .to_string(),
+            )
+        }
+        Err(e) => CallToolResult::error(format!("Failed to query validation errors: {}", e)),
+    }
+}
+
+pub async fn list_predicates(
+    state: &ToolState,
+    arguments: &HashMap<String, Value>,
+) -> CallToolResult {
     let search_filter = arguments.get("search").and_then(|v| v.as_str());
     let mut user_predicates: Vec<Value> = Vec::new();
     let mut derived_predicates: Vec<Value> = Vec::new();
@@ -871,10 +934,10 @@ pub async fn list_predicates(state: &ToolState, arguments: &HashMap<String, Valu
     // Get derived predicates with full info from DerivedFactGenerator
     for (name, info) in DerivedFactGenerator::predicate_info() {
         // Apply search filter to derived predicates
-        if let Some(search) = search_filter {
-            if !name.to_lowercase().contains(&search.to_lowercase()) {
-                continue;
-            }
+        if let Some(search) = search_filter
+            && !name.to_lowercase().contains(&search.to_lowercase())
+        {
+            continue;
         }
 
         let signature = format!("{}({})", name, info.args.join(", "));
@@ -900,10 +963,10 @@ pub async fn list_predicates(state: &ToolState, arguments: &HashMap<String, Valu
     ];
     for (name, arity, args) in meta {
         // Apply search filter to metadata predicates
-        if let Some(search) = search_filter {
-            if !name.to_lowercase().contains(&search.to_lowercase()) {
-                continue;
-            }
+        if let Some(search) = search_filter
+            && !name.to_lowercase().contains(&search.to_lowercase())
+        {
+            continue;
         }
 
         metadata_predicates.push(json!({
@@ -917,7 +980,10 @@ pub async fn list_predicates(state: &ToolState, arguments: &HashMap<String, Valu
     let fact_results = if let Some(ref coordinator) = state.datalog_coordinator {
         coordinator.query("_fact(R, P, C)", None).await.ok()
     } else if let Some(ref datalog_cache) = state.datalog_cache {
-        datalog_cache.execute_query("_fact(R, P, C)", None).await.ok()
+        datalog_cache
+            .execute_query("_fact(R, P, C)", None)
+            .await
+            .ok()
     } else {
         None
     };
@@ -936,10 +1002,10 @@ pub async fn list_predicates(state: &ToolState, arguments: &HashMap<String, Valu
                 continue;
             }
             // Apply search filter to user predicates
-            if let Some(search) = search_filter {
-                if !pred.to_lowercase().contains(&search.to_lowercase()) {
-                    continue;
-                }
+            if let Some(search) = search_filter
+                && !pred.to_lowercase().contains(&search.to_lowercase())
+            {
+                continue;
             }
             user_predicates.push(json!({
                 "name": pred,
@@ -1008,10 +1074,7 @@ fn parse_query(query: &str) -> Option<ParsedQuery> {
     let args_str = &query[paren_idx + 1..close_paren];
 
     if args_str.trim().is_empty() {
-        return Some(ParsedQuery {
-            name,
-            args: vec![],
-        });
+        return Some(ParsedQuery { name, args: vec![] });
     }
 
     // Parse arguments, handling quoted strings and nested parens
@@ -1158,31 +1221,6 @@ fn generate_query_wrapper(
     (wrapper, result_arity)
 }
 
-/// Parse a JSON array into a Vec<String>, returning an error if any element is not a string.
-fn parse_string_array(arr: &[Value], field_name: &str) -> Result<Vec<String>, CallToolResult> {
-    let mut result = Vec::with_capacity(arr.len());
-    for (i, v) in arr.iter().enumerate() {
-        match v.as_str() {
-            Some(s) => result.push(s.to_string()),
-            None => {
-                let type_name = match v {
-                    Value::Null => "null",
-                    Value::Bool(_) => "boolean",
-                    Value::Number(_) => "number",
-                    Value::Array(_) => "array",
-                    Value::Object(_) => "object",
-                    Value::String(_) => unreachable!(),
-                };
-                return Err(CallToolResult::error(format!(
-                    "Invalid {}[{}]: expected string, got {}",
-                    field_name, i, type_name
-                )));
-            }
-        }
-    }
-    Ok(result)
-}
-
 /// Fetch facts and rules via HTTP (fallback when cache is unavailable).
 async fn fetch_facts_and_rules_http(
     state: &ToolState,
@@ -1312,7 +1350,9 @@ mod tests {
         assert_eq!(arity, 1);
         assert!(wrapper.contains(".decl _query_result(arg0: symbol)"));
         assert!(wrapper.contains(".output _query_result"));
-        assert!(wrapper.contains(r#"_query_result("did:plc:abc") :- should_engage("did:plc:abc")."#));
+        assert!(
+            wrapper.contains(r#"_query_result("did:plc:abc") :- should_engage("did:plc:abc")."#)
+        );
     }
 
     #[test]

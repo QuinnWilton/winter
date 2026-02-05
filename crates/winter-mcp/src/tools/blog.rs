@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::protocol::{CallToolResult, ToolDefinition};
-use winter_atproto::Tid;
+use winter_atproto::{AtUri, Tid};
 
-use super::ToolState;
+use super::{ToolMeta, ToolState};
 
 /// Collection name for WhiteWind blog entries.
 const BLOG_COLLECTION: &str = "com.whtwnd.blog.entry";
@@ -121,8 +121,20 @@ pub fn definitions() -> Vec<ToolDefinition> {
             description: "List all blog posts. Returns rkey, title, draft status, and created_at for each post.".to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {},
-                "required": []
+                "properties": {
+                    "draft": {
+                        "type": "boolean",
+                        "description": "Filter by draft status (true = drafts only, false = published only)"
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "Filter by title (case-insensitive substring)"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum number of posts to return"
+                    }
+                }
             }),
         },
         ToolDefinition {
@@ -140,6 +152,12 @@ pub fn definitions() -> Vec<ToolDefinition> {
             }),
         },
     ]
+}
+
+/// Get all blog tools with their permission metadata.
+/// All blog tools are allowed for the autonomous agent.
+pub fn tools() -> Vec<ToolMeta> {
+    definitions().into_iter().map(ToolMeta::allowed).collect()
 }
 
 pub async fn publish_blog_post(
@@ -324,8 +342,12 @@ pub async fn update_blog_post(
 
 pub async fn list_blog_posts(
     state: &ToolState,
-    _arguments: &HashMap<String, Value>,
+    arguments: &HashMap<String, Value>,
 ) -> CallToolResult {
+    let draft_filter = arguments.get("draft").and_then(|v| v.as_bool());
+    let search_filter = arguments.get("search").and_then(|v| v.as_str());
+    let limit = arguments.get("limit").and_then(|v| v.as_u64());
+
     let records = match state
         .atproto
         .list_all_records::<BlogEntry>(BLOG_COLLECTION)
@@ -339,8 +361,28 @@ pub async fn list_blog_posts(
 
     let posts: Vec<Value> = records
         .iter()
+        .filter(|item| {
+            // Filter by draft status
+            if let Some(draft) = draft_filter
+                && item.value.draft != draft
+            {
+                return false;
+            }
+            // Filter by title (case-insensitive substring)
+            if let Some(search) = search_filter
+                && !item
+                    .value
+                    .title
+                    .to_lowercase()
+                    .contains(&search.to_lowercase())
+            {
+                return false;
+            }
+            true
+        })
+        .take(limit.unwrap_or(usize::MAX as u64) as usize)
         .map(|item| {
-            let rkey = item.uri.rsplit('/').next().unwrap_or("");
+            let rkey = AtUri::extract_rkey(&item.uri);
             let whtwnd_url = format!("https://whtwnd.com/{}/{}", handle, rkey);
             let greengale_url = format!("https://greengale.app/{}/{}", handle, rkey);
             json!({
