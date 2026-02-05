@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "winter": {
+      "type": "http",
+      "url": "http://mcp-server:3847/mcp",
+      "headers": {
+        "X-Winter-Trigger": "${WINTER_TRIGGER:-}"
+      }
+    }
+  }
+}
