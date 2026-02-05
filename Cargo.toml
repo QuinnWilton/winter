@@ -22,7 +22,17 @@ thiserror = "2.0"
 miette = { version = "7.0", features = ["fancy"] }
 
 # Async runtime
-tokio = { version = "1.42", features = ["full"] }
+tokio = { version = "1.42", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "io-util",
+    "net",
+    "fs",
+    "signal",
+    "process",
+] }
 async-trait = "0.1"
 
 # Claude Code CLI wrapper (vendored)
@@ -66,11 +76,15 @@ serde_bytes = "0.11"
 dashmap = "6.0"
 crossbeam = "0.8"
 
+# Retry with backoff
+backoff = { version = "0.4", features = ["tokio"] }
+
 # Regular expressions
 regex = "1.10"
 
 # Web framework
 axum = { version = "0.8.8", features = ["macros"] }
+axum-extra = { version = "0.10", features = ["form"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 askama = "0.12"
@@ -80,6 +94,7 @@ tokio-stream = "0.1"
 # Testing utilities
 test-case = "3.3"
 proptest = "1.6"
+proptest-state-machine = "0.6"
 insta = "1.41"
 pretty_assertions = "1.4"
 tempfile = "3.14"
@@ -95,6 +110,22 @@ winter-agent = { path = "crates/winter-agent" }
 winter-mcp = { path = "crates/winter-mcp" }
 winter-scheduler = { path = "crates/winter-scheduler" }
 winter-web = { path = "crates/winter-web" }
+
+[profile.dev]
+# Faster incremental builds
+incremental = true
+# More codegen units = faster compilation, worse runtime
+codegen-units = 256
+
+[profile.dev.package."*"]
+# Optimize dependencies even in dev (they rarely change)
+opt-level = 2
+
+[profile.test]
+inherits = "dev"
+
+[profile.dev.build-override]
+opt-level = 0
 
 [profile.release]
 lto = "thin"
