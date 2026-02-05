@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -8,7 +9,7 @@ use crate::core::error::Error;
 const MAX_QUERY_LENGTH: usize = 100_000;
 const MAX_SYSTEM_PROMPT_LENGTH: usize = 100_000;
 const MIN_TIMEOUT_SECS: u64 = 1;
-const MAX_TIMEOUT_SECS: u64 = 3600; // 1 hour
+const MAX_TIMEOUT_SECS: u64 = 14400; // 4 hours
 const MAX_TOKENS_LIMIT: usize = 200_000;
 const MAX_TOOL_NAME_LENGTH: usize = 100;
 
@@ -115,6 +116,14 @@ pub struct Config {
     /// Increase this for complex queries that might take longer to process.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
+
+    /// Environment variables to pass to the Claude CLI subprocess
+    ///
+    /// These variables will be set in the environment when spawning
+    /// the Claude CLI process. Useful for passing context like triggers
+    /// or authentication tokens that need to flow through to MCP servers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
 }
 
 /// Output format for Claude CLI responses
@@ -177,6 +186,7 @@ impl Default for Config {
             verbose: false,
             max_tokens: None,
             timeout_secs: Some(30), // Default 30 second timeout
+            env: None,
         }
     }
 }
@@ -496,6 +506,32 @@ impl ConfigBuilder {
     #[must_use]
     pub fn verbose(mut self, verbose: bool) -> Self {
         self.config.verbose = verbose;
+        self
+    }
+
+    /// Set environment variables to pass to the Claude CLI subprocess
+    ///
+    /// These variables will be set in the environment when spawning
+    /// the Claude CLI process. Useful for passing context like triggers
+    /// that need to flow through to MCP servers via env var substitution
+    /// in the MCP config.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use claude_sdk_rs_core::Config;
+    /// use std::collections::HashMap;
+    ///
+    /// let mut env = HashMap::new();
+    /// env.insert("MY_VAR".to_string(), "my_value".to_string());
+    ///
+    /// let config = Config::builder()
+    ///     .env(env)
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn env(mut self, env: HashMap<String, String>) -> Self {
+        self.config.env = Some(env);
         self
     }
 

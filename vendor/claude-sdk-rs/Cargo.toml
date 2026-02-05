@@ -261,7 +261,17 @@ version = "1.0"
 
 [dependencies.tokio]
 version = "1.40"
-features = ["full"]
+features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "io-util",
+    "net",
+    "fs",
+    "signal",
+    "process",
+]
 
 [dependencies.tokio-tungstenite]
 version = "0.24"

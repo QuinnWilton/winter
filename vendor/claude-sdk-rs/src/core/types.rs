@@ -1,5 +1,33 @@
 use serde::{Deserialize, Serialize};
 
+/// Extracted tool call from Claude's stream-json output.
+///
+/// When using `StreamFormat::StreamJson`, Claude's responses include `tool_use`
+/// content blocks in assistant messages. This struct captures the essential
+/// fields from those blocks for logging or analysis.
+///
+/// # Examples
+///
+/// ```rust
+/// use claude_sdk_rs_core::ExtractedToolCall;
+/// use serde_json::json;
+///
+/// let tool_call = ExtractedToolCall {
+///     id: "toolu_01ABC".to_string(),
+///     name: "WebSearch".to_string(),
+///     input: json!({"query": "Rust async programming"}),
+/// };
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedToolCall {
+    /// Unique identifier for this tool call (e.g., `toolu_01ABC`)
+    pub id: String,
+    /// Name of the tool being called (e.g., `WebSearch`, `Read`)
+    pub name: String,
+    /// Input arguments passed to the tool
+    pub input: serde_json::Value,
+}
+
 /// Raw response from Claude CLI in JSON format
 ///
 /// This represents the direct JSON response from the Claude CLI tool.

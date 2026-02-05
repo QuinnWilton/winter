@@ -99,6 +99,13 @@ pub async fn execute_claude(config: &Config, query: &str) -> Result<String> {
         cmd.arg("--max-tokens").arg(max_tokens.to_string());
     }
 
+    // Apply custom environment variables
+    if let Some(env_vars) = &config.env {
+        for (key, value) in env_vars {
+            cmd.env(key, value);
+        }
+    }
+
     // Determine if we should use stdin or command argument
     let use_stdin =
         config.allowed_tools.is_some() && !config.allowed_tools.as_ref().unwrap().is_empty();
@@ -424,6 +431,13 @@ pub async fn execute_claude_streaming(
 
     if let Some(max_tokens) = &config.max_tokens {
         cmd.arg("--max-tokens").arg(max_tokens.to_string());
+    }
+
+    // Apply custom environment variables
+    if let Some(env_vars) = &config.env {
+        for (key, value) in env_vars {
+            cmd.env(key, value);
+        }
     }
 
     // Set up stdio for streaming

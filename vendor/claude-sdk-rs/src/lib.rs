@@ -328,14 +328,15 @@ pub mod cli;
 
 // Re-export core types for convenience
 pub use crate::core::{
-    ClaudeResponse, Config, Cost, Error, Message, MessageMeta, MessageType, ResponseMetadata,
-    Result, Session, SessionId, SessionManager, StreamFormat, TokenUsage, ToolPermission,
+    ClaudeResponse, Config, Cost, Error, ExtractedToolCall, Message, MessageMeta, MessageType,
+    ResponseMetadata, Result, Session, SessionId, SessionManager, StreamFormat, TokenUsage,
+    ToolPermission,
 };
 // Re-export MCP types when feature is enabled
 #[cfg(feature = "mcp")]
 pub use crate::mcp::{McpConfig, McpServer};
 // Re-export runtime types
-pub use crate::runtime::{Client, MessageStream, QueryBuilder};
+pub use crate::runtime::{extract_tool_calls, Client, MessageStream, QueryBuilder};
 
 /// Prelude module for convenient imports
 pub mod prelude {

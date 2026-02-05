@@ -17,7 +17,9 @@ pub use message::{ConversationStats, Message, MessageMeta, MessageType, TokenUsa
 pub use session::{
     Session, SessionBuilder, SessionId, SessionManager, SessionStorage, StorageBackend,
 };
-pub use types::{ClaudeCliResponse, ClaudeResponse, Cost, ResponseMetadata, ToolPermission};
+pub use types::{
+    ClaudeCliResponse, ClaudeResponse, Cost, ExtractedToolCall, ResponseMetadata, ToolPermission,
+};
 
 #[cfg(test)]
 mod config_test;

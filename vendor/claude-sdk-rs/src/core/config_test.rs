@@ -207,7 +207,7 @@ mod config_validation_tests {
 
     #[test]
     fn test_timeout_validation() {
-        let timeouts = vec![1, 30, 300, 3600];
+        let timeouts = vec![1, 30, 300, 14400];
 
         for timeout in timeouts {
             let config = Config::builder().timeout_secs(timeout).build().unwrap();
@@ -229,7 +229,7 @@ mod config_validation_tests {
         let large_timeout = 86400; // 24 hours
         let result = Config::builder().timeout_secs(large_timeout).build();
 
-        // 24 hours exceeds our max of 3600 seconds (1 hour)
+        // 24 hours exceeds our max of 14400 seconds (1 hour)
         assert!(result.is_err());
     }
 
@@ -433,6 +433,7 @@ mod config_edge_cases {
             non_interactive: true,
             verbose: false,
             max_tokens: None,
+            env: None,
         };
 
         assert_eq!(config.model, None);
@@ -514,7 +515,7 @@ mod property_tests {
 
         #[test]
         fn test_config_builder_with_arbitrary_numbers(
-            timeout in 1u64..=3600,
+            timeout in 1u64..=14400,
             max_tokens in 1usize..=200_000,
         ) {
             let result = Config::builder()
@@ -541,7 +542,7 @@ mod property_tests {
 
         #[test]
         fn test_config_clone_consistency(
-            timeout in 1u64..=3600,
+            timeout in 1u64..=14400,
             verbose in any::<bool>(),
             non_interactive in any::<bool>(),
         ) {
@@ -564,7 +565,7 @@ mod property_tests {
         #[test]
         fn test_config_builder_idempotence(
             model in any::<String>(),
-            timeout in 1u64..=3600,
+            timeout in 1u64..=14400,
         ) {
             // Setting the same value multiple times should result in the last value
             let result = Config::builder()
@@ -729,12 +730,12 @@ mod validation_tests {
         let result = Config::builder().timeout_secs(0).build();
         assert!(result.is_err());
 
-        // Too large
-        let result = Config::builder().timeout_secs(3601).build();
+        // Too large (MAX_TIMEOUT_SECS is 14400)
+        let result = Config::builder().timeout_secs(14401).build();
         assert!(result.is_err());
 
         // Valid range
-        for timeout in [1, 30, 60, 3600] {
+        for timeout in [1, 30, 60, 14400] {
             let result = Config::builder().timeout_secs(timeout).build();
             assert!(result.is_ok());
         }
@@ -853,7 +854,7 @@ mod validation_tests {
 
         if let Err(e) = result {
             let error_msg = e.to_string();
-            assert!(error_msg.contains("3600")); // Shows max
+            assert!(error_msg.contains("14400")); // Shows max
             assert!(error_msg.contains("5000")); // Shows actual
         }
     }

@@ -15,7 +15,7 @@ pub mod stream_config;
 pub mod telemetry;
 
 pub use backpressure::{BackpressureMonitor, BackpressureSender};
-pub use client::{Client, QueryBuilder};
+pub use client::{extract_tool_calls, Client, QueryBuilder};
 pub use error_handling::{
     log_error_with_context, retry_with_backoff, ErrorContext, ProcessErrorDetails, RetryConfig,
 };

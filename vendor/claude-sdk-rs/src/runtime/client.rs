@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use crate::{
     core::{
-        validate_query, ClaudeCliResponse, ClaudeResponse, Config, Result, SessionId, StreamFormat,
+        validate_query, ClaudeCliResponse, ClaudeResponse, Config, ExtractedToolCall, Result,
+        SessionId, StreamFormat,
     },
     runtime::{process::execute_claude, stream::MessageStream},
 };
@@ -63,6 +64,71 @@ fn extract_assistant_text(msg: &serde_json::Value, result: &mut String) {
             }
         }
     }
+}
+
+/// Extract tool calls from stream-json output.
+///
+/// When using `StreamFormat::StreamJson`, the `raw_json` field contains an array
+/// of all JSON messages. This function extracts `tool_use` content blocks from
+/// assistant messages, returning a list of tool calls.
+///
+/// # Examples
+///
+/// ```rust
+/// use claude_sdk_rs::extract_tool_calls;
+/// use serde_json::json;
+///
+/// let raw_json = json!([
+///     {
+///         "type": "assistant",
+///         "message": {
+///             "content": [
+///                 {"type": "tool_use", "id": "toolu_01", "name": "WebSearch", "input": {"query": "rust"}}
+///             ]
+///         }
+///     }
+/// ]);
+///
+/// let tool_calls = extract_tool_calls(&raw_json);
+/// assert_eq!(tool_calls.len(), 1);
+/// assert_eq!(tool_calls[0].name, "WebSearch");
+/// ```
+pub fn extract_tool_calls(raw_json: &serde_json::Value) -> Vec<ExtractedToolCall> {
+    let mut tool_calls = Vec::new();
+    let Some(messages) = raw_json.as_array() else {
+        return tool_calls;
+    };
+
+    for msg in messages {
+        if msg.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+
+        let Some(content) = msg
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+
+        for item in content {
+            if item.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                if let (Some(id), Some(name), Some(input)) = (
+                    item.get("id").and_then(|v| v.as_str()),
+                    item.get("name").and_then(|v| v.as_str()),
+                    item.get("input"),
+                ) {
+                    tool_calls.push(ExtractedToolCall {
+                        id: id.to_string(),
+                        name: name.to_string(),
+                        input: input.clone(),
+                    });
+                }
+            }
+        }
+    }
+    tool_calls
 }
 
 impl Client {
@@ -596,5 +662,147 @@ impl QueryBuilder {
     pub async fn parse_output<T: serde::de::DeserializeOwned>(self) -> Result<T> {
         let response = self.send().await?;
         serde_json::from_str(&response).map_err(Into::into)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_extract_tool_calls_basic() {
+        let raw_json = json!([
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_01ABC",
+                            "name": "WebSearch",
+                            "input": {"query": "rust programming"}
+                        }
+                    ]
+                }
+            }
+        ]);
+
+        let tool_calls = extract_tool_calls(&raw_json);
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "toolu_01ABC");
+        assert_eq!(tool_calls[0].name, "WebSearch");
+        assert_eq!(tool_calls[0].input["query"], "rust programming");
+    }
+
+    #[test]
+    fn test_extract_tool_calls_multiple() {
+        let raw_json = json!([
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_01",
+                            "name": "Read",
+                            "input": {"path": "/foo/bar.rs"}
+                        },
+                        {
+                            "type": "text",
+                            "text": "Let me check that file"
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_02",
+                            "name": "WebFetch",
+                            "input": {"url": "https://example.com"}
+                        }
+                    ]
+                }
+            }
+        ]);
+
+        let tool_calls = extract_tool_calls(&raw_json);
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].name, "Read");
+        assert_eq!(tool_calls[1].name, "WebFetch");
+    }
+
+    #[test]
+    fn test_extract_tool_calls_empty() {
+        let raw_json = json!([
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Hello!"}
+                    ]
+                }
+            }
+        ]);
+
+        let tool_calls = extract_tool_calls(&raw_json);
+        assert!(tool_calls.is_empty());
+    }
+
+    #[test]
+    fn test_extract_tool_calls_ignores_non_assistant() {
+        let raw_json = json!([
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_01",
+                            "name": "Read",
+                            "input": {}
+                        }
+                    ]
+                }
+            }
+        ]);
+
+        let tool_calls = extract_tool_calls(&raw_json);
+        assert!(tool_calls.is_empty());
+    }
+
+    #[test]
+    fn test_extract_tool_calls_not_array() {
+        let raw_json = json!({"type": "assistant"});
+        let tool_calls = extract_tool_calls(&raw_json);
+        assert!(tool_calls.is_empty());
+    }
+
+    #[test]
+    fn test_extract_tool_calls_across_multiple_messages() {
+        let raw_json = json!([
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "id": "t1", "name": "Read", "input": {}}
+                    ]
+                }
+            },
+            {
+                "type": "tool_result",
+                "content": "file contents..."
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "tool_use", "id": "t2", "name": "WebSearch", "input": {"query": "test"}}
+                    ]
+                }
+            }
+        ]);
+
+        let tool_calls = extract_tool_calls(&raw_json);
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].name, "Read");
+        assert_eq!(tool_calls[1].name, "WebSearch");
     }
 }
