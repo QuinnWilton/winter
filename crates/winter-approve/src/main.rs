@@ -49,10 +49,11 @@ enum Commands {
         /// Tool rkey
         rkey: String,
     },
-    /// Approve a tool (interactive by default, or use flags for scripting)
+    /// Approve a tool (interactive by default, or use flags for scripting).
+    /// If no rkey is given, cycles through all pending tools interactively.
     Approve {
-        /// Tool rkey
-        rkey: String,
+        /// Tool rkey (omit to cycle through all pending)
+        rkey: Option<String>,
         /// Allow network access
         #[arg(long)]
         network: bool,
@@ -558,6 +559,174 @@ fn display_tool(
     }
 }
 
+/// Interactive approval for a single tool. Returns true if approved, false if skipped.
+async fn approve_tool_interactive(
+    client: &OperatorClient,
+    winter_did: &str,
+    rkey: &str,
+    tool: &CustomTool,
+    all_tools: &[(String, CustomTool)],
+) -> bool {
+    println!();
+    println!("Tool: {} (v{})", tool.name, tool.version);
+    println!("Description: {}", tool.description);
+    println!("Rkey: {}", rkey);
+    println!();
+
+    // Network
+    let net = if tool.code.contains("fetch(")
+        || tool.code.contains("Deno.connect")
+        || tool.description.to_lowercase().contains("network")
+        || tool.description.to_lowercase().contains("fetch")
+        || tool.description.to_lowercase().contains("http")
+    {
+        prompt_yn("Allow network access?", true)
+    } else {
+        prompt_yn("Allow network access?", false)
+    };
+
+    // Secrets
+    let secs = prompt_select("Select secrets to grant", &tool.required_secrets, all_tools);
+
+    // Commands
+    let cmds = prompt_select("Select commands to allow", &tool.required_commands, all_tools);
+
+    // Tool chaining
+    let tls = prompt_select(
+        "Select tools this tool may call",
+        &tool.required_tools,
+        all_tools,
+    );
+
+    // Workspace
+    let requires_ws = tool.requires_workspace.unwrap_or(false);
+    let (ws_read, ws_write, ws_path) = if requires_ws {
+        let r = prompt_yn("Allow workspace read?", true);
+        let w = prompt_yn("Allow workspace write?", false);
+        eprint!("Workspace path (empty for default): ");
+        let mut path_input = String::new();
+        std::io::stdin().read_line(&mut path_input).unwrap_or(0);
+        let p = path_input.trim();
+        let p = if p.is_empty() { None } else { Some(p.to_string()) };
+        (r, w, p)
+    } else {
+        (false, false, None)
+    };
+
+    // Summary
+    println!();
+    println!("Summary:");
+    println!("  Network: {}", net);
+    if !secs.is_empty() {
+        println!("  Secrets: {}", secs.join(", "));
+    }
+    if !cmds.is_empty() {
+        println!("  Commands: {}", cmds.join(", "));
+    }
+    if !tls.is_empty() {
+        let names: Vec<String> = tls
+            .iter()
+            .map(|t| resolve_tool_name(t, all_tools))
+            .collect();
+        println!("  Allowed tools: {}", names.join(", "));
+    }
+    if requires_ws {
+        println!("  Workspace read: {}, write: {}", ws_read, ws_write);
+        if let Some(ref p) = ws_path {
+            println!("  Workspace path: {}", p);
+        }
+    }
+    println!();
+
+    if !prompt_yn("Approve with these permissions?", false) {
+        println!("Skipped.");
+        return false;
+    }
+
+    write_approval(client, winter_did, rkey, tool, all_tools, net, secs, cmds, tls, ws_read, ws_write, ws_path, None).await
+}
+
+/// Approve a tool using explicit flags (non-interactive).
+#[allow(clippy::too_many_arguments)]
+async fn approve_tool_with_flags(
+    client: &OperatorClient,
+    winter_did: &str,
+    rkey: &str,
+    tool: &CustomTool,
+    all_tools: &[(String, CustomTool)],
+    network: bool,
+    secrets: Vec<String>,
+    commands: Vec<String>,
+    tools: Vec<String>,
+    workspace_read: bool,
+    workspace_write: bool,
+    workspace_path: Option<String>,
+    reason: Option<String>,
+) {
+    write_approval(client, winter_did, rkey, tool, all_tools, network, secrets, commands, tools, workspace_read, workspace_write, workspace_path, reason).await;
+}
+
+/// Write an approval record to the operator's PDS.
+#[allow(clippy::too_many_arguments)]
+async fn write_approval(
+    client: &OperatorClient,
+    winter_did: &str,
+    rkey: &str,
+    tool: &CustomTool,
+    all_tools: &[(String, CustomTool)],
+    network: bool,
+    secrets: Vec<String>,
+    commands: Vec<String>,
+    tools: Vec<String>,
+    workspace_read: bool,
+    workspace_write: bool,
+    workspace_path: Option<String>,
+    reason: Option<String>,
+) -> bool {
+    let approval = ToolApproval {
+        tool_rkey: rkey.to_string(),
+        tool_version: tool.version,
+        status: ToolApprovalStatus::Approved,
+        allow_network: Some(network),
+        allowed_secrets: secrets,
+        workspace_path,
+        allow_workspace_read: Some(workspace_read),
+        allow_workspace_write: Some(workspace_write),
+        allowed_commands: commands,
+        allowed_tools: tools,
+        winter_did: Some(winter_did.to_string()),
+        operator_did: Some(client.did.clone()),
+        approved_by: Some(client.did.clone()),
+        reason,
+        created_at: Utc::now(),
+    };
+
+    let record_value = serde_json::to_value(&approval).unwrap();
+
+    match client
+        .put_record(TOOL_APPROVAL_COLLECTION, rkey, &record_value)
+        .await
+    {
+        Ok(()) => {
+            println!("Approved '{}' (v{})", tool.name, tool.version);
+            if !approval.allowed_tools.is_empty() {
+                let names: Vec<String> = approval
+                    .allowed_tools
+                    .iter()
+                    .map(|t| resolve_tool_name(t, all_tools))
+                    .collect();
+                println!("  Allowed tools: {}", names.join(", "));
+            }
+            println!("Approval written to your PDS.");
+            true
+        }
+        Err(e) => {
+            eprintln!("Failed to write approval: {}", e);
+            false
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -697,7 +866,6 @@ async fn main() {
             reason,
             yes,
         } => {
-            // Get tool info
             let all_tools = match list_tools_from_winter(&cli.winter_did).await {
                 Ok(t) => t,
                 Err(e) => {
@@ -706,181 +874,70 @@ async fn main() {
                 }
             };
 
-            let tool = match all_tools.iter().find(|(r, _)| r == &rkey) {
-                Some((_, t)) => t,
-                None => {
-                    eprintln!("Tool '{}' not found in Winter's PDS", rkey);
-                    std::process::exit(1);
-                }
-            };
-
-            if is_safe_tool(tool) {
-                println!("Tool '{}' is safe and auto-approved. No action needed.", tool.name);
-                return;
-            }
-
-            // Determine if any permission flags were explicitly set
-            let has_flags = network
-                || workspace_read
-                || workspace_write
-                || workspace_path.is_some()
-                || !secrets.is_empty()
-                || !commands.is_empty()
-                || !tools.is_empty()
-                || yes;
-
-            let (
-                final_network,
-                final_secrets,
-                final_commands,
-                final_tools,
-                final_ws_read,
-                final_ws_write,
-                final_ws_path,
-                final_reason,
-            ) = if has_flags {
-                // Non-interactive: use flags directly
-                (
-                    network,
-                    secrets,
-                    commands,
-                    tools,
-                    workspace_read,
-                    workspace_write,
-                    workspace_path,
-                    reason,
-                )
-            } else {
-                // Interactive mode
-                println!();
-                println!("Tool: {} (v{})", tool.name, tool.version);
-                println!("Description: {}", tool.description);
-                println!("Rkey: {}", rkey);
-                println!();
-
-                // Network
-                let net = if tool.code.contains("fetch(")
-                    || tool.code.contains("Deno.connect")
-                    || tool.description.to_lowercase().contains("network")
-                    || tool.description.to_lowercase().contains("fetch")
-                    || tool.description.to_lowercase().contains("http")
-                {
-                    prompt_yn("Allow network access?", true)
-                } else {
-                    prompt_yn("Allow network access?", false)
-                };
-
-                // Secrets
-                let secs = prompt_select(
-                    "Select secrets to grant",
-                    &tool.required_secrets,
-                    &all_tools,
-                );
-
-                // Commands
-                let cmds = prompt_select(
-                    "Select commands to allow",
-                    &tool.required_commands,
-                    &all_tools,
-                );
-
-                // Tool chaining
-                let tls = prompt_select(
-                    "Select tools this tool may call",
-                    &tool.required_tools,
-                    &all_tools,
-                );
-
-                // Workspace
-                let requires_ws = tool.requires_workspace.unwrap_or(false);
-                let (ws_read, ws_write, ws_path) = if requires_ws {
-                    let r = prompt_yn("Allow workspace read?", true);
-                    let w = prompt_yn("Allow workspace write?", false);
-                    eprint!("Workspace path (empty for default): ");
-                    let mut path_input = String::new();
-                    std::io::stdin().read_line(&mut path_input).unwrap_or(0);
-                    let p = path_input.trim();
-                    let p = if p.is_empty() { None } else { Some(p.to_string()) };
-                    (r, w, p)
-                } else {
-                    (false, false, None)
-                };
-
-                // Summary
-                println!();
-                println!("Summary:");
-                println!("  Network: {}", net);
-                if !secs.is_empty() {
-                    println!("  Secrets: {}", secs.join(", "));
-                }
-                if !cmds.is_empty() {
-                    println!("  Commands: {}", cmds.join(", "));
-                }
-                if !tls.is_empty() {
-                    let names: Vec<String> = tls
-                        .iter()
-                        .map(|t| resolve_tool_name(t, &all_tools))
-                        .collect();
-                    println!("  Allowed tools: {}", names.join(", "));
-                }
-                if requires_ws {
-                    println!("  Workspace read: {}, write: {}", ws_read, ws_write);
-                    if let Some(ref p) = ws_path {
-                        println!("  Workspace path: {}", p);
+            if let Some(rkey) = rkey {
+                // Single tool approval
+                let tool = match all_tools.iter().find(|(r, _)| r == &rkey) {
+                    Some((_, t)) => t,
+                    None => {
+                        eprintln!("Tool '{}' not found in Winter's PDS", rkey);
+                        std::process::exit(1);
                     }
-                }
-                println!();
+                };
 
-                if !prompt_yn("Approve with these permissions?", false) {
-                    println!("Aborted.");
+                if is_safe_tool(tool) {
+                    println!("Tool '{}' is safe and auto-approved. No action needed.", tool.name);
                     return;
                 }
 
-                (net, secs, cmds, tls, ws_read, ws_write, ws_path, reason)
-            };
+                // Determine if any permission flags were explicitly set
+                let has_flags = network
+                    || workspace_read
+                    || workspace_write
+                    || workspace_path.is_some()
+                    || !secrets.is_empty()
+                    || !commands.is_empty()
+                    || !tools.is_empty()
+                    || yes;
 
-            // Authenticate to operator's PDS
-            let client = authenticate(&cli.pds, &cli.handle).await;
-
-            let approval = ToolApproval {
-                tool_rkey: rkey.clone(),
-                tool_version: tool.version,
-                status: ToolApprovalStatus::Approved,
-                allow_network: Some(final_network),
-                allowed_secrets: final_secrets,
-                workspace_path: final_ws_path,
-                allow_workspace_read: Some(final_ws_read),
-                allow_workspace_write: Some(final_ws_write),
-                allowed_commands: final_commands,
-                allowed_tools: final_tools,
-                winter_did: Some(cli.winter_did.clone()),
-                operator_did: Some(client.did.clone()),
-                approved_by: Some(client.did.clone()),
-                reason: final_reason,
-                created_at: Utc::now(),
-            };
-
-            let record_value = serde_json::to_value(&approval).unwrap();
-
-            match client
-                .put_record(TOOL_APPROVAL_COLLECTION, &rkey, &record_value)
-                .await
-            {
-                Ok(()) => {
-                    println!("Approved '{}' (v{})", tool.name, tool.version);
-                    if !approval.allowed_tools.is_empty() {
-                        let names: Vec<String> = approval
-                            .allowed_tools
-                            .iter()
-                            .map(|t| resolve_tool_name(t, &all_tools))
-                            .collect();
-                        println!("  Allowed tools: {}", names.join(", "));
-                    }
-                    println!("Approval written to your PDS.");
+                let client = authenticate(&cli.pds, &cli.handle).await;
+                if has_flags {
+                    approve_tool_with_flags(
+                        &client, &cli.winter_did, &rkey, tool, &all_tools,
+                        network, secrets, commands, tools,
+                        workspace_read, workspace_write, workspace_path, reason,
+                    ).await;
+                } else {
+                    approve_tool_interactive(&client, &cli.winter_did, &rkey, tool, &all_tools).await;
                 }
-                Err(e) => {
-                    eprintln!("Failed to write approval: {}", e);
-                    std::process::exit(1);
+            } else {
+                // No rkey: cycle through all pending tools
+                let approvals = get_all_approvals(&cli.pds, &cli.handle, &cli.winter_did).await;
+
+                let pending: Vec<_> = all_tools
+                    .iter()
+                    .filter(|(_, t)| !is_safe_tool(t))
+                    .filter(|(rkey, tool)| {
+                        let approval = approvals.get(rkey.as_str());
+                        !matches!(
+                            approval,
+                            Some(a) if a.status == ToolApprovalStatus::Approved
+                                && a.tool_version == tool.version
+                        )
+                    })
+                    .collect();
+
+                if pending.is_empty() {
+                    println!("No tools pending approval.");
+                    return;
+                }
+
+                println!("{} tool(s) pending approval.\n", pending.len());
+                let client = authenticate(&cli.pds, &cli.handle).await;
+
+                for (i, (rkey, tool)) in pending.iter().enumerate() {
+                    println!("--- [{}/{}] ---", i + 1, pending.len());
+                    approve_tool_interactive(&client, &cli.winter_did, rkey, tool, &all_tools).await;
+                    println!();
                 }
             }
         }
