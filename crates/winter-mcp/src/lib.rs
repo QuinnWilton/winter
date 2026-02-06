@@ -17,4 +17,8 @@ pub use bluesky::{BlueskyClient, BlueskyError};
 pub use deno::{DenoError, DenoExecutor, DenoOutput, DenoPermissions};
 pub use secrets::{SecretError, SecretManager};
 pub use server::McpServer;
-pub use tools::{InterruptionState, ToolMeta, ToolRegistry};
+pub use tools::inbox::{
+    ConversationHistoryMessage as InboxConversationHistoryMessage, Inbox, InboxItem,
+    InboxItemKind, InboxPayload, PostRef as InboxPostRef,
+};
+pub use tools::{InterruptionState, SessionMetrics, ToolMeta, ToolRegistry};

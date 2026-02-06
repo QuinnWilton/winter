@@ -201,12 +201,14 @@ mod directives;
 mod enrich;
 mod facts;
 mod identity;
+pub mod inbox;
 mod jobs;
 mod notes;
 mod pds;
 pub mod permissions;
 mod rules;
 mod thoughts;
+mod triggers;
 pub mod wiki;
 
 use std::collections::HashMap;
@@ -224,7 +226,7 @@ use crate::deno::DenoExecutor;
 use crate::protocol::{CallToolResult, ToolContent, ToolDefinition};
 use crate::secrets::SecretManager;
 use winter_atproto::{AtprotoClient, RepoCache, Thought, ThoughtKind, Tid};
-use winter_datalog::{DatalogCache, DatalogCoordinatorHandle};
+use winter_datalog::DatalogCache;
 
 // ============================================================================
 // Tool Metadata with Permissions
@@ -432,6 +434,25 @@ fn get_tool_category(tool_name: &str) -> ToolResultCategory {
             key_fields: &["deleted", "rkey"],
             web_path: None,
         },
+        // Trigger tools
+        "create_trigger" => SingleMutation {
+            key_fields: &["rkey", "name"],
+            web_path: None,
+        },
+        "update_trigger" => SingleMutation {
+            key_fields: &["rkey", "name"],
+            web_path: None,
+        },
+        "delete_trigger" => SingleMutation {
+            key_fields: &["deleted", "rkey"],
+            web_path: None,
+        },
+        "list_triggers" => List {
+            count_field: "count",
+            items_field: "triggers",
+            sample_key: "name",
+        },
+        "test_trigger" => Query,
         // PDS raw access
         "pds_put_record" => SingleMutation {
             key_fields: &["uri", "collection", "rkey"],
@@ -629,6 +650,14 @@ fn get_tool_category(tool_name: &str) -> ToolResultCategory {
         // === Session Management ===
         "check_interruption" => Get {
             key_fields: &["interrupted", "reason"],
+            size_field: None,
+        },
+        "session_stats" => Get {
+            key_fields: &["context_used_pct", "turn_count"],
+            size_field: None,
+        },
+        "set_active_context" => Get {
+            key_fields: &["active_context", "status"],
             size_field: None,
         },
 
@@ -1083,6 +1112,51 @@ impl InterruptionState {
     }
 }
 
+/// Live session metrics for observability.
+///
+/// Updated by the daemon as it processes the streaming response from Claude.
+/// Exposed via `session_stats` MCP tool and auto-injected into `query_facts`.
+#[derive(Debug, Clone)]
+pub struct SessionMetrics {
+    /// When the session started.
+    pub session_start: chrono::DateTime<chrono::Utc>,
+    /// Cumulative input tokens.
+    pub total_input_tokens: u64,
+    /// Cumulative output tokens.
+    pub total_output_tokens: u64,
+    /// Cumulative total tokens.
+    pub total_tokens: u64,
+    /// Number of assistant turns completed.
+    pub turn_count: u64,
+    /// Cumulative cost in USD.
+    pub total_cost_usd: f64,
+    /// Total tool calls executed (tracked by finalize_result).
+    pub tool_call_count: u64,
+    /// Total tool errors (tracked by finalize_result).
+    pub tool_error_count: u64,
+    /// Inbox items acknowledged this session.
+    pub inbox_items_acknowledged: u64,
+    /// When the last tool call was executed (for watchdog staleness checks).
+    pub last_tool_call_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Default for SessionMetrics {
+    fn default() -> Self {
+        Self {
+            session_start: chrono::Utc::now(),
+            total_input_tokens: 0,
+            total_output_tokens: 0,
+            total_tokens: 0,
+            turn_count: 0,
+            total_cost_usd: 0.0,
+            tool_call_count: 0,
+            tool_error_count: 0,
+            inbox_items_acknowledged: 0,
+            last_tool_call_at: chrono::Utc::now(),
+        }
+    }
+}
+
 /// Shared state for tools.
 pub struct ToolState {
     pub atproto: Arc<AtprotoClient>,
@@ -1091,9 +1165,6 @@ pub struct ToolState {
     pub cache: Option<Arc<RepoCache>>,
     /// Datalog query cache for efficient query execution (optional).
     pub datalog_cache: Option<Arc<DatalogCache>>,
-    /// Handle to the datalog coordinator for serialized TSV access (optional).
-    /// When set, queries go through the coordinator instead of direct cache access.
-    pub datalog_coordinator: Option<DatalogCoordinatorHandle>,
     /// Channel for async thought recording (fire-and-forget).
     pub thought_tx: Option<mpsc::Sender<Thought>>,
     /// Secret manager for custom tool secrets (optional).
@@ -1108,6 +1179,13 @@ pub struct ToolState {
     /// Internal MCP URL for tool chaining (e.g., "http://127.0.0.1:3847").
     /// Set by the HTTP server so Deno tools can call back into the same server.
     pub internal_mcp_url: Option<String>,
+    /// Inbox for persistent session model (optional).
+    pub inbox: Option<Arc<inbox::Inbox>>,
+    /// Live session metrics (optional, set when persistent session is active).
+    pub session_metrics: Option<Arc<RwLock<SessionMetrics>>>,
+    /// Active context tag for thought scoping in persistent sessions.
+    /// Set by Winter via `set_active_context` when working on a specific inbox item.
+    pub active_context: Arc<RwLock<Option<String>>>,
 }
 
 /// Registry of available tools.
@@ -1128,13 +1206,16 @@ impl ToolRegistry {
                 bluesky: None,
                 cache: None,
                 datalog_cache: None,
-                datalog_coordinator: None,
+
                 thought_tx: None,
                 secrets: None,
                 deno: None,
                 interruption: None,
                 tool_sessions: None,
                 internal_mcp_url: None,
+                inbox: None,
+                session_metrics: None,
+                active_context: Arc::new(RwLock::new(None)),
             })),
         }
     }
@@ -1157,13 +1238,16 @@ impl ToolRegistry {
                 bluesky: None,
                 cache: None,
                 datalog_cache: None,
-                datalog_coordinator: None,
+
                 thought_tx: Some(thought_tx),
                 secrets: None,
                 deno: None,
                 interruption: None,
                 tool_sessions: None,
                 internal_mcp_url: None,
+                inbox: None,
+                session_metrics: None,
+                active_context: Arc::new(RwLock::new(None)),
             })),
         }
     }
@@ -1186,13 +1270,16 @@ impl ToolRegistry {
                 bluesky: None,
                 cache: Some(cache),
                 datalog_cache: None,
-                datalog_coordinator: None,
+
                 thought_tx: Some(thought_tx),
                 secrets: None,
                 deno: None,
                 interruption: None,
                 tool_sessions: None,
                 internal_mcp_url: None,
+                inbox: None,
+                session_metrics: None,
+                active_context: Arc::new(RwLock::new(None)),
             })),
         }
     }
@@ -1201,12 +1288,6 @@ impl ToolRegistry {
     pub async fn set_datalog_cache(&self, datalog_cache: Arc<DatalogCache>) {
         let mut guard = self.state.write().await;
         guard.datalog_cache = Some(datalog_cache);
-    }
-
-    /// Set the datalog coordinator handle for serialized TSV access.
-    pub async fn set_datalog_coordinator(&self, coordinator: DatalogCoordinatorHandle) {
-        let mut guard = self.state.write().await;
-        guard.datalog_coordinator = Some(coordinator);
     }
 
     /// Set the cache asynchronously.
@@ -1267,6 +1348,24 @@ impl ToolRegistry {
         guard.internal_mcp_url = Some(url);
     }
 
+    /// Set the inbox for persistent session model.
+    pub async fn set_inbox(&self, inbox_ref: Arc<inbox::Inbox>) {
+        let mut guard = self.state.write().await;
+        guard.inbox = Some(inbox_ref);
+    }
+
+    /// Set session metrics for observability.
+    pub async fn set_session_metrics(&self, metrics: Arc<RwLock<SessionMetrics>>) {
+        let mut guard = self.state.write().await;
+        guard.session_metrics = Some(metrics);
+    }
+
+    /// Clear session metrics (on session end).
+    pub async fn clear_session_metrics(&self) {
+        let mut guard = self.state.write().await;
+        guard.session_metrics = None;
+    }
+
     /// Get all tool metadata (definitions + permissions).
     fn all_tools() -> Vec<ToolMeta> {
         let mut tools = Vec::new();
@@ -1307,16 +1406,47 @@ impl ToolRegistry {
         // Fact declaration tools
         tools.extend(declarations::tools());
 
+        // Trigger tools
+        tools.extend(triggers::tools());
+
         // Wiki tools
         tools.extend(wiki::tools());
 
         // PDS raw access tools
         tools.extend(pds::tools());
 
-        // Session management tools (check_interruption for background sessions)
+        // Inbox tools (persistent session model)
+        tools.extend(inbox::tools());
+
+        // Session management tools
         tools.push(ToolMeta::allowed(ToolDefinition {
             name: "check_interruption".to_string(),
             description: "Check if this background session should wrap up. Call this periodically during background sessions. Returns whether notifications are waiting and the session should exit gracefully.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        }));
+
+        tools.push(ToolMeta::allowed(ToolDefinition {
+            name: "set_active_context".to_string(),
+            description: "Set the active context tag for thought scoping. When working on an inbox item, set this to the item's context_tag so thoughts are associated with it. Pass null or empty string to clear. Thoughts recorded while a context is active will be tagged with it.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "context": {
+                        "type": ["string", "null"],
+                        "description": "Context tag to set (from inbox item's context_tag field), or null to clear"
+                    }
+                },
+                "required": []
+            }),
+        }));
+
+        tools.push(ToolMeta::allowed(ToolDefinition {
+            name: "session_stats".to_string(),
+            description: "Get live session metrics: token usage, context window percentage, turn count, cost, tool call stats. Use this to monitor session health and decide when to wrap up.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {},
@@ -1609,6 +1739,13 @@ impl ToolRegistry {
                 "list_blog_posts" => blog::list_blog_posts(&state, arguments).await,
                 "get_blog_post" => blog::get_blog_post(&state, arguments).await,
 
+                // Trigger tools
+                "create_trigger" => triggers::create_trigger(&state, arguments).await,
+                "update_trigger" => triggers::update_trigger(&state, arguments).await,
+                "delete_trigger" => triggers::delete_trigger(&state, arguments).await,
+                "list_triggers" => triggers::list_triggers(&state, arguments).await,
+                "test_trigger" => triggers::test_trigger(&state, arguments).await,
+
                 // Wiki tools
                 "create_wiki_entry" => wiki::create_wiki_entry(&state, arguments).await,
                 "update_wiki_entry" => wiki::update_wiki_entry(&state, arguments).await,
@@ -1651,23 +1788,103 @@ impl ToolRegistry {
                     declarations::list_fact_declarations(&state, arguments).await
                 }
 
+                // Inbox tools
+                "check_inbox" => {
+                    inbox::check_inbox(state.inbox.as_deref(), arguments).await
+                }
+                "acknowledge_inbox" => {
+                    inbox::acknowledge_inbox(state.inbox.as_deref(), arguments).await
+                }
+
                 // Session management tools
                 "check_interruption" => {
+                    let inbox_pending = if let Some(ref ib) = state.inbox {
+                        ib.len().await
+                    } else {
+                        0
+                    };
+                    let urgent = if let Some(ref ib) = state.inbox {
+                        ib.has_urgent(200).await
+                    } else {
+                        false
+                    };
                     if let Some(ref interruption) = state.interruption {
                         let (interrupted, reason) = interruption.check().await;
                         CallToolResult::success(
                             json!({
                                 "interrupted": interrupted,
-                                "reason": reason
+                                "reason": reason,
+                                "urgent": urgent || interrupted,
+                                "inbox_pending": inbox_pending
                             })
                             .to_string(),
                         )
                     } else {
-                        // No interruption state means not a background session
                         CallToolResult::success(
                             json!({
                                 "interrupted": false,
-                                "reason": null
+                                "reason": null,
+                                "urgent": urgent,
+                                "inbox_pending": inbox_pending
+                            })
+                            .to_string(),
+                        )
+                    }
+                }
+
+                // Active context tool
+                "set_active_context" => {
+                    let context = arguments
+                        .get("context")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
+
+                    let label = context.as_deref().unwrap_or("(cleared)");
+                    *state.active_context.write().await = context.clone();
+
+                    CallToolResult::success(
+                        json!({
+                            "active_context": context,
+                            "status": format!("context set to {}", label),
+                        })
+                        .to_string(),
+                    )
+                }
+
+                // Session stats tool
+                "session_stats" => {
+                    const CONTEXT_WINDOW: u64 = 1_000_000;
+                    if let Some(ref metrics) = state.session_metrics {
+                        let m = metrics.read().await;
+                        let elapsed = (chrono::Utc::now() - m.session_start).num_seconds().max(0) as u64;
+                        let context_used_pct = if CONTEXT_WINDOW > 0 {
+                            (m.total_tokens as f64 / CONTEXT_WINDOW as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        CallToolResult::success(
+                            json!({
+                                "session_start": m.session_start.to_rfc3339(),
+                                "elapsed_seconds": elapsed,
+                                "total_input_tokens": m.total_input_tokens,
+                                "total_output_tokens": m.total_output_tokens,
+                                "total_tokens": m.total_tokens,
+                                "context_window": CONTEXT_WINDOW,
+                                "context_used_pct": (context_used_pct * 10.0).round() / 10.0,
+                                "turn_count": m.turn_count,
+                                "total_cost_usd": (m.total_cost_usd * 10000.0).round() / 10000.0,
+                                "tool_call_count": m.tool_call_count,
+                                "tool_error_count": m.tool_error_count,
+                                "inbox_items_acknowledged": m.inbox_items_acknowledged,
+                            })
+                            .to_string(),
+                        )
+                    } else {
+                        CallToolResult::success(
+                            json!({
+                                "error": "no session metrics available",
+                                "hint": "session_stats is only available during persistent sessions"
                             })
                             .to_string(),
                         )
@@ -1688,7 +1905,7 @@ impl ToolRegistry {
         &self,
         name: &str,
         arguments: &HashMap<String, Value>,
-        result: CallToolResult,
+        mut result: CallToolResult,
         duration_ms: u64,
         trigger: Option<String>,
     ) -> CallToolResult {
@@ -1696,6 +1913,42 @@ impl ToolRegistry {
         if name != "record_thought" {
             self.record_tool_call(name, arguments, &result, duration_ms, trigger)
                 .await;
+        }
+
+        // Update session metrics counters
+        {
+            let state = self.state.read().await;
+            if let Some(ref metrics) = state.session_metrics {
+                let mut m = metrics.write().await;
+                m.tool_call_count += 1;
+                m.last_tool_call_at = chrono::Utc::now();
+                if result.is_error.unwrap_or(false) {
+                    m.tool_error_count += 1;
+                }
+                // Track inbox acknowledgements
+                if name == "acknowledge_inbox" {
+                    if let Some(ids) = arguments.get("ids").and_then(|v| v.as_array()) {
+                        m.inbox_items_acknowledged += ids.len() as u64;
+                    }
+                }
+            }
+        }
+
+        // Passive inbox nudge: append pending count to every tool result
+        // so Winter sees inbox status on every tool call without explicit polling.
+        // Skip for inbox tools themselves to avoid redundancy.
+        if name != "check_inbox" && name != "acknowledge_inbox" && name != "check_interruption" && name != "session_stats" {
+            let state = self.state.read().await;
+            if let Some(ref ib) = state.inbox {
+                let pending = ib.len().await;
+                if pending > 0 {
+                    // Append to the last text content item
+                    if let Some(last) = result.content.last_mut() {
+                        let ToolContent::Text { text } = last;
+                        text.push_str(&format!("\n\n_inbox_pending: {}", pending));
+                    }
+                }
+            }
         }
 
         result
@@ -1750,8 +2003,16 @@ impl ToolRegistry {
         // Format the tool call in structured format for web UI rendering
         let content = format_tool_call_content(name, arguments, result, is_error);
 
-        // Use the session trigger if provided, otherwise fall back to static trigger
-        let thought_trigger = trigger.unwrap_or_else(|| "internal:tool_call".to_string());
+        let state = self.state.read().await;
+
+        // In persistent sessions, use the active context for thought scoping.
+        // This tags thoughts with the specific inbox item being worked on.
+        let thought_trigger = if trigger.as_deref() == Some("persistent") {
+            let active = state.active_context.read().await;
+            active.clone().unwrap_or_else(|| "persistent".to_string())
+        } else {
+            trigger.unwrap_or_else(|| "internal:tool_call".to_string())
+        };
 
         let thought = Thought {
             kind: ThoughtKind::ToolCall,
@@ -1761,8 +2022,6 @@ impl ToolRegistry {
             duration_ms: Some(duration_ms),
             created_at: Utc::now(),
         };
-
-        let state = self.state.read().await;
 
         // Fire and forget - don't block on write
         if let Some(ref tx) = state.thought_tx

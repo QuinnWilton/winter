@@ -325,15 +325,7 @@ pub async fn query_and_enrich(
     };
 
     // Execute the datalog query
-    let tuples = if let Some(ref coordinator) = state.datalog_coordinator {
-        match coordinator
-            .query_with_facts(query, extra_rules, extra_facts.as_deref())
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => return CallToolResult::error(format!("Query failed: {}", e)),
-        }
-    } else if let Some(ref datalog_cache) = state.datalog_cache {
+    let tuples = if let Some(ref datalog_cache) = state.datalog_cache {
         match datalog_cache
             .execute_query_with_facts(query, extra_rules, extra_facts.as_deref())
             .await

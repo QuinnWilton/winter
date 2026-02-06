@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tracing::debug;
 
@@ -17,6 +17,40 @@ const FACT_COLLECTION: &str = "diy.razorgirl.winter.fact";
 
 /// Collection name for rules.
 const RULE_COLLECTION: &str = "diy.razorgirl.winter.rule";
+
+/// Parse `expires_at` or `ttl_seconds` from a HashMap (for create_fact, update_fact).
+fn parse_expires_at(arguments: &HashMap<String, Value>) -> Option<DateTime<Utc>> {
+    if let Some(ts) = arguments.get("expires_at").and_then(|v| v.as_str()) {
+        if !ts.is_empty() {
+            if let Ok(dt) = ts.parse::<DateTime<Utc>>() {
+                return Some(dt);
+            }
+        }
+    }
+    if let Some(ttl) = arguments.get("ttl_seconds").and_then(|v| v.as_i64()) {
+        if ttl > 0 {
+            return Some(Utc::now() + chrono::Duration::seconds(ttl));
+        }
+    }
+    None
+}
+
+/// Parse `expires_at` or `ttl_seconds` from a JSON object (for create_facts batch items).
+fn parse_expires_at_from_obj(obj: &serde_json::Map<String, Value>) -> Option<DateTime<Utc>> {
+    if let Some(ts) = obj.get("expires_at").and_then(|v| v.as_str()) {
+        if !ts.is_empty() {
+            if let Ok(dt) = ts.parse::<DateTime<Utc>>() {
+                return Some(dt);
+            }
+        }
+    }
+    if let Some(ttl) = obj.get("ttl_seconds").and_then(|v| v.as_i64()) {
+        if ttl > 0 {
+            return Some(Utc::now() + chrono::Duration::seconds(ttl));
+        }
+    }
+    None
+}
 
 pub fn definitions() -> Vec<ToolDefinition> {
     vec![
@@ -43,6 +77,14 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Optional tags for categorization"
+                    },
+                    "expires_at": {
+                        "type": "string",
+                        "description": "Optional ISO 8601 expiration timestamp. Facts past this time are excluded from default queries."
+                    },
+                    "ttl_seconds": {
+                        "type": "integer",
+                        "description": "Optional time-to-live in seconds (convenience alternative to expires_at). Computed to expires_at at creation time."
                     }
                 },
                 "required": ["predicate", "args"]
@@ -76,6 +118,14 @@ pub fn definitions() -> Vec<ToolDefinition> {
                                     "type": "array",
                                     "items": { "type": "string" },
                                     "description": "Optional tags for categorization"
+                                },
+                                "expires_at": {
+                                    "type": "string",
+                                    "description": "Optional ISO 8601 expiration timestamp"
+                                },
+                                "ttl_seconds": {
+                                    "type": "integer",
+                                    "description": "Optional time-to-live in seconds"
                                 }
                             },
                             "required": ["predicate", "args"]
@@ -113,6 +163,14 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Optional tags"
+                    },
+                    "expires_at": {
+                        "type": "string",
+                        "description": "Optional ISO 8601 expiration timestamp for the new fact"
+                    },
+                    "ttl_seconds": {
+                        "type": "integer",
+                        "description": "Optional time-to-live in seconds for the new fact"
                     }
                 },
                 "required": ["rkey", "predicate", "args"]
@@ -150,6 +208,9 @@ pub fn definitions() -> Vec<ToolDefinition> {
 - `_source(Rkey, SourceCid)` - only facts with source set
 - `_supersedes(NewRkey, OldRkey)` - supersession chain
 - `_created_at(Rkey, Timestamp)` - when each fact was created (ISO8601)
+- `_expires_at(Rkey, Timestamp)` - only facts with expiration set (ISO8601)
+- `_now(Timestamp)` - current time, auto-injected at query time
+- `_expired(Rkey)` - derived: facts past their expiration (computed via `_expires_at` + `_now`)
 
 ## Example Queries
 
@@ -272,6 +333,8 @@ pub async fn create_fact(state: &ToolState, arguments: &HashMap<String, Value>) 
         })
         .unwrap_or_default();
 
+    let expires_at = parse_expires_at(arguments);
+
     let fact = Fact {
         predicate: predicate.to_string(),
         args,
@@ -280,6 +343,7 @@ pub async fn create_fact(state: &ToolState, arguments: &HashMap<String, Value>) 
         supersedes: None,
         tags,
         created_at: Utc::now(),
+        expires_at,
     };
 
     let rkey = Tid::now().to_string();
@@ -294,16 +358,17 @@ pub async fn create_fact(state: &ToolState, arguments: &HashMap<String, Value>) 
             if let Some(cache) = &state.cache {
                 cache.upsert_fact(rkey.clone(), fact.clone(), response.cid.clone());
             }
-            CallToolResult::success(
-                json!({
-                    "rkey": rkey,
-                    "uri": response.uri,
-                    "cid": response.cid,
-                    "predicate": predicate,
-                    "args": fact.args
-                })
-                .to_string(),
-            )
+            let mut result = json!({
+                "rkey": rkey,
+                "uri": response.uri,
+                "cid": response.cid,
+                "predicate": predicate,
+                "args": fact.args
+            });
+            if let Some(ref ea) = fact.expires_at {
+                result["expires_at"] = json!(ea.to_rfc3339());
+            }
+            CallToolResult::success(result.to_string())
         }
         Err(e) => CallToolResult::error(format!("Failed to create fact: {}", e)),
     }
@@ -373,6 +438,8 @@ pub async fn create_facts(state: &ToolState, arguments: &HashMap<String, Value>)
             })
             .unwrap_or_default();
 
+        let expires_at = parse_expires_at_from_obj(obj);
+
         let fact = Fact {
             predicate: predicate.to_string(),
             args,
@@ -381,6 +448,7 @@ pub async fn create_facts(state: &ToolState, arguments: &HashMap<String, Value>)
             supersedes: None,
             tags,
             created_at: now,
+            expires_at,
         };
 
         let rkey = Tid::now().to_string();
@@ -493,6 +561,8 @@ pub async fn update_fact(state: &ToolState, arguments: &HashMap<String, Value>) 
         })
         .unwrap_or_default();
 
+    let expires_at = parse_expires_at(arguments);
+
     let fact = Fact {
         predicate: predicate.to_string(),
         args,
@@ -501,6 +571,7 @@ pub async fn update_fact(state: &ToolState, arguments: &HashMap<String, Value>) 
         supersedes: old_cid,
         tags,
         created_at: Utc::now(),
+        expires_at,
     };
 
     // Create a new fact that supersedes the old one
@@ -692,41 +763,50 @@ pub async fn query_facts(state: &ToolState, arguments: &HashMap<String, Value>) 
         }
     }
 
-    // Try to use DatalogCoordinator for serialized access (preferred)
-    if let Some(ref coordinator) = state.datalog_coordinator {
-        debug!("using DatalogCoordinator for query_facts");
-
-        // Execute query through the coordinator (serializes TSV access)
-        let tuples = match coordinator
-            .query_with_facts_and_declarations(
-                query,
-                extra_rules,
-                extra_facts.as_deref(),
-                extra_declarations.as_deref(),
-            )
-            .await
-        {
-            Ok(tuples) => tuples,
-            Err(e) => return CallToolResult::error(format!("Failed to execute query: {}", e)),
+    // Auto-inject session metrics as ephemeral facts when available
+    let mut extra_facts = extra_facts;
+    let mut extra_declarations = extra_declarations;
+    if let Some(ref metrics) = state.session_metrics {
+        let m = metrics.read().await;
+        let elapsed_min = (chrono::Utc::now() - m.session_start).num_minutes().max(0);
+        let context_pct = if m.total_tokens > 0 {
+            ((m.total_tokens as f64 / 200_000.0) * 100.0).round() as u64
+        } else {
+            0
+        };
+        let error_rate = if m.tool_call_count > 0 {
+            ((m.tool_error_count as f64 / m.tool_call_count as f64) * 100.0).round() as u64
+        } else {
+            0
         };
 
-        let results: Vec<Value> = tuples.into_iter().map(|tuple| json!(tuple)).collect();
+        let session_facts = vec![
+            format!("token_usage_pct({context_pct})"),
+            format!("session_duration_min({elapsed_min})"),
+            format!("tool_calls({})", m.tool_call_count),
+            format!("tool_error_rate({error_rate})"),
+        ];
 
-        return CallToolResult::success(
-            json!({
-                "query": query,
-                "results": results,
-                "count": results.len()
-            })
-            .to_string(),
-        );
+        let session_decls = vec![
+            "token_usage_pct(pct: number)".to_string(),
+            "session_duration_min(minutes: number)".to_string(),
+            "tool_calls(n: number)".to_string(),
+            "tool_error_rate(pct: number)".to_string(),
+        ];
+
+        extra_facts.get_or_insert_with(Vec::new).extend(session_facts);
+        extra_declarations.get_or_insert_with(Vec::new).extend(session_decls);
     }
 
-    // Fall back to direct DatalogCache access (single-process scenarios)
-    if let Some(ref datalog_cache) = state.datalog_cache {
-        debug!("using DatalogCache for query_facts");
+    // Auto-inject _now(Timestamp) for expiration queries
+    {
+        let now_ts = Utc::now().to_rfc3339();
+        extra_facts
+            .get_or_insert_with(Vec::new)
+            .push(format!("_now(\"{}\")", now_ts));
+    }
 
-        // Execute query using the cached datalog state
+    if let Some(ref datalog_cache) = state.datalog_cache {
         let tuples = match datalog_cache
             .execute_query_with_facts_and_declarations(
                 query,
@@ -853,8 +933,35 @@ pub async fn query_facts(state: &ToolState, arguments: &HashMap<String, Value>) 
         program.push_str("\n\n");
     }
 
+    // Inject extra_declarations and extra_facts into the program
+    let mut predicate_types: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    if let Some(ref decls) = extra_declarations {
+        for decl_str in decls {
+            if let Some((name, types)) = parse_declaration_types(decl_str) {
+                // Add the declaration to the program
+                if !declared_predicates.contains(&name) {
+                    let params: Vec<String> = types
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| format!("arg{}: {}", i, t))
+                        .collect();
+                    program.push_str(&format!(".decl {}({})\n", name, params.join(", ")));
+                    declared_predicates.insert(name.clone());
+                }
+                predicate_types.entry(name).or_insert(types);
+            }
+        }
+    }
+    if let Some(ref facts) = extra_facts {
+        for fact_str in facts {
+            program.push_str(&format!("{}.\n", fact_str));
+        }
+    }
+
     // Generate wrapper rule that properly handles constants as filters
-    let (wrapper, _result_arity) = generate_query_wrapper(query, Some(&declared_predicates));
+    let (wrapper, _result_arity) =
+        generate_query_wrapper(query, Some(&declared_predicates), &predicate_types);
     program.push_str(&wrapper);
 
     debug!(program = %program, "Generated Soufflé program");
@@ -889,9 +996,7 @@ pub async fn list_validation_errors(
     // Query the _validation_error predicate via datalog
     let query = "_validation_error(R, P, E)";
 
-    let results = if let Some(ref coordinator) = state.datalog_coordinator {
-        coordinator.query(query, None).await
-    } else if let Some(ref datalog_cache) = state.datalog_cache {
+    let results = if let Some(ref datalog_cache) = state.datalog_cache {
         datalog_cache.execute_query(query, None).await
     } else {
         return CallToolResult::error("No datalog cache available");
@@ -960,6 +1065,9 @@ pub async fn list_predicates(
         ("_source", 2, "rkey, source_cid"),
         ("_supersedes", 2, "new_rkey, old_rkey"),
         ("_created_at", 2, "rkey, timestamp"),
+        ("_expires_at", 2, "rkey, timestamp"),
+        ("_now", 1, "timestamp (auto-injected at query time)"),
+        ("_expired", 1, "rkey (derived: facts past expiration)"),
     ];
     for (name, arity, args) in meta {
         // Apply search filter to metadata predicates
@@ -977,9 +1085,7 @@ pub async fn list_predicates(
     }
 
     // Get user predicates by querying _fact relation
-    let fact_results = if let Some(ref coordinator) = state.datalog_coordinator {
-        coordinator.query("_fact(R, P, C)", None).await.ok()
-    } else if let Some(ref datalog_cache) = state.datalog_cache {
+    let fact_results = if let Some(ref datalog_cache) = state.datalog_cache {
         datalog_cache
             .execute_query("_fact(R, P, C)", None)
             .await
@@ -1020,10 +1126,11 @@ pub async fn list_predicates(
             "derived_predicates": derived_predicates,
             "metadata_predicates": metadata_predicates,
             "usage_notes": {
-                "current_facts": "Use predicate(args..., Rkey) for current (non-superseded) facts - rkey is last arg",
-                "historical_facts": "Use _all_predicate(args..., Rkey) to include superseded facts - same format",
+                "current_facts": "Use predicate(args..., Rkey) for current (non-superseded, non-expired) facts - rkey is last arg",
+                "historical_facts": "Use _all_predicate(args..., Rkey) to include superseded and expired facts - same format",
                 "rkey_wildcard": "Use _ for rkey if you don't need it: follows(X, Y, _)",
-                "arity_check": "If unsure of arity, query: predicate(A, B, ..., R) with enough variables"
+                "arity_check": "If unsure of arity, query: predicate(A, B, ..., R) with enough variables",
+                "expiring_facts": "Create facts with expires_at or ttl_seconds. Expired facts excluded from default queries, visible in _all_ variants. Query _expired(R) for expired facts."
             }
         })
         .to_string(),
@@ -1139,11 +1246,39 @@ fn parse_single_arg(arg: &str) -> QueryArg {
     }
 }
 
+/// Parse a declaration string like `"tool_calls(n: number)"` into (name, types).
+fn parse_declaration_types(decl: &str) -> Option<(String, Vec<String>)> {
+    let decl = decl.trim().strip_prefix(".decl ").unwrap_or(decl);
+    let paren_idx = decl.find('(')?;
+    let close_paren = decl.rfind(')')?;
+    let name = decl[..paren_idx].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let args_str = &decl[paren_idx + 1..close_paren];
+    if args_str.trim().is_empty() {
+        return Some((name, vec![]));
+    }
+    let types = args_str
+        .split(',')
+        .map(|arg| {
+            let arg = arg.trim();
+            if let Some(colon_idx) = arg.find(':') {
+                arg[colon_idx + 1..].trim().to_string()
+            } else {
+                "symbol".to_string()
+            }
+        })
+        .collect();
+    Some((name, types))
+}
+
 /// Generate a wrapper rule and output declaration for a query.
 /// This ensures constants in the query are properly used as filters.
 fn generate_query_wrapper(
     query: &str,
     declared_predicates: Option<&std::collections::HashSet<String>>,
+    predicate_types: &std::collections::HashMap<String, Vec<String>>,
 ) -> (String, usize) {
     let parsed = match parse_query(query) {
         Some(p) => p,
@@ -1167,10 +1302,42 @@ fn generate_query_wrapper(
         variables.len()
     };
 
+    // Look up the source predicate types to determine result column types.
+    let source_types = predicate_types.get(&parsed.name);
+
+    let result_column_types: Vec<String> = if variables.is_empty() {
+        (0..parsed.arity())
+            .map(|pos| {
+                source_types
+                    .and_then(|ts| ts.get(pos))
+                    .cloned()
+                    .unwrap_or_else(|| "symbol".to_string())
+            })
+            .collect()
+    } else {
+        parsed
+            .args
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, a)| match a {
+                QueryArg::Variable(v) if v != "_" => {
+                    let t = source_types
+                        .and_then(|ts| ts.get(pos))
+                        .cloned()
+                        .unwrap_or_else(|| "symbol".to_string());
+                    Some(t)
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
     // Build the result predicate declaration
     let decl = if result_arity > 0 {
-        let params: Vec<String> = (0..result_arity)
-            .map(|i| format!("arg{}: symbol", i))
+        let params: Vec<String> = result_column_types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("arg{}: {}", i, t))
             .collect();
         format!(".decl _query_result({})\n", params.join(", "))
     } else {
@@ -1202,9 +1369,17 @@ fn generate_query_wrapper(
     // Check if the base predicate needs declaration (for direct predicate queries without rules)
     let base_decl = if let Some(declared) = declared_predicates {
         if !declared.contains(&parsed.name) && parsed.arity() > 0 {
-            let params: Vec<String> = (0..parsed.arity())
-                .map(|i| format!("arg{}: symbol", i))
-                .collect();
+            let params: Vec<String> = if let Some(types) = source_types {
+                types
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| format!("arg{}: {}", i, t))
+                    .collect()
+            } else {
+                (0..parsed.arity())
+                    .map(|i| format!("arg{}: symbol", i))
+                    .collect()
+            };
             format!(".decl {}({})\n", parsed.name, params.join(", "))
         } else {
             String::new()
@@ -1336,7 +1511,8 @@ mod tests {
 
     #[test]
     fn test_generate_query_wrapper_all_variables() {
-        let (wrapper, arity) = generate_query_wrapper("follows(X, Y)", None);
+        let empty_types = std::collections::HashMap::new();
+        let (wrapper, arity) = generate_query_wrapper("follows(X, Y)", None, &empty_types);
         assert_eq!(arity, 2);
         assert!(wrapper.contains(".decl _query_result(arg0: symbol, arg1: symbol)"));
         assert!(wrapper.contains(".output _query_result"));
@@ -1345,7 +1521,9 @@ mod tests {
 
     #[test]
     fn test_generate_query_wrapper_with_constant() {
-        let (wrapper, arity) = generate_query_wrapper(r#"should_engage("did:plc:abc")"#, None);
+        let empty_types = std::collections::HashMap::new();
+        let (wrapper, arity) =
+            generate_query_wrapper(r#"should_engage("did:plc:abc")"#, None, &empty_types);
         // When all args are constants, we still output them so user sees what matched
         assert_eq!(arity, 1);
         assert!(wrapper.contains(".decl _query_result(arg0: symbol)"));
@@ -1357,7 +1535,9 @@ mod tests {
 
     #[test]
     fn test_generate_query_wrapper_mixed() {
-        let (wrapper, arity) = generate_query_wrapper(r#"follows(X, "did:plc:abc")"#, None);
+        let empty_types = std::collections::HashMap::new();
+        let (wrapper, arity) =
+            generate_query_wrapper(r#"follows(X, "did:plc:abc")"#, None, &empty_types);
         // Only variables in output
         assert_eq!(arity, 1);
         assert!(wrapper.contains(".decl _query_result(arg0: symbol)"));
@@ -1366,7 +1546,8 @@ mod tests {
 
     #[test]
     fn test_generate_query_wrapper_nullary() {
-        let (wrapper, arity) = generate_query_wrapper("has_data()", None);
+        let empty_types = std::collections::HashMap::new();
+        let (wrapper, arity) = generate_query_wrapper("has_data()", None, &empty_types);
         assert_eq!(arity, 0);
         assert!(wrapper.contains(".decl _query_result()"));
         assert!(wrapper.contains("_query_result() :- has_data()."));

@@ -18,12 +18,15 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tracing::{debug, info, warn};
 
 use crate::{
     protocol::{JsonRpcRequest, JsonRpcResponse},
     server::McpServer,
     tools::InterruptionState,
+    tools::SessionMetrics,
+    tools::inbox::{Inbox, InboxItem},
     tools::permissions::{MAX_CALL_DEPTH, ToolSessionStore, is_safe_mcp_tool},
 };
 
@@ -37,6 +40,10 @@ pub struct HttpState {
     interruption: Arc<InterruptionState>,
     /// Shared tool session store (also held by ToolState for token registration).
     sessions: Arc<ToolSessionStore>,
+    /// Shared inbox for persistent session model (optional).
+    inbox: Option<Arc<Inbox>>,
+    /// Shared session metrics for observability (optional).
+    session_metrics: Option<Arc<tokio::sync::RwLock<SessionMetrics>>>,
 }
 
 impl HttpState {
@@ -47,6 +54,8 @@ impl HttpState {
             server,
             interruption,
             sessions: Arc::new(ToolSessionStore::new()),
+            inbox: None,
+            session_metrics: None,
         }
     }
 
@@ -60,6 +69,41 @@ impl HttpState {
             server,
             interruption,
             sessions,
+            inbox: None,
+            session_metrics: None,
+        }
+    }
+
+    /// Create a new HTTP state with all shared components including inbox.
+    pub fn with_inbox(
+        server: McpServer,
+        interruption: Arc<InterruptionState>,
+        sessions: Arc<ToolSessionStore>,
+        inbox: Arc<Inbox>,
+    ) -> Self {
+        Self {
+            server,
+            interruption,
+            sessions,
+            inbox: Some(inbox),
+            session_metrics: None,
+        }
+    }
+
+    /// Create a new HTTP state with all shared components including inbox and session metrics.
+    pub fn with_all(
+        server: McpServer,
+        interruption: Arc<InterruptionState>,
+        sessions: Arc<ToolSessionStore>,
+        inbox: Arc<Inbox>,
+        session_metrics: Arc<tokio::sync::RwLock<SessionMetrics>>,
+    ) -> Self {
+        Self {
+            server,
+            interruption,
+            sessions,
+            inbox: Some(inbox),
+            session_metrics: Some(session_metrics),
         }
     }
 
@@ -72,6 +116,11 @@ impl HttpState {
     pub fn sessions(&self) -> &Arc<ToolSessionStore> {
         &self.sessions
     }
+
+    /// Get the inbox reference (if configured).
+    pub fn inbox(&self) -> Option<&Arc<Inbox>> {
+        self.inbox.as_ref()
+    }
 }
 
 /// Create an axum router for the MCP HTTP server.
@@ -83,6 +132,9 @@ pub fn create_router(state: Arc<HttpState>) -> Router {
         .route("/interrupt", post(handle_interrupt))
         .route("/interrupt", axum::routing::delete(handle_clear_interrupt))
         .route("/builtin-tool-call", post(handle_builtin_tool_call))
+        .route("/inbox", post(handle_push_inbox))
+        .route("/inbox/status", get(handle_inbox_status))
+        .route("/session-metrics", post(handle_session_metrics))
         .with_state(state)
 }
 
@@ -423,10 +475,108 @@ async fn handle_builtin_tool_call(
     )
 }
 
+/// Push an item to the inbox (daemon-internal endpoint).
+///
+/// The daemon uses this endpoint to push notifications, DMs, and jobs
+/// into the inbox for Winter's persistent session to consume.
+async fn handle_push_inbox(
+    State(state): State<Arc<HttpState>>,
+    Json(item): Json<InboxItem>,
+) -> impl IntoResponse {
+    if let Some(ref inbox) = state.inbox {
+        let id = item.id.clone();
+        let kind = item.kind;
+        inbox.push(item).await;
+        debug!(id = %id, kind = %kind, "inbox item pushed");
+        (
+            StatusCode::OK,
+            Json(json!({ "success": true, "id": id })),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "success": false, "error": "inbox not configured" })),
+        )
+    }
+}
+
+/// Get inbox status (used by daemon watchdog).
+async fn handle_inbox_status(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
+    let (pending, is_empty) = if let Some(ref inbox) = state.inbox {
+        let len = inbox.len().await;
+        (len, len == 0)
+    } else {
+        (0, true)
+    };
+
+    // Include last tool call timestamp from session metrics for staleness checks
+    let last_tool_call_at = if let Some(ref metrics) = state.session_metrics {
+        let m = metrics.read().await;
+        Some(m.last_tool_call_at.to_rfc3339())
+    } else {
+        None
+    };
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "pending": pending,
+            "is_empty": is_empty,
+            "last_tool_call_at": last_tool_call_at
+        })),
+    )
+}
+
+/// Request body for session metrics updates.
+///
+/// Pushed by the daemon as it processes streaming responses from Claude.
+#[derive(Debug, Deserialize)]
+pub struct SessionMetricsUpdate {
+    /// Input tokens for this turn.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Output tokens for this turn.
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Total tokens for this turn.
+    #[serde(default)]
+    pub total_tokens: u64,
+    /// Cost for this turn in USD.
+    #[serde(default)]
+    pub cost_usd: f64,
+    /// Whether this update represents a completed turn.
+    #[serde(default)]
+    pub is_turn: bool,
+}
+
+/// Update session metrics (called by daemon during streaming).
+async fn handle_session_metrics(
+    State(state): State<Arc<HttpState>>,
+    Json(update): Json<SessionMetricsUpdate>,
+) -> impl IntoResponse {
+    if let Some(ref metrics) = state.session_metrics {
+        let mut m = metrics.write().await;
+        m.total_input_tokens += update.input_tokens;
+        m.total_output_tokens += update.output_tokens;
+        m.total_tokens += update.total_tokens;
+        m.total_cost_usd += update.cost_usd;
+        if update.is_turn {
+            m.turn_count += 1;
+        }
+        (StatusCode::OK, Json(json!({ "success": true })))
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "success": false, "error": "session metrics not configured" })),
+        )
+    }
+}
+
 /// Run the MCP HTTP server on the specified port.
 pub async fn run_server(server: McpServer, port: u16) -> Result<(), std::io::Error> {
     let interruption = Arc::new(InterruptionState::new());
     let sessions = Arc::new(ToolSessionStore::new());
+    let session_metrics = Arc::new(tokio::sync::RwLock::new(SessionMetrics::default()));
 
     // Set the interruption state on the tool registry so check_interruption works
     server
@@ -446,7 +596,26 @@ pub async fn run_server(server: McpServer, port: u16) -> Result<(), std::io::Err
         .set_internal_mcp_url(format!("http://127.0.0.1:{}", port))
         .await;
 
-    let state = Arc::new(HttpState::with_shared(server, interruption, sessions));
+    // Set session metrics for observability
+    server
+        .tools()
+        .set_session_metrics(Arc::clone(&session_metrics))
+        .await;
+
+    // Create inbox and wire into both ToolState and HttpState
+    let inbox = Arc::new(Inbox::new());
+    server
+        .tools()
+        .set_inbox(Arc::clone(&inbox))
+        .await;
+
+    let state = Arc::new(HttpState::with_all(
+        server,
+        interruption,
+        sessions,
+        inbox,
+        session_metrics,
+    ));
     let router = create_router(state);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
