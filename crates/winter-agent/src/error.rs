@@ -19,7 +19,7 @@ pub enum AgentError {
 
     /// Claude SDK error.
     #[error("Claude error: {0}")]
-    Claude(#[from] claude_sdk_rs::Error),
+    Claude(#[from] winter_claude::Error),
 
     /// Operation timed out.
     #[error("operation timed out: {0}")]

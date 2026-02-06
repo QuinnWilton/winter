@@ -13,7 +13,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 
 # Claude SDK
-claude-sdk-rs = { workspace = true }
+winter-claude = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

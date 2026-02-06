@@ -1,0 +1,52 @@
+# Tarpaulin configuration for local code coverage
+# Run with: cargo tarpaulin
+
+[default]
+# Workspace configuration
+workspace = true
+all-features = true
+
+# Output formats
+out = ["Html", "Xml", "Lcov"]
+output-dir = "target/coverage"
+
+# Coverage options
+branch = true
+ignore-panics = true
+ignore-tests = false
+run-types = ["Tests", "Doctests"]
+
+# Timeout for each test
+timeout = "300s"
+
+# Exclude patterns
+exclude-files = [
+    "*/tests/*",
+    "*/examples/*",
+    "*/benches/*",
+    "**/build.rs",
+    "**/main.rs",
+]
+
+# Packages to include
+packages = [
+    "claude-sdk-rs-core",
+    "claude-sdk-rs-runtime", 
+    "claude-sdk-rs",
+    "claude-sdk-rs-mcp",
+    "claude-sdk-rs-interactive",
+]
+
+# Environment variables
+[env]
+RUST_LOG = "info"
+RUST_BACKTRACE = "1"
+
+# Coverage thresholds
+[report]
+# Fail if coverage is below this percentage
+fail-under = 80
+
+# Skip coverage for these functions/modules
+[skip]
+skip-clean = false

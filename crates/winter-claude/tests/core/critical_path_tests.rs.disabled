@@ -1,0 +1,542 @@
+//! Critical path tests for Claude AI Core
+//! 
+//! This module contains comprehensive tests for all critical paths in the core library,
+//! targeting >95% test coverage of essential functionality.
+
+use claude_ai_core::*;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn test_config_default_values() {
+        let config = Config::default();
+        
+        assert!(config.system_prompt.is_none());
+        assert!(config.model.is_none());
+        assert!(config.stream_format == StreamFormat::Text);
+        assert!(config.timeout_secs.is_none());
+        assert!(config.max_tokens.is_none());
+        assert!(config.allowed_tools.is_none());
+        assert!(config.mcp_config_path.is_none());
+        assert!(!config.verbose);
+    }
+
+    #[test]
+    fn test_config_builder_all_fields() {
+        let config = Config::builder()
+            .model("claude-3-opus-20240229")
+            .system_prompt("Test system prompt")
+            .stream_format(StreamFormat::Json)
+            .timeout_secs(60)
+            .max_tokens(1000)
+            .allowed_tools(vec!["bash".to_string(), "filesystem".to_string()])
+            .mcp_config_path("./config.json")
+            .verbose(true)
+            .build()
+            .expect("Config should build successfully");
+
+        assert_eq!(config.model, Some("claude-3-opus-20240229".to_string()));
+        assert_eq!(config.system_prompt, Some("Test system prompt".to_string()));
+        assert_eq!(config.stream_format, StreamFormat::Json);
+        assert_eq!(config.timeout_secs, Some(60));
+        assert_eq!(config.max_tokens, Some(1000));
+        assert_eq!(config.allowed_tools, Some(vec!["bash".to_string(), "filesystem".to_string()]));
+        assert_eq!(config.mcp_config_path, Some(PathBuf::from("./config.json")));
+        assert!(config.verbose);
+    }
+
+    #[test]
+    fn test_config_validation_system_prompt_too_long() {
+        let long_prompt = "a".repeat(10_001);
+        let result = Config::builder()
+            .system_prompt(&long_prompt)
+            .build();
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::ConfigError(msg) => assert!(msg.contains("System prompt too long")),
+            _ => panic!("Expected ConfigError for long system prompt"),
+        }
+    }
+
+    #[test]
+    fn test_config_validation_timeout_too_small() {
+        let result = Config::builder()
+            .timeout_secs(0)
+            .build();
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::ConfigError(msg) => assert!(msg.contains("Timeout must be between")),
+            _ => panic!("Expected ConfigError for invalid timeout"),
+        }
+    }
+
+    #[test]
+    fn test_config_validation_timeout_too_large() {
+        let result = Config::builder()
+            .timeout_secs(3601)
+            .build();
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::ConfigError(msg) => assert!(msg.contains("Timeout must be between")),
+            _ => panic!("Expected ConfigError for invalid timeout"),
+        }
+    }
+
+    #[test]
+    fn test_config_validation_max_tokens_too_large() {
+        let result = Config::builder()
+            .max_tokens(200_001)
+            .build();
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::ConfigError(msg) => assert!(msg.contains("Max tokens cannot exceed")),
+            _ => panic!("Expected ConfigError for invalid max_tokens"),
+        }
+    }
+
+    #[test]
+    fn test_config_validation_tool_name_too_long() {
+        let long_tool_name = "a".repeat(101);
+        let result = Config::builder()
+            .allowed_tools(vec![long_tool_name])
+            .build();
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::ConfigError(msg) => assert!(msg.contains("Tool name too long")),
+            _ => panic!("Expected ConfigError for long tool name"),
+        }
+    }
+
+    #[test]
+    fn test_config_serialization() {
+        let config = Config::builder()
+            .model("claude-3-sonnet-20240229")
+            .system_prompt("Test prompt")
+            .stream_format(StreamFormat::StreamJson)
+            .timeout_secs(30)
+            .max_tokens(500)
+            .verbose(true)
+            .build()
+            .expect("Config should build");
+
+        let json = serde_json::to_string(&config).expect("Should serialize");
+        let deserialized: Config = serde_json::from_str(&json).expect("Should deserialize");
+
+        assert_eq!(config.model, deserialized.model);
+        assert_eq!(config.system_prompt, deserialized.system_prompt);
+        assert_eq!(config.stream_format, deserialized.stream_format);
+        assert_eq!(config.timeout_secs, deserialized.timeout_secs);
+        assert_eq!(config.max_tokens, deserialized.max_tokens);
+        assert_eq!(config.verbose, deserialized.verbose);
+    }
+
+    #[test]
+    fn test_query_validation_empty() {
+        let result = validate_query("");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::InvalidInput(msg) => assert!(msg.contains("Query cannot be empty")),
+            _ => panic!("Expected InvalidInput for empty query"),
+        }
+    }
+
+    #[test]
+    fn test_query_validation_whitespace_only() {
+        let result = validate_query("   \n\t  ");
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::InvalidInput(msg) => assert!(msg.contains("Query cannot be empty")),
+            _ => panic!("Expected InvalidInput for whitespace-only query"),
+        }
+    }
+
+    #[test]
+    fn test_query_validation_too_long() {
+        let long_query = "a".repeat(100_001);
+        let result = validate_query(&long_query);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::InvalidInput(msg) => assert!(msg.contains("Query too long")),
+            _ => panic!("Expected InvalidInput for long query"),
+        }
+    }
+
+    #[test]
+    fn test_query_validation_valid() {
+        let result = validate_query("Valid query");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_stream_format_variants() {
+        // Test all stream format variants
+        assert_eq!(format!("{:?}", StreamFormat::Text), "Text");
+        assert_eq!(format!("{:?}", StreamFormat::Json), "Json");
+        assert_eq!(format!("{:?}", StreamFormat::StreamJson), "StreamJson");
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    #[test]
+    fn test_error_codes_unique() {
+        // Test that all error codes are unique
+        let mut codes = std::collections::HashSet::new();
+        
+        let errors = vec![
+            Error::BinaryNotFound,
+            Error::SessionNotFound("test".to_string()),
+            Error::PermissionDenied("test".to_string()),
+            Error::McpError("test".to_string()),
+            Error::ConfigError("test".to_string()),
+            Error::InvalidInput("test".to_string()),
+            Error::Timeout(30),
+            Error::ProcessError("test".to_string()),
+            Error::StreamClosed,
+            Error::NotAuthenticated,
+            Error::RateLimitExceeded,
+        ];
+
+        for error in errors {
+            let code = error.code();
+            assert!(codes.insert(code), "Duplicate error code: {:?}", code);
+        }
+    }
+
+    #[test]
+    fn test_error_recoverability() {
+        // Test recoverable errors
+        assert!(Error::Timeout(30).is_recoverable());
+        assert!(Error::RateLimitExceeded.is_recoverable());
+        assert!(Error::StreamClosed.is_recoverable());
+        assert!(Error::ProcessError("temp failure".to_string()).is_recoverable());
+
+        // Test non-recoverable errors
+        assert!(!Error::BinaryNotFound.is_recoverable());
+        assert!(!Error::ConfigError("invalid".to_string()).is_recoverable());
+        assert!(!Error::InvalidInput("bad".to_string()).is_recoverable());
+        assert!(!Error::NotAuthenticated.is_recoverable());
+        assert!(!Error::PermissionDenied("denied".to_string()).is_recoverable());
+    }
+
+    #[test]
+    fn test_error_display_includes_codes() {
+        let error = Error::BinaryNotFound;
+        assert!(error.to_string().contains("[C001]"));
+
+        let error = Error::Timeout(30);
+        assert!(error.to_string().contains("[C007]"));
+        assert!(error.to_string().contains("30s"));
+
+        let error = Error::SessionNotFound("session123".to_string());
+        assert!(error.to_string().contains("[C002]"));
+        assert!(error.to_string().contains("session123"));
+    }
+
+    #[test]
+    fn test_error_from_conversions() {
+        // Test From implementations
+        let io_error = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let error: Error = io_error.into();
+        assert_eq!(error.code(), ErrorCode::IoError);
+
+        let json_error = serde_json::from_str::<serde_json::Value>("invalid json").unwrap_err();
+        let error: Error = json_error.into();
+        assert_eq!(error.code(), ErrorCode::SerializationError);
+    }
+
+    #[test]
+    fn test_error_clone() {
+        let original = Error::SessionNotFound("test123".to_string());
+        let cloned = original.clone();
+        
+        assert_eq!(original.code(), cloned.code());
+        assert_eq!(original.to_string(), cloned.to_string());
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    #[test]
+    fn test_session_id_creation() {
+        let id = SessionId::new("test-session");
+        assert_eq!(id.as_str(), "test-session");
+        assert_eq!(id.to_string(), "test-session");
+    }
+
+    #[test]
+    fn test_session_id_generate() {
+        let id1 = SessionId::generate();
+        let id2 = SessionId::generate();
+        
+        // Generated IDs should be different
+        assert_ne!(id1.as_str(), id2.as_str());
+        
+        // Generated IDs should be valid UUIDs (36 characters with hyphens)
+        assert_eq!(id1.as_str().len(), 36);
+        assert_eq!(id2.as_str().len(), 36);
+    }
+
+    #[test]
+    fn test_session_creation() {
+        let id = SessionId::new("test-session");
+        let session = Session::new(id.clone());
+        
+        assert_eq!(session.id(), &id);
+        assert_eq!(session.system_prompt, None);
+        assert!(session.metadata.is_empty());
+    }
+
+    #[test]
+    fn test_session_with_system_prompt() {
+        let id = SessionId::new("test-session");
+        let session = Session::new(id)
+            .with_system_prompt("Test system prompt");
+        
+        assert_eq!(session.system_prompt, Some("Test system prompt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_session_manager_creation() {
+        let manager = SessionManager::new();
+        
+        // Should start with no sessions
+        let sessions = manager.list().await.expect("Should list sessions");
+        assert!(sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_session_manager_store_and_retrieve() {
+        let manager = SessionManager::new();
+        let session_id = SessionId::new("test-session");
+        
+        // Create and store a session
+        let session = manager.create_session()
+            .with_id(session_id.clone())
+            .with_system_prompt("Test prompt")
+            .build()
+            .await
+            .expect("Should build session");
+        
+        // Retrieve the session
+        let retrieved = manager.get(&session_id).await
+            .expect("Should get session")
+            .expect("Session should exist");
+        
+        assert_eq!(retrieved.id(), &session_id);
+        assert_eq!(retrieved.system_prompt, Some("Test prompt".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_session_manager_resume() {
+        let manager = SessionManager::new();
+        let session_id = SessionId::new("test-session");
+        
+        // Store a session
+        let _session = manager.create_session()
+            .with_id(session_id.clone())
+            .build()
+            .await
+            .expect("Should build session");
+        
+        // Resume the session
+        let resumed = manager.resume(&session_id).await
+            .expect("Should resume session");
+        
+        assert_eq!(resumed.id(), &session_id);
+    }
+
+    #[tokio::test]
+    async fn test_session_manager_resume_nonexistent() {
+        let manager = SessionManager::new();
+        let session_id = SessionId::new("nonexistent");
+        
+        let result = manager.resume(&session_id).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            Error::SessionNotFound(id) => assert_eq!(id, "nonexistent"),
+            _ => panic!("Expected SessionNotFound error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_builder() {
+        let builder = SessionBuilder::new();
+        
+        let session = builder
+            .with_system_prompt("Test prompt")
+            .with_metadata("key1", serde_json::Value::String("value1".to_string()))
+            .with_metadata("key2", serde_json::Value::Number(serde_json::Number::from(42)))
+            .build()
+            .await
+            .expect("Should build session");
+        
+        assert_eq!(session.system_prompt, Some("Test prompt".to_string()));
+        assert_eq!(session.metadata.len(), 2);
+        assert_eq!(session.metadata.get("key1"), Some(&serde_json::Value::String("value1".to_string())));
+        assert_eq!(session.metadata.get("key2"), Some(&serde_json::Value::Number(serde_json::Number::from(42))));
+    }
+}
+
+#[cfg(test)]
+mod types_tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_permission_display() {
+        let perm = ToolPermission::Allow("bash".to_string());
+        assert_eq!(perm.to_string(), "bash");
+    }
+
+    #[test]
+    fn test_cost_calculation() {
+        let cost = Cost {
+            input_tokens: 1000,
+            output_tokens: 500,
+            cache_creation_input_tokens: Some(100),
+            cache_read_input_tokens: Some(50),
+        };
+
+        // Test total tokens
+        let total = cost.total_tokens();
+        assert_eq!(total, 1500); // input + output
+
+        // Test total cost calculation (using example rates)
+        let rates = std::collections::HashMap::from([
+            ("input".to_string(), 0.001),
+            ("output".to_string(), 0.002),
+            ("cache_creation".to_string(), 0.0005),
+            ("cache_read".to_string(), 0.0001),
+        ]);
+        
+        let total_cost = cost.total_cost(&rates);
+        let expected = (1000.0 * 0.001) + (500.0 * 0.002) + (100.0 * 0.0005) + (50.0 * 0.0001);
+        assert!((total_cost - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_response_metadata() {
+        let metadata = ResponseMetadata {
+            usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_creation_input_tokens: Some(10),
+                cache_read_input_tokens: Some(5),
+            },
+            cost: Some(Cost {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_creation_input_tokens: Some(10),
+                cache_read_input_tokens: Some(5),
+            }),
+            model: Some("claude-3-sonnet-20240229".to_string()),
+            finish_reason: Some("end_turn".to_string()),
+        };
+
+        assert_eq!(metadata.usage.input_tokens, 100);
+        assert_eq!(metadata.usage.output_tokens, 50);
+        assert!(metadata.cost.is_some());
+        assert_eq!(metadata.model, Some("claude-3-sonnet-20240229".to_string()));
+    }
+
+    #[test]
+    fn test_claude_response_serialization() {
+        let response = ClaudeResponse {
+            content: "Test response".to_string(),
+            metadata: ResponseMetadata {
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cache_creation_input_tokens: None,
+                    cache_read_input_tokens: None,
+                },
+                cost: None,
+                model: Some("test-model".to_string()),
+                finish_reason: Some("end_turn".to_string()),
+            },
+        };
+
+        let json = serde_json::to_string(&response).expect("Should serialize");
+        let deserialized: ClaudeResponse = serde_json::from_str(&json).expect("Should deserialize");
+
+        assert_eq!(response.content, deserialized.content);
+        assert_eq!(response.metadata.usage.input_tokens, deserialized.metadata.usage.input_tokens);
+        assert_eq!(response.metadata.model, deserialized.metadata.model);
+    }
+}
+
+#[cfg(test)]
+mod message_tests {
+    use super::*;
+
+    #[test]
+    fn test_message_creation() {
+        let message = Message::new(MessageType::User, "Hello, Claude!");
+        
+        assert_eq!(message.message_type, MessageType::User);
+        assert_eq!(message.content, "Hello, Claude!");
+        assert!(message.timestamp > 0);
+    }
+
+    #[test]
+    fn test_message_types() {
+        // Test all message type variants
+        assert_eq!(format!("{:?}", MessageType::User), "User");
+        assert_eq!(format!("{:?}", MessageType::Assistant), "Assistant");
+    }
+
+    #[test]
+    fn test_message_serialization() {
+        let message = Message::new(MessageType::Assistant, "Hello, human!");
+        
+        let json = serde_json::to_string(&message).expect("Should serialize");
+        let deserialized: Message = serde_json::from_str(&json).expect("Should deserialize");
+
+        assert_eq!(message.message_type, deserialized.message_type);
+        assert_eq!(message.content, deserialized.content);
+        assert_eq!(message.timestamp, deserialized.timestamp);
+    }
+
+    #[test]
+    fn test_conversation_stats() {
+        let stats = ConversationStats {
+            total_messages: 10,
+            total_tokens: 1000,
+            total_cost: 0.50,
+            average_response_time: 2.5,
+        };
+
+        assert_eq!(stats.total_messages, 10);
+        assert_eq!(stats.total_tokens, 1000);
+        assert!((stats.total_cost - 0.50).abs() < f64::EPSILON);
+        assert!((stats.average_response_time - 2.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_message_meta() {
+        let meta = MessageMeta {
+            tokens: Some(100),
+            model: Some("claude-3-haiku-20240307".to_string()),
+            finish_reason: Some("end_turn".to_string()),
+            timestamp: 1234567890,
+        };
+
+        assert_eq!(meta.tokens, Some(100));
+        assert_eq!(meta.model, Some("claude-3-haiku-20240307".to_string()));
+        assert_eq!(meta.finish_reason, Some("end_turn".to_string()));
+        assert_eq!(meta.timestamp, 1234567890);
+    }
+}

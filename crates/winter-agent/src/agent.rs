@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use claude_sdk_rs::{
+use winter_claude::{
     ClaudeResponse, Client, Config as ClaudeConfig, StreamFormat, extract_tool_calls,
 };
 use tracing::{debug, info, warn};
@@ -14,6 +14,7 @@ use crate::{AgentContext, AgentError, PromptBuilder};
 
 /// Built-in Claude Code tools that we want to log.
 const BUILTIN_TOOLS: &[&str] = &["Read", "WebFetch", "WebSearch", "Glob", "Grep"];
+const DEFAULT_MODEL: &str = "claude-opus-4-6";
 
 /// Agent that wraps the Claude SDK for Winter.
 pub struct Agent {
@@ -148,7 +149,7 @@ impl Agent {
         let trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
 
         let claude_config = ClaudeConfig::builder()
-            .model("opus")
+            .model(DEFAULT_MODEL)
             .system_prompt(&system_prompt)
             .mcp_config(&self.mcp_config_path)
             .allowed_tools(Self::allowed_tools())
@@ -205,7 +206,7 @@ impl Agent {
         let trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
 
         let claude_config = ClaudeConfig::builder()
-            .model("opus")
+            .model(DEFAULT_MODEL)
             .system_prompt(&system_prompt)
             .mcp_config(&self.mcp_config_path)
             .allowed_tools(Self::allowed_tools())
@@ -246,7 +247,7 @@ impl Agent {
         let trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
 
         let claude_config = ClaudeConfig::builder()
-            .model("opus")
+            .model(DEFAULT_MODEL)
             .system_prompt(&system_prompt)
             .mcp_config(&self.mcp_config_path)
             .allowed_tools(Self::allowed_tools())
@@ -306,7 +307,7 @@ impl Agent {
         let trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
 
         let claude_config = ClaudeConfig::builder()
-            .model("opus")
+            .model(DEFAULT_MODEL)
             .system_prompt(&system_prompt)
             .mcp_config(&self.mcp_config_path)
             .allowed_tools(Self::allowed_tools())
@@ -351,7 +352,7 @@ impl Agent {
         let trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
 
         let claude_config = ClaudeConfig::builder()
-            .model("opus")
+            .model(DEFAULT_MODEL)
             .system_prompt(&system_prompt)
             .mcp_config(&self.mcp_config_path)
             .allowed_tools(Self::allowed_tools())
