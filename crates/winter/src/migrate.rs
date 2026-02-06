@@ -15,7 +15,7 @@ use tracing::info;
 use winter_atproto::{
     AtUri, AtprotoClient, DIRECTIVE_COLLECTION, Directive, DirectiveKind, FACT_COLLECTION, Fact,
     IDENTITY_COLLECTION, IDENTITY_KEY, Identity, LegacyIdentity, NOTE_COLLECTION, Note,
-    RULE_COLLECTION, Rule, Tid,
+    RULE_COLLECTION, Rule, Tid, WIKI_ENTRY_COLLECTION, WikiEntry,
 };
 use winter_datalog::DerivedFactGenerator;
 
@@ -938,6 +938,214 @@ impl Migration for RulePredicateArityMigration {
 }
 
 // =============================================================================
+// Migration: Notes to Wiki Entries
+// =============================================================================
+
+/// Migration: Convert notes to wiki entries.
+///
+/// For each note, creates a WikiEntry with:
+/// - slug = slugify(title)
+/// - status = "stable"
+/// - content, tags, timestamps preserved
+/// - category moved to tags (if present)
+///
+/// Handles slug collisions by appending -2, -3, etc.
+struct NotesToWikiEntries;
+
+impl NotesToWikiEntries {
+    /// Convert a title to a URL-safe slug.
+    fn slugify(title: &str) -> String {
+        title
+            .to_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .split('-')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+
+    /// Generate a unique slug, appending -2, -3, etc. if needed.
+    fn unique_slug(base_slug: &str, used_slugs: &[String]) -> String {
+        if !used_slugs.contains(&base_slug.to_string()) {
+            return base_slug.to_string();
+        }
+
+        for i in 2.. {
+            let candidate = format!("{}-{}", base_slug, i);
+            if !used_slugs.contains(&candidate) {
+                return candidate;
+            }
+        }
+
+        unreachable!()
+    }
+}
+
+#[async_trait]
+impl Migration for NotesToWikiEntries {
+    fn name(&self) -> &'static str {
+        "notes-to-wiki-entries"
+    }
+
+    fn description(&self) -> &'static str {
+        "Convert note records to wiki entries with generated slugs"
+    }
+
+    async fn needs_migration(&self, client: &AtprotoClient) -> Result<bool> {
+        let notes = client
+            .list_all_records::<Note>(NOTE_COLLECTION)
+            .await
+            .map_err(|e| miette::miette!("{}", e))?;
+
+        Ok(!notes.is_empty())
+    }
+
+    async fn preview(&self, client: &AtprotoClient) -> Result<MigrationPreview> {
+        let notes = client
+            .list_all_records::<Note>(NOTE_COLLECTION)
+            .await
+            .map_err(|e| miette::miette!("{}", e))?;
+
+        // Also check existing wiki entries for slug collisions
+        let existing_entries = client
+            .list_all_records::<WikiEntry>(WIKI_ENTRY_COLLECTION)
+            .await
+            .unwrap_or_default();
+        let mut used_slugs: Vec<String> = existing_entries
+            .iter()
+            .map(|e| e.value.slug.clone())
+            .collect();
+
+        let mut changes = Vec::new();
+
+        for record in &notes {
+            let rkey = extract_rkey(&record.uri);
+            let base_slug = Self::slugify(&record.value.title);
+            let slug = Self::unique_slug(&base_slug, &used_slugs);
+            used_slugs.push(slug.clone());
+
+            let mut extra = String::new();
+            if let Some(ref cat) = record.value.category {
+                extra = format!(" (category '{}' -> tag)", cat);
+            }
+
+            changes.push(format!(
+                "Note '{}' ({}) -> wiki entry slug '{}'{}",
+                record.value.title, rkey, slug, extra
+            ));
+        }
+
+        Ok(MigrationPreview {
+            records_to_update: notes.len(),
+            changes,
+        })
+    }
+
+    async fn apply(&self, client: &AtprotoClient) -> Result<MigrationResult> {
+        let notes = client
+            .list_all_records::<Note>(NOTE_COLLECTION)
+            .await
+            .map_err(|e| miette::miette!("{}", e))?;
+
+        // Check existing wiki entries for slug collisions
+        let existing_entries = client
+            .list_all_records::<WikiEntry>(WIKI_ENTRY_COLLECTION)
+            .await
+            .unwrap_or_default();
+        let mut used_slugs: Vec<String> = existing_entries
+            .iter()
+            .map(|e| e.value.slug.clone())
+            .collect();
+
+        let mut created = 0;
+        let mut deleted = 0;
+        let mut errors = Vec::new();
+
+        for record in &notes {
+            let note_rkey = extract_rkey(&record.uri);
+            let base_slug = Self::slugify(&record.value.title);
+            let slug = Self::unique_slug(&base_slug, &used_slugs);
+            used_slugs.push(slug.clone());
+
+            // Build tags: preserve existing + add category if present
+            let mut tags = record.value.tags.clone();
+            if let Some(ref category) = record.value.category {
+                if !category.is_empty() && !tags.contains(category) {
+                    tags.push(category.clone());
+                }
+            }
+
+            let entry = WikiEntry {
+                title: record.value.title.clone(),
+                slug: slug.clone(),
+                aliases: Vec::new(),
+                summary: None,
+                content: record.value.content.clone(),
+                status: "stable".to_string(),
+                supersedes: None,
+                tags,
+                created_at: record.value.created_at,
+                last_updated: record.value.last_updated,
+            };
+
+            let wiki_rkey = Tid::now().to_string();
+            match client
+                .create_record(WIKI_ENTRY_COLLECTION, Some(&wiki_rkey), &entry)
+                .await
+            {
+                Ok(_) => {
+                    info!(
+                        note = %record.value.title,
+                        slug = %slug,
+                        "created wiki entry from note"
+                    );
+                    created += 1;
+
+                    // Delete the original note
+                    match client.delete_record(NOTE_COLLECTION, &note_rkey).await {
+                        Ok(()) => {
+                            deleted += 1;
+                        }
+                        Err(e) => {
+                            errors.push(format!(
+                                "Created wiki entry but failed to delete note '{}': {}",
+                                record.value.title, e
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    errors.push(format!(
+                        "Failed to create wiki entry for note '{}': {}",
+                        record.value.title, e
+                    ));
+                }
+            }
+        }
+
+        info!(
+            created = created,
+            deleted = deleted,
+            errors = errors.len(),
+            "notes-to-wiki-entries migration complete"
+        );
+
+        Ok(MigrationResult {
+            records_updated: created + deleted,
+            errors,
+        })
+    }
+}
+
+// =============================================================================
 // Migration Registry
 // =============================================================================
 
@@ -949,6 +1157,7 @@ pub fn available_migrations() -> Vec<Box<dyn Migration>> {
         Box::new(NoteRelatedFactsToUris),
         Box::new(LegacyIdentityToDirectives),
         Box::new(RulePredicateArityMigration),
+        Box::new(NotesToWikiEntries),
     ]
 }
 
