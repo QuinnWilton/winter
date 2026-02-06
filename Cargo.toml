@@ -1,12 +1,14 @@
 [workspace]
 members = [
     "crates/winter",
+    "crates/winter-approve",
     "crates/winter-atproto",
     "crates/winter-datalog",
     "crates/winter-agent",
     "crates/winter-mcp",
     "crates/winter-scheduler",
     "crates/winter-web",
+    "crates/winter-claude",
 ]
 resolver = "2"
 
@@ -35,8 +37,8 @@ tokio = { version = "1.42", features = [
 ] }
 async-trait = "0.1"
 
-# Claude Code CLI wrapper (vendored)
-claude-sdk-rs = { path = "vendor/claude-sdk-rs" }
+# Claude Code CLI wrapper
+winter-claude = { path = "crates/winter-claude" }
 
 # HTTP client
 reqwest = { version = "0.12", features = ["json"] }
@@ -101,7 +103,8 @@ tempfile = "3.14"
 wiremock = "0.6"
 
 # CLI
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+rpassword = "5.0"
 
 # Internal crates
 winter-atproto = { path = "crates/winter-atproto" }
