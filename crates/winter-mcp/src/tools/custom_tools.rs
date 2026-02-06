@@ -1144,19 +1144,31 @@ pub async fn run_custom_tool(
         };
 
         // Build workspace permission if granted
-        let workspace = match (
-            approval.workspace_path.clone(),
-            approval.allow_workspace_read,
-            approval.allow_workspace_write,
-        ) {
-            (Some(path), read, write) if read.unwrap_or(false) || write.unwrap_or(false) => {
-                Some(WorkspacePermission {
-                    path: std::path::PathBuf::from(path),
-                    read: read.unwrap_or(false),
-                    write: write.unwrap_or(false),
-                })
+        let read = approval.allow_workspace_read.unwrap_or(false);
+        let write = approval.allow_workspace_write.unwrap_or(false);
+        let workspace = if read || write {
+            // Use explicit path from approval, or fall back to WINTER_WORKSPACE env var
+            let path = approval
+                .workspace_path
+                .clone()
+                .or_else(|| std::env::var("WINTER_WORKSPACE").ok())
+                .filter(|p| !p.is_empty());
+            match path {
+                Some(p) => Some(WorkspacePermission {
+                    path: std::path::PathBuf::from(p),
+                    read,
+                    write,
+                }),
+                None => {
+                    tracing::warn!(
+                        tool = %rkey,
+                        "Workspace access granted but no path available (set WINTER_WORKSPACE or workspace_path in approval)"
+                    );
+                    None
+                }
             }
-            _ => None,
+        } else {
+            None
         };
 
         // Build tool chaining permissions
