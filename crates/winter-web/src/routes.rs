@@ -8,7 +8,6 @@ use axum::{
     response::{Html, IntoResponse, Json, Redirect},
     routing::{get, post},
 };
-use axum_extra::extract::Form as HtmlForm;
 use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
@@ -127,9 +126,6 @@ pub fn create_router_with_secrets(
         // Tools
         .route("/tools", get(tools_page))
         .route("/tools/{rkey}", get(tool_detail))
-        .route("/api/tools/{rkey}/approve", post(approve_tool))
-        .route("/api/tools/{rkey}/deny", post(deny_tool))
-        .route("/api/tools/{rkey}/revoke", post(revoke_tool))
         // Secrets
         .route("/secrets", get(secrets_page))
         .route("/api/secrets", post(create_secret))
@@ -3592,76 +3588,6 @@ async fn tool_detail(
         None => ("pending approval", "pending"),
     };
 
-    let secrets_checkboxes: String = tool
-        .required_secrets
-        .iter()
-        .map(|s| {
-            let checked = approval
-                .as_ref()
-                .map(|a| a.allowed_secrets.contains(s))
-                .unwrap_or(false);
-            let checked_attr = if checked { " checked" } else { "" };
-            format!(
-                r#"<label><input type="checkbox" name="secrets" value="{s}"{checked_attr}> {s}</label><br>"#
-            )
-        })
-        .collect();
-
-    let network_checked = approval
-        .as_ref()
-        .and_then(|a| a.allow_network)
-        .unwrap_or(false);
-    let network_attr = if network_checked { " checked" } else { "" };
-
-    // Workspace settings
-    let requires_workspace = tool.requires_workspace.unwrap_or(false);
-    let workspace_section = if requires_workspace {
-        let workspace_path = approval
-            .as_ref()
-            .and_then(|a| a.workspace_path.as_ref())
-            .cloned()
-            .unwrap_or_else(|| std::env::var("WINTER_WORKSPACE").unwrap_or_default());
-        let read_checked = approval
-            .as_ref()
-            .and_then(|a| a.allow_workspace_read)
-            .unwrap_or(false);
-        let write_checked = approval
-            .as_ref()
-            .and_then(|a| a.allow_workspace_write)
-            .unwrap_or(false);
-        let read_attr = if read_checked { " checked" } else { "" };
-        let write_attr = if write_checked { " checked" } else { "" };
-        format!(
-            r#"<div class="form-group">
-                <label>Workspace path:</label>
-                <input type="text" name="workspace_path" value="{}" placeholder="/path/to/workspace">
-            </div>
-            <div class="form-group">
-                <label><input type="checkbox" name="allow_workspace_read"{read_attr}> Allow workspace read</label><br>
-                <label><input type="checkbox" name="allow_workspace_write"{write_attr}> Allow workspace write</label>
-            </div>"#,
-            html_escape(&workspace_path)
-        )
-    } else {
-        String::new()
-    };
-
-    // Command checkboxes
-    let commands_checkboxes: String = tool
-        .required_commands
-        .iter()
-        .map(|c| {
-            let checked = approval
-                .as_ref()
-                .map(|a| a.allowed_commands.contains(c))
-                .unwrap_or(false);
-            let checked_attr = if checked { " checked" } else { "" };
-            format!(
-                r#"<label><input type="checkbox" name="commands" value="{c}"{checked_attr}> {c}</label><br>"#
-            )
-        })
-        .collect();
-
     Html(
         TOOL_DETAIL_HTML
             .replace("<!-- RKEY -->", &rkey)
@@ -3671,10 +3597,6 @@ async fn tool_detail(
             .replace("<!-- VERSION -->", &tool.version.to_string())
             .replace("<!-- STATUS -->", status)
             .replace("<!-- STATUS_CLASS -->", status_class)
-            .replace("<!-- SECRETS_CHECKBOXES -->", &secrets_checkboxes)
-            .replace("<!-- NETWORK_CHECKED -->", network_attr)
-            .replace("<!-- WORKSPACE_SECTION -->", &workspace_section)
-            .replace("<!-- COMMANDS_CHECKBOXES -->", &commands_checkboxes)
             .replace(
                 "<!-- INPUT_SCHEMA -->",
                 &html_escape(&serde_json::to_string_pretty(&tool.input_schema).unwrap_or_default()),
@@ -3682,146 +3604,6 @@ async fn tool_detail(
     )
 }
 
-#[derive(Deserialize)]
-struct ApprovalForm {
-    #[serde(default)]
-    secrets: Vec<String>,
-    #[serde(default)]
-    allow_network: Option<String>,
-    #[serde(default)]
-    workspace_path: Option<String>,
-    #[serde(default)]
-    allow_workspace_read: Option<String>,
-    #[serde(default)]
-    allow_workspace_write: Option<String>,
-    #[serde(default)]
-    commands: Vec<String>,
-    reason: Option<String>,
-}
-
-async fn approve_tool(
-    State(state): State<Arc<AppState>>,
-    Path(rkey): Path<String>,
-    HtmlForm(form): HtmlForm<ApprovalForm>,
-) -> impl IntoResponse {
-    // Get the tool to verify it exists and get version
-    let tool = match state
-        .client
-        .get_record::<CustomTool>(TOOL_COLLECTION, &rkey)
-        .await
-    {
-        Ok(t) => t.value,
-        Err(_) => return Redirect::to(&format!("/tools/{}", rkey)),
-    };
-
-    // Validate workspace path if provided
-    let workspace_path = form.workspace_path.filter(|p| !p.is_empty());
-    let allow_workspace_read = if workspace_path.is_some() {
-        Some(form.allow_workspace_read.is_some())
-    } else {
-        None
-    };
-    let allow_workspace_write = if workspace_path.is_some() {
-        Some(form.allow_workspace_write.is_some())
-    } else {
-        None
-    };
-
-    let approval = ToolApproval {
-        tool_rkey: rkey.clone(),
-        tool_version: tool.version,
-        status: ToolApprovalStatus::Approved,
-        allow_network: Some(form.allow_network.is_some()),
-        allowed_secrets: form.secrets,
-        workspace_path,
-        allow_workspace_read,
-        allow_workspace_write,
-        allowed_commands: form.commands,
-        approved_by: None, // TODO: get from session
-        reason: form.reason,
-        created_at: Utc::now(),
-    };
-
-    let _ = state
-        .client
-        .put_record(TOOL_APPROVAL_COLLECTION, &rkey, &approval)
-        .await;
-
-    Redirect::to(&format!("/tools/{}", rkey))
-}
-
-async fn deny_tool(
-    State(state): State<Arc<AppState>>,
-    Path(rkey): Path<String>,
-    HtmlForm(form): HtmlForm<ApprovalForm>,
-) -> impl IntoResponse {
-    let tool = match state
-        .client
-        .get_record::<CustomTool>(TOOL_COLLECTION, &rkey)
-        .await
-    {
-        Ok(t) => t.value,
-        Err(_) => return Redirect::to(&format!("/tools/{}", rkey)),
-    };
-
-    let approval = ToolApproval {
-        tool_rkey: rkey.clone(),
-        tool_version: tool.version,
-        status: ToolApprovalStatus::Denied,
-        allow_network: None,
-        allowed_secrets: Vec::new(),
-        workspace_path: None,
-        allow_workspace_read: None,
-        allow_workspace_write: None,
-        allowed_commands: Vec::new(),
-        approved_by: None,
-        reason: form.reason,
-        created_at: Utc::now(),
-    };
-
-    let _ = state
-        .client
-        .put_record(TOOL_APPROVAL_COLLECTION, &rkey, &approval)
-        .await;
-
-    Redirect::to(&format!("/tools/{}", rkey))
-}
-
-async fn revoke_tool(
-    State(state): State<Arc<AppState>>,
-    Path(rkey): Path<String>,
-) -> impl IntoResponse {
-    let tool = match state
-        .client
-        .get_record::<CustomTool>(TOOL_COLLECTION, &rkey)
-        .await
-    {
-        Ok(t) => t.value,
-        Err(_) => return Redirect::to(&format!("/tools/{}", rkey)),
-    };
-
-    let approval = ToolApproval {
-        tool_rkey: rkey.clone(),
-        tool_version: tool.version,
-        status: ToolApprovalStatus::Revoked,
-        allow_network: None,
-        allowed_secrets: Vec::new(),
-        workspace_path: None,
-        allow_workspace_read: None,
-        allow_workspace_write: None,
-        allowed_commands: Vec::new(),
-        approved_by: None,
-        reason: Some("Revoked by operator".to_string()),
-        created_at: Utc::now(),
-    };
-
-    let _ = state
-        .client
-        .put_record(TOOL_APPROVAL_COLLECTION, &rkey, &approval)
-        .await;
-
-    Redirect::to(&format!("/tools/{}", rkey))
-}
 
 async fn secrets_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Get metadata from ATProto
@@ -4060,13 +3842,19 @@ const TOOL_DETAIL_HTML: &str = r#"<!DOCTYPE html>
             border-radius: 4px;
             margin: 1rem 0;
         }
-        .approval-form {
+        .approval-info {
             background: #2e3440;
             padding: 1.5rem;
             border-radius: 4px;
             margin: 1rem 0;
         }
-        .approval-form h3 { margin-top: 0; color: #88c0d0; }
+        .approval-info h3 { margin-top: 0; color: #88c0d0; }
+        .approval-info pre {
+            background: #3b4252;
+            padding: 1rem;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
         .form-group { margin: 1rem 0; }
         .form-group label { display: block; margin-bottom: 0.5rem; }
         input[type="text"], textarea {
@@ -4104,34 +3892,14 @@ const TOOL_DETAIL_HTML: &str = r#"<!DOCTYPE html>
     <h2>Source Code</h2>
     <pre><!-- CODE --></pre>
 
-    <div class="approval-form">
+    <div class="approval-info">
         <h3>Approval</h3>
-        <form action="/api/tools/<!-- RKEY -->/approve" method="post">
-            <div class="form-group">
-                <label><input type="checkbox" name="allow_network"<!-- NETWORK_CHECKED -->> Allow network access</label>
-            </div>
-            <div class="form-group">
-                <label>Allowed secrets:</label>
-                <!-- SECRETS_CHECKBOXES -->
-            </div>
-            <!-- WORKSPACE_SECTION -->
-            <div class="form-group">
-                <label>Allowed commands:</label>
-                <!-- COMMANDS_CHECKBOXES -->
-            </div>
-            <div class="form-group">
-                <label>Reason (optional):</label>
-                <input type="text" name="reason" placeholder="Approval reason">
-            </div>
-            <button type="submit" class="btn btn-approve">Approve</button>
-        </form>
-        <form action="/api/tools/<!-- RKEY -->/deny" method="post" style="display: inline;">
-            <input type="hidden" name="reason" value="">
-            <button type="submit" class="btn btn-deny">Deny</button>
-        </form>
-        <form action="/api/tools/<!-- RKEY -->/revoke" method="post" style="display: inline;">
-            <button type="submit" class="btn btn-revoke">Revoke</button>
-        </form>
+        <p>Tool approvals are managed via the <code>winter-approve</code> CLI. Safe tools (no network, no secrets, no writes) are auto-approved.</p>
+        <pre>winter-approve list              # show pending tools
+winter-approve show &lt;rkey&gt;       # view tool details
+winter-approve approve &lt;rkey&gt;    # approve with permissions
+winter-approve deny &lt;rkey&gt;       # deny approval
+winter-approve revoke &lt;rkey&gt;     # revoke existing approval</pre>
     </div>
 </body>
 </html>"#;
