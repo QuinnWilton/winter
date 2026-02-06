@@ -1,23 +1,18 @@
 //! In-memory cache for ATProto repository records.
 //!
 //! Provides thread-safe caching of facts and rules with support for
-//! real-time updates via firehose subscription.
+//! real-time updates via Jetstream subscription.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use dashmap::DashMap;
-use tokio::sync::{Mutex, RwLock, broadcast};
-use tracing::{debug, trace, warn};
-
-/// Maximum number of pending firehose events to queue during sync.
-/// When exceeded, oldest events are dropped to prevent memory exhaustion.
-const MAX_PENDING_EVENTS: usize = 10_000;
+use tokio::sync::{RwLock, broadcast};
+use tracing::{debug, trace};
 
 use crate::{
     BlogEntry, CustomTool, DaemonState, Directive, Fact, FactDeclaration, Follow, Identity, Job,
-    Like, Note, Post, Repost, Rule, Thought, ToolApproval, WikiEntry, WikiLink,
+    Like, Note, Post, Repost, Rule, Thought, ToolApproval, Trigger, WikiEntry, WikiLink,
 };
 
 /// Synchronization state of the cache.
@@ -26,7 +21,7 @@ use crate::{
 pub enum SyncState {
     /// Not yet started synchronization.
     Disconnected = 0,
-    /// CAR fetch in progress, firehose events being queued.
+    /// Initial cache population in progress.
     Syncing = 1,
     /// Fully synchronized with real-time updates.
     Live = 2,
@@ -212,33 +207,14 @@ pub enum CacheUpdate {
     },
     /// A fact declaration was deleted.
     DeclarationDeleted { rkey: String },
+    /// A trigger was created.
+    TriggerCreated { rkey: String, trigger: Trigger },
+    /// A trigger was updated.
+    TriggerUpdated { rkey: String, trigger: Trigger },
+    /// A trigger was deleted.
+    TriggerDeleted { rkey: String },
     /// Daemon state was updated.
     StateUpdated { state: DaemonState },
-}
-
-/// A commit event from the firehose, queued during sync.
-#[derive(Debug, Clone)]
-pub struct FirehoseCommit {
-    /// Firehose sequence number.
-    pub seq: i64,
-    /// Repository revision.
-    pub rev: String,
-    /// Operations in this commit.
-    pub ops: Vec<FirehoseOp>,
-}
-
-/// An operation from a firehose commit.
-#[derive(Debug, Clone)]
-pub enum FirehoseOp {
-    /// Record created or updated.
-    CreateOrUpdate {
-        collection: String,
-        rkey: String,
-        cid: String,
-        record: Vec<u8>,
-    },
-    /// Record deleted.
-    Delete { collection: String, rkey: String },
 }
 
 /// In-memory cache for repository records.
@@ -287,6 +263,8 @@ pub struct RepoCache {
     wiki_links: DashMap<String, CachedRecord<WikiLink>>,
     /// Cached fact declarations by rkey.
     declarations: DashMap<String, CachedRecord<FactDeclaration>>,
+    /// Cached triggers by rkey.
+    triggers: DashMap<String, CachedRecord<Trigger>>,
     // =========================================================================
     // Sync state
     // =========================================================================
@@ -294,21 +272,17 @@ pub struct RepoCache {
     state: AtomicU8,
     /// Current repository revision.
     repo_rev: RwLock<Option<String>>,
-    /// Last seen firehose sequence number (for cursor-based reconnection).
-    firehose_seq: AtomicI64,
-    /// Pending firehose events during CAR fetch.
-    pending_events: Mutex<VecDeque<FirehoseCommit>>,
     /// Broadcast channel for cache updates.
     updates_tx: broadcast::Sender<CacheUpdate>,
-    /// Flag to suppress broadcasts during sync replay.
+    /// Flag to suppress broadcasts during bulk cache population.
     /// When true, cache mutations will not send updates to subscribers.
-    /// This prevents broadcast channel lag during firehose replay (which
+    /// This prevents broadcast channel lag during initial sync (which
     /// can trigger expensive full TSV regeneration in DatalogCache).
     suppress_broadcasts: AtomicBool,
 }
 
 /// Broadcast channel capacity for cache updates.
-/// Set high enough to handle firehose reconnection bursts without lagging,
+/// Set high enough to handle reconnection bursts without lagging,
 /// which would trigger expensive full regeneration in DatalogCache.
 const BROADCAST_CHANNEL_CAPACITY: usize = 4096;
 
@@ -335,10 +309,9 @@ impl RepoCache {
             wiki_entries: DashMap::new(),
             wiki_links: DashMap::new(),
             declarations: DashMap::new(),
+            triggers: DashMap::new(),
             state: AtomicU8::new(SyncState::Disconnected as u8),
             repo_rev: RwLock::new(None),
-            firehose_seq: AtomicI64::new(0),
-            pending_events: Mutex::new(VecDeque::new()),
             updates_tx,
             suppress_broadcasts: AtomicBool::new(false),
         })
@@ -365,26 +338,6 @@ impl RepoCache {
     /// Set the repository revision.
     pub async fn set_repo_rev(&self, rev: String) {
         *self.repo_rev.write().await = Some(rev);
-    }
-
-    /// Get the last seen firehose sequence number.
-    ///
-    /// Returns 0 if no events have been processed yet.
-    pub fn firehose_seq(&self) -> i64 {
-        self.firehose_seq.load(Ordering::SeqCst)
-    }
-
-    /// Update the firehose sequence number if the new value is greater.
-    ///
-    /// This is used to track progress through the firehose stream.
-    pub fn update_firehose_seq(&self, seq: i64) {
-        // Only update if greater (sequence numbers are monotonically increasing)
-        self.firehose_seq.fetch_max(seq, Ordering::SeqCst);
-    }
-
-    /// Reset the firehose sequence number (e.g., for full re-sync).
-    pub fn reset_firehose_seq(&self) {
-        self.firehose_seq.store(0, Ordering::SeqCst);
     }
 
     /// Subscribe to cache updates.
@@ -1481,6 +1434,77 @@ impl RepoCache {
         }
     }
 
+    // =========================================================================
+    // Trigger methods
+    // =========================================================================
+
+    /// Get a trigger by rkey.
+    pub fn get_trigger(&self, rkey: &str) -> Option<CachedRecord<Trigger>> {
+        self.triggers.get(rkey).map(|r| r.value().clone())
+    }
+
+    /// List all triggers.
+    pub fn list_triggers(&self) -> Vec<(String, CachedRecord<Trigger>)> {
+        self.triggers
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect()
+    }
+
+    /// Get the number of cached triggers.
+    pub fn trigger_count(&self) -> usize {
+        self.triggers.len()
+    }
+
+    /// Insert or update a trigger.
+    pub fn upsert_trigger(&self, rkey: String, trigger: Trigger, cid: String) {
+        use dashmap::mapref::entry::Entry;
+
+        let cached = CachedRecord {
+            value: trigger,
+            cid,
+        };
+
+        let is_update = match self.triggers.entry(rkey.clone()) {
+            Entry::Occupied(mut entry) => {
+                entry.insert(cached);
+                true
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(cached);
+                false
+            }
+        };
+
+        if let Some(cached_ref) = self.triggers.get(&rkey) {
+            let trigger_clone = cached_ref.value().value.clone();
+            let update = if is_update {
+                CacheUpdate::TriggerUpdated {
+                    rkey: rkey.clone(),
+                    trigger: trigger_clone,
+                }
+            } else {
+                CacheUpdate::TriggerCreated {
+                    rkey: rkey.clone(),
+                    trigger: trigger_clone,
+                }
+            };
+
+            self.broadcast(update);
+            trace!(rkey = %rkey, name = %cached_ref.value().value.name, "cache: trigger upserted");
+        }
+    }
+
+    /// Delete a trigger.
+    pub fn delete_trigger(&self, rkey: &str) {
+        if self.triggers.remove(rkey).is_some() {
+            self.broadcast(CacheUpdate::TriggerDeleted {
+                rkey: rkey.to_string(),
+            });
+            trace!(rkey = %rkey, "cache: trigger deleted");
+        }
+    }
+
     /// Get the cached identity.
     pub async fn get_identity(&self) -> Option<CachedRecord<Identity>> {
         self.identity.read().await.clone()
@@ -1547,61 +1571,8 @@ impl RepoCache {
         self.wiki_entries.clear();
         self.wiki_links.clear();
         self.declarations.clear();
+        self.triggers.clear();
         debug!("cache cleared");
-    }
-
-    /// Queue a firehose commit for later replay.
-    ///
-    /// If the queue exceeds `MAX_PENDING_EVENTS`, oldest commits are dropped
-    /// to prevent unbounded memory growth during slow syncs or reconnections.
-    pub async fn queue_commit(&self, commit: FirehoseCommit) {
-        let mut queue = self.pending_events.lock().await;
-
-        // Drop oldest events if queue is full to prevent memory exhaustion
-        while queue.len() >= MAX_PENDING_EVENTS {
-            queue.pop_front();
-            warn!(
-                max = MAX_PENDING_EVENTS,
-                "pending events queue full, dropping oldest commit"
-            );
-        }
-
-        queue.push_back(commit);
-
-        // Log at different levels based on queue size for diagnostics
-        let len = queue.len();
-        if len >= 5000 {
-            warn!(queue_len = len, "pending events queue is very large");
-        } else if len >= 1000 {
-            debug!(queue_len = len, "pending events queue growing");
-        } else {
-            trace!(queue_len = len, "queued firehose commit");
-        }
-    }
-
-    /// Clear all pending firehose commits.
-    ///
-    /// Called when restarting sync to discard stale events from a previous
-    /// sync attempt that are no longer relevant.
-    pub async fn clear_pending(&self) {
-        let mut queue = self.pending_events.lock().await;
-        let count = queue.len();
-        queue.clear();
-        if count > 0 {
-            debug!(count, "cleared stale pending events");
-        }
-    }
-
-    /// Drain all pending commits for replay.
-    ///
-    /// Returns all queued commits, emptying the queue.
-    pub async fn drain_pending(&self) -> Vec<FirehoseCommit> {
-        let mut queue = self.pending_events.lock().await;
-        let commits: Vec<_> = queue.drain(..).collect();
-        if !commits.is_empty() {
-            debug!(count = commits.len(), "drained pending commits for replay");
-        }
-        commits
     }
 
     /// Populate cache from CAR parse result (legacy method for facts and rules only).
@@ -1700,6 +1671,7 @@ impl RepoCache {
         blog_entries: impl IntoIterator<Item = (String, BlogEntry, String)>,
         wiki_entries: impl IntoIterator<Item = (String, WikiEntry, String)>,
         wiki_links: impl IntoIterator<Item = (String, WikiLink, String)>,
+        triggers: impl IntoIterator<Item = (String, Trigger, String)>,
     ) {
         // Winter collections
         for (rkey, fact, cid) in facts {
@@ -1791,6 +1763,17 @@ impl RepoCache {
                 .insert(rkey, CachedRecord { value: link, cid });
         }
 
+        // Triggers
+        for (rkey, trigger, cid) in triggers {
+            self.triggers.insert(
+                rkey,
+                CachedRecord {
+                    value: trigger,
+                    cid,
+                },
+            );
+        }
+
         debug!(
             facts = self.facts.len(),
             rules = self.rules.len(),
@@ -1807,6 +1790,7 @@ impl RepoCache {
             blog_entries = self.blog_entries.len(),
             wiki_entries = self.wiki_entries.len(),
             wiki_links = self.wiki_links.len(),
+            triggers = self.triggers.len(),
             "cache populated from CAR (full)"
         );
     }
@@ -1834,10 +1818,9 @@ impl Default for RepoCache {
             wiki_entries: DashMap::new(),
             wiki_links: DashMap::new(),
             declarations: DashMap::new(),
+            triggers: DashMap::new(),
             state: AtomicU8::new(SyncState::Disconnected as u8),
             repo_rev: RwLock::new(None),
-            firehose_seq: AtomicI64::new(0),
-            pending_events: Mutex::new(VecDeque::new()),
             updates_tx,
             suppress_broadcasts: AtomicBool::new(false),
         }
@@ -1858,6 +1841,7 @@ mod tests {
             supersedes: None,
             tags: vec![],
             created_at: Utc::now(),
+            expires_at: None,
         }
     }
 
@@ -2143,85 +2127,6 @@ mod tests {
         assert_eq!(cache.repo_rev().await, Some("rev123".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_pending_events_queue() {
-        let cache = RepoCache::new();
-
-        // Queue some commits
-        let commit1 = FirehoseCommit {
-            seq: 1,
-            rev: "rev1".to_string(),
-            ops: vec![],
-        };
-        let commit2 = FirehoseCommit {
-            seq: 2,
-            rev: "rev2".to_string(),
-            ops: vec![],
-        };
-
-        cache.queue_commit(commit1).await;
-        cache.queue_commit(commit2).await;
-
-        // Drain and verify order
-        let drained = cache.drain_pending().await;
-        assert_eq!(drained.len(), 2);
-        assert_eq!(drained[0].rev, "rev1");
-        assert_eq!(drained[1].rev, "rev2");
-
-        // Should be empty now
-        let empty = cache.drain_pending().await;
-        assert!(empty.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_pending_events_queue_bounded() {
-        let cache = RepoCache::new();
-
-        // Queue more than MAX_PENDING_EVENTS commits
-        for i in 0..(MAX_PENDING_EVENTS + 100) {
-            let commit = FirehoseCommit {
-                seq: i as i64,
-                rev: format!("rev{}", i),
-                ops: vec![],
-            };
-            cache.queue_commit(commit).await;
-        }
-
-        // Drain and verify we only have MAX_PENDING_EVENTS
-        let drained = cache.drain_pending().await;
-        assert_eq!(drained.len(), MAX_PENDING_EVENTS);
-
-        // Verify oldest were dropped (first 100 should be missing)
-        // The remaining commits should be rev100 through rev10099
-        assert_eq!(drained[0].rev, "rev100");
-        assert_eq!(
-            drained[MAX_PENDING_EVENTS - 1].rev,
-            format!("rev{}", MAX_PENDING_EVENTS + 99)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_clear_pending() {
-        let cache = RepoCache::new();
-
-        // Queue some commits
-        for i in 0..10 {
-            let commit = FirehoseCommit {
-                seq: i as i64,
-                rev: format!("rev{}", i),
-                ops: vec![],
-            };
-            cache.queue_commit(commit).await;
-        }
-
-        // Clear pending
-        cache.clear_pending().await;
-
-        // Drain should return empty
-        let drained = cache.drain_pending().await;
-        assert!(drained.is_empty());
-    }
-
     #[test]
     fn test_subscribe_updates() {
         let cache = RepoCache::new();
@@ -2241,27 +2146,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_firehose_seq_tracking() {
-        let cache = RepoCache::new();
-
-        // Initially 0
-        assert_eq!(cache.firehose_seq(), 0);
-
-        // Update increases the value
-        cache.update_firehose_seq(100);
-        assert_eq!(cache.firehose_seq(), 100);
-
-        // Update with higher value succeeds
-        cache.update_firehose_seq(200);
-        assert_eq!(cache.firehose_seq(), 200);
-
-        // Update with lower value is ignored (monotonic increase)
-        cache.update_firehose_seq(150);
-        assert_eq!(cache.firehose_seq(), 200);
-
-        // Reset clears the value
-        cache.reset_firehose_seq();
-        assert_eq!(cache.firehose_seq(), 0);
-    }
 }

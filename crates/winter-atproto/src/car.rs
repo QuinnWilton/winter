@@ -1,6 +1,7 @@
 //! CAR file parsing for ATProto repositories.
 //!
 //! Parses CAR v1 files and extracts records from the ATProto MST structure.
+//! Used for fast initial cache hydration (single HTTP request for entire repo).
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -14,7 +15,7 @@ use crate::dispatch::extract_record_to_result;
 use crate::{
     AtprotoError, BlogEntry, CustomTool, DaemonState, Directive, Fact, FactDeclaration, Follow,
     IDENTITY_COLLECTION, IDENTITY_KEY, Identity, Job, Like, Note, Post, Repost, Rule,
-    STATE_COLLECTION, STATE_KEY, Thought, ToolApproval, WikiEntry, WikiLink,
+    STATE_COLLECTION, STATE_KEY, Thought, ToolApproval, Trigger, WikiEntry, WikiLink,
 };
 
 /// Result of parsing a CAR file.
@@ -64,9 +65,11 @@ pub struct CarParseResult {
     pub wiki_entries: HashMap<String, (WikiEntry, String)>,
     /// Wiki links extracted from the repo, keyed by rkey.
     pub wiki_links: HashMap<String, (WikiLink, String)>,
+    /// Triggers extracted from the repo, keyed by rkey.
+    pub triggers: HashMap<String, (Trigger, String)>,
 }
 
-/// Parse a CAR file and extract Winter facts and rules.
+/// Parse a CAR file and extract all records.
 ///
 /// The CAR file contains:
 /// 1. A header with roots
@@ -139,6 +142,7 @@ pub async fn parse_car(car_bytes: &[u8]) -> Result<CarParseResult, AtprotoError>
         blog_entries = result.blog_entries.len(),
         wiki_entries = result.wiki_entries.len(),
         wiki_links = result.wiki_links.len(),
+        triggers = result.triggers.len(),
         has_identity = result.identity.is_some(),
         has_daemon_state = result.daemon_state.is_some(),
         "extracted records from CAR"
@@ -246,7 +250,6 @@ where
 
 /// Parse a CBOR-encoded value.
 fn parse_cbor<T: DeserializeOwned>(data: &[u8]) -> Result<T, AtprotoError> {
-    // Use serde_ipld_dagcbor for proper CBOR parsing
     serde_ipld_dagcbor::from_slice(data).map_err(|e| AtprotoError::CborDecode(format!("{}", e)))
 }
 
@@ -411,6 +414,7 @@ mod tests {
         let result = CarParseResult::default();
         assert!(result.facts.is_empty());
         assert!(result.rules.is_empty());
+        assert!(result.triggers.is_empty());
         assert!(result.rev.is_none());
     }
 
@@ -458,7 +462,8 @@ mod tests {
         let mut result = CarParseResult::default();
 
         // Unknown collection should be skipped
-        let outcome = extract_record("app.bsky.feed.post/rkey123", "cid123", &blocks, &mut result);
+        let outcome =
+            extract_record("com.example.unknown/rkey123", "cid123", &blocks, &mut result);
         assert!(outcome.is_ok());
         assert!(result.facts.is_empty());
         assert!(result.rules.is_empty());

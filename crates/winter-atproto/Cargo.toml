@@ -28,15 +28,15 @@ tracing = { workspace = true }
 # Base64 for auth
 base64 = { workspace = true }
 
-# CAR file parsing and firehose
-iroh-car = { workspace = true }
+# WebSocket (Jetstream)
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
+
+# CBOR/CAR (initial cache hydration from repo snapshot)
 serde_ipld_dagcbor = { workspace = true }
-ipld-core = { workspace = true }
-ciborium = { workspace = true }
-multibase = { workspace = true }
 serde_bytes = { workspace = true }
+iroh-car = { workspace = true }
+ipld-core = { workspace = true }
 
 # Concurrent data structures
 dashmap = { workspace = true }
@@ -46,8 +46,6 @@ crossbeam = { workspace = true }
 backoff = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
-proptest-state-machine = { workspace = true }
 insta = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }

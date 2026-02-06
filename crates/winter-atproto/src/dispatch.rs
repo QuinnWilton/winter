@@ -1,13 +1,13 @@
-//! Record dispatch macro for unified collection handling.
+//! Record dispatch for unified collection handling.
 //!
 //! This module provides a macro-generated dispatch system that eliminates
-//! repetitive boilerplate in firehose and CAR parsing code.
+//! repetitive boilerplate in Jetstream event processing and CAR file parsing.
 //!
 //! The `define_record_dispatch!` macro generates:
 //! - `is_tracked_collection()` - check if a collection is tracked
-//! - `dispatch_create_or_update()` - decode CBOR and upsert to cache
+//! - `dispatch_create_or_update_json()` - decode JSON and upsert to cache (Jetstream)
 //! - `dispatch_delete()` - delete from cache
-//! - `extract_record_to_result()` - extract from CAR blocks to CarParseResult
+//! - `extract_record_to_result()` - decode CBOR and insert into CarParseResult (CAR hydration)
 //!
 //! # Adding a New Collection
 //!
@@ -40,14 +40,7 @@
 //! - Initialize the field in `new()` and `Default`
 //! - Clear it in `clear()`
 //!
-//! ## 3. Add to CarParseResult
-//!
-//! In `car.rs`, add a field to `CarParseResult`:
-//! ```ignore
-//! pub my_records: HashMap<String, (MyRecord, String)>,
-//! ```
-//!
-//! ## 4. Add to the dispatch macro (THIS FILE)
+//! ## 3. Add to the dispatch macro (THIS FILE)
 //!
 //! Add a single line to the `define_record_dispatch!` invocation:
 //!
@@ -59,16 +52,9 @@
 //! @insert crate::MY_COLLECTION => crate::MyRecord, insert_my_record, delete_my_record, my_records;
 //! ```
 //!
-//! ## 5. Update sync.rs (if needed)
+//! The last field is the `CarParseResult` field name for CAR file parsing.
 //!
-//! If the record should be populated from CAR during initial sync, add it to
-//! `populate_from_car_full()` in `sync.rs`:
-//! ```ignore
-//! let my_records = parse_result.my_records.into_iter()
-//!     .map(|(rkey, (record, cid))| (rkey, record, cid));
-//! ```
-//!
-//! ## 6. Export the type
+//! ## 4. Export the type
 //!
 //! In `lib.rs`, ensure the type and collection constant are exported.
 //!
@@ -78,55 +64,26 @@
 //!
 //! Singletons have a fixed rkey (e.g., "self") and often require async handling.
 //! These are NOT added to the dispatch macro. Instead:
-//! - They return `false` from `dispatch_create_or_update()` / `extract_record_to_result()`
-//! - Handle them explicitly in `firehose.rs::apply_create_or_update()` and
-//!   `car.rs::extract_record()`
+//! - They return `false` from `dispatch_create_or_update_json()`
+//! - Handle them explicitly in `jetstream.rs::handle_commit()` and `car.rs::extract_record()`
 //!
 //! ## CacheUpdate Events
 //!
 //! If you need to broadcast cache updates for the new type, add variants to
 //! `CacheUpdate` in `cache.rs` and emit them from your upsert/delete methods.
-//!
-//! # Example: Adding a Bookmark Collection
-//!
-//! ```ignore
-//! // 1. types.rs
-//! pub const BOOKMARK_COLLECTION: &str = "diy.razorgirl.winter.bookmark";
-//!
-//! #[derive(Debug, Clone, Serialize, Deserialize)]
-//! pub struct Bookmark {
-//!     pub uri: String,
-//!     pub created_at: DateTime<Utc>,
-//! }
-//!
-//! // 2. cache.rs - add DashMap field, methods, init in new()/Default, clear()
-//!
-//! // 3. car.rs - add to CarParseResult
-//! pub bookmarks: HashMap<String, (Bookmark, String)>,
-//!
-//! // 4. dispatch.rs - add ONE line:
-//! crate::BOOKMARK_COLLECTION => crate::Bookmark, upsert_bookmark, delete_bookmark, bookmarks;
-//!
-//! // 5. sync.rs - add to populate_from_car_full() call
-//!
-//! // 6. lib.rs - export Bookmark and BOOKMARK_COLLECTION
-//! ```
-//!
-//! That's it! The dispatch macro handles firehose and CAR parsing automatically.
 
-use tracing::{trace, warn};
+use tracing::trace;
 
 use crate::AtprotoError;
 use crate::cache::RepoCache;
-use crate::car::CarParseResult;
 
 /// Macro to define record dispatch for all tracked collections.
 ///
 /// This macro generates the dispatch functions that handle:
 /// 1. Checking if a collection is tracked
-/// 2. Decoding CBOR and upserting to cache (firehose)
-/// 3. Deleting from cache (firehose)
-/// 4. Extracting records from CAR blocks
+/// 2. Deserializing JSON and upserting to cache (Jetstream live updates)
+/// 3. Deleting from cache
+/// 4. Deserializing CBOR and inserting into CarParseResult (CAR initial hydration)
 ///
 /// # Syntax
 ///
@@ -169,27 +126,23 @@ macro_rules! define_record_dispatch {
             collection == crate::IDENTITY_COLLECTION || collection == crate::STATE_COLLECTION
         }
 
-        /// Dispatch a create/update operation to the cache.
+        /// Dispatch a create/update operation to the cache from JSON.
         ///
-        /// Decodes the CBOR record and calls the appropriate cache upsert method.
+        /// Deserializes the JSON record and calls the appropriate cache upsert method.
         /// Returns Ok(true) if the record was handled, Ok(false) if it's a special
         /// collection that needs separate handling.
-        pub fn dispatch_create_or_update(
+        pub fn dispatch_create_or_update_json(
             cache: &RepoCache,
             collection: &str,
             rkey: &str,
             cid: &str,
-            record: &[u8],
+            record: serde_json::Value,
         ) -> Result<bool, AtprotoError> {
             // Regular upsert records
             $(
                 if collection == $collection {
-                    let value: $type = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
-                        AtprotoError::CborDecode(format!(
-                            "failed to decode {}: {}",
-                            stringify!($type),
-                            e
-                        ))
+                    let value: $type = serde_json::from_value(record).map_err(|e| {
+                        AtprotoError::Json(e)
                     })?;
                     cache.$upsert(rkey.to_string(), value, cid.to_string());
                     return Ok(true);
@@ -198,12 +151,8 @@ macro_rules! define_record_dispatch {
             // Insert-only records
             $(
                 if collection == $ins_collection {
-                    let value: $ins_type = serde_ipld_dagcbor::from_slice(record).map_err(|e| {
-                        AtprotoError::CborDecode(format!(
-                            "failed to decode {}: {}",
-                            stringify!($ins_type),
-                            e
-                        ))
+                    let value: $ins_type = serde_json::from_value(record).map_err(|e| {
+                        AtprotoError::Json(e)
                     })?;
                     cache.$insert(rkey.to_string(), value, cid.to_string());
                     return Ok(true);
@@ -245,54 +194,63 @@ macro_rules! define_record_dispatch {
             trace!(collection = %collection, rkey = %rkey, "ignoring unknown collection in delete");
         }
 
-        /// Extract a record from CAR blocks into CarParseResult.
+        /// Extract a record from CBOR data into a CarParseResult.
         ///
-        /// Returns true if the collection was handled, false if it needs
-        /// special handling (identity, daemon_state).
+        /// Used during CAR file parsing for initial cache hydration.
+        /// Returns true if the collection was handled (even if parsing failed),
+        /// false if the collection is not recognized by the dispatch macro.
         pub fn extract_record_to_result(
             collection: &str,
             rkey: &str,
-            cid: &str,
+            value_cid: &str,
             data: &[u8],
-            result: &mut CarParseResult,
+            result: &mut crate::car::CarParseResult,
         ) -> bool {
             // Regular records
             $(
                 if collection == $collection {
                     match serde_ipld_dagcbor::from_slice::<$type>(data) {
                         Ok(value) => {
-                            trace!(rkey = %rkey, "extracted {}", stringify!($type));
-                            result.$car_field.insert(rkey.to_string(), (value, cid.to_string()));
+                            result.$car_field.insert(
+                                rkey.to_string(),
+                                (value, value_cid.to_string()),
+                            );
                         }
                         Err(e) => {
-                            warn!(rkey = %rkey, error = %e, "failed to parse {}", stringify!($type));
+                            tracing::warn!(
+                                collection = %collection,
+                                rkey = %rkey,
+                                error = %e,
+                                "failed to parse CBOR record"
+                            );
                         }
                     }
                     return true;
                 }
             )*
-            // Insert-only records (same extraction logic)
+            // Insert-only records
             $(
                 if collection == $ins_collection {
                     match serde_ipld_dagcbor::from_slice::<$ins_type>(data) {
                         Ok(value) => {
-                            trace!(rkey = %rkey, "extracted {}", stringify!($ins_type));
-                            result.$ins_car_field.insert(rkey.to_string(), (value, cid.to_string()));
+                            result.$ins_car_field.insert(
+                                rkey.to_string(),
+                                (value, value_cid.to_string()),
+                            );
                         }
                         Err(e) => {
-                            warn!(rkey = %rkey, error = %e, "failed to parse {}", stringify!($ins_type));
+                            tracing::warn!(
+                                collection = %collection,
+                                rkey = %rkey,
+                                error = %e,
+                                "failed to parse CBOR record"
+                            );
                         }
                     }
                     return true;
                 }
             )*
-            // Special collections need separate handling
-            if collection == crate::IDENTITY_COLLECTION || collection == crate::STATE_COLLECTION {
-                return false;
-            }
-            // Unknown collection
-            trace!(collection = %collection, rkey = %rkey, "skipping unknown collection");
-            true
+            false
         }
     };
 }
@@ -303,7 +261,7 @@ macro_rules! define_record_dispatch {
 // - Collection constants
 // - Record types
 // - Cache methods (upsert/insert and delete)
-// - CarParseResult fields
+// - CarParseResult fields (for CAR initial hydration)
 //
 // Special collections (identity, daemon_state) are handled separately
 // because they have async requirements or singleton key checks.
@@ -318,6 +276,7 @@ define_record_dispatch! {
     crate::FACT_DECLARATION_COLLECTION => crate::FactDeclaration, upsert_declaration, delete_declaration, declarations;
     crate::TOOL_COLLECTION => crate::CustomTool, upsert_tool, delete_tool, tools;
     crate::TOOL_APPROVAL_COLLECTION => crate::ToolApproval, upsert_tool_approval, delete_tool_approval, tool_approvals;
+    crate::TRIGGER_COLLECTION => crate::Trigger, upsert_trigger, delete_trigger, triggers;
     // Bluesky collections (posts can be updated)
     crate::POST_COLLECTION => crate::Post, upsert_post, delete_post, posts;
     // WhiteWind blog
@@ -347,6 +306,11 @@ mod tests {
         assert!(is_tracked_collection(FACT_DECLARATION_COLLECTION));
         assert!(is_tracked_collection(TOOL_COLLECTION));
         assert!(is_tracked_collection(TOOL_APPROVAL_COLLECTION));
+    }
+
+    #[test]
+    fn test_is_tracked_collection_trigger() {
+        assert!(is_tracked_collection(crate::TRIGGER_COLLECTION));
     }
 
     #[test]
@@ -389,34 +353,30 @@ mod tests {
     }
 
     #[test]
-    fn test_dispatch_create_unknown_collection() {
+    fn test_dispatch_create_json_unknown_collection() {
         let cache = RepoCache::new();
-        let result = dispatch_create_or_update(&cache, "unknown.collection", "rkey", "cid", &[]);
+        let result = dispatch_create_or_update_json(
+            &cache,
+            "unknown.collection",
+            "rkey",
+            "cid",
+            serde_json::json!({}),
+        );
         // Unknown collections return Ok(true) but don't do anything
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_dispatch_create_special_collection() {
+    fn test_dispatch_create_json_special_collection() {
         let cache = RepoCache::new();
-        let result = dispatch_create_or_update(&cache, IDENTITY_COLLECTION, "self", "cid", &[]);
+        let result = dispatch_create_or_update_json(
+            &cache,
+            IDENTITY_COLLECTION,
+            "self",
+            "cid",
+            serde_json::json!({}),
+        );
         // Special collections return Ok(false) for separate handling
         assert!(matches!(result, Ok(false)));
-    }
-
-    #[test]
-    fn test_extract_record_unknown_collection() {
-        let mut result = CarParseResult::default();
-        let handled =
-            extract_record_to_result("unknown.collection", "rkey", "cid", &[], &mut result);
-        assert!(handled); // Unknown collections are "handled" (skipped)
-    }
-
-    #[test]
-    fn test_extract_record_special_collection() {
-        let mut result = CarParseResult::default();
-        let handled =
-            extract_record_to_result(IDENTITY_COLLECTION, "self", "cid", &[], &mut result);
-        assert!(!handled); // Special collections need separate handling
     }
 }

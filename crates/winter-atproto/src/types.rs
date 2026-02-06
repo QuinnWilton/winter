@@ -80,70 +80,7 @@ impl From<&str> for Tid {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StrongRef {
     pub uri: String,
-    /// CID can be either a string (JSON) or a CBOR CID link (tag 42).
-    #[serde(deserialize_with = "deserialize_cid_as_string")]
     pub cid: String,
-}
-
-/// Deserialize a CID field that could be either a string or a CBOR CID link.
-///
-/// In DAG-CBOR, CIDs are encoded as links (tag 42), while in JSON they're strings.
-/// This deserializer handles both formats.
-fn deserialize_cid_as_string<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::{self, Visitor};
-
-    struct CidVisitor;
-
-    impl<'de> Visitor<'de> for CidVisitor {
-        type Value = String;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a CID as a string or CBOR link")
-        }
-
-        // Handle string CIDs (JSON format)
-        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(value.to_string())
-        }
-
-        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            Ok(value)
-        }
-
-        // Handle CBOR CID links (bytes with tag 42)
-        fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
-        where
-            E: de::Error,
-        {
-            // Parse as CID from bytes
-            use ipld_core::cid::Cid;
-            let cid = Cid::read_bytes(value)
-                .map_err(|e| de::Error::custom(format!("failed to parse CID from bytes: {}", e)))?;
-            Ok(cid.to_string())
-        }
-
-        // Handle newtype struct (how serde_ipld_dagcbor wraps CID links)
-        fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            // serde_ipld_dagcbor wraps CID links as newtype structs containing Cid
-            use ipld_core::cid::Cid;
-            let cid = Cid::deserialize(deserializer)?;
-            Ok(cid.to_string())
-        }
-    }
-
-    deserializer.deserialize_any(CidVisitor)
 }
 
 /// Deserialize a field that may be null as the type's default value.
@@ -440,6 +377,9 @@ pub struct Fact {
     pub tags: Vec<String>,
     /// When this fact was created.
     pub created_at: DateTime<Utc>,
+    /// Optional expiration timestamp. Facts past this time are excluded from default queries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 /// Serialize confidence as a string for ATProto compatibility.
@@ -1258,6 +1198,52 @@ pub struct Directive {
     pub last_updated: Option<DateTime<Utc>>,
 }
 
+/// Action to perform when a trigger's condition is satisfied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TriggerAction {
+    /// Create a new fact record.
+    CreateFact {
+        predicate: String,
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tags: Vec<String>,
+    },
+    /// Push an item to the inbox.
+    CreateInboxItem {
+        message: String,
+    },
+    /// Delete a fact record by rkey.
+    DeleteFact {
+        rkey: String,
+    },
+}
+
+/// Trigger record (diy.razorgirl.winter.trigger).
+///
+/// Defines a condition (datalog query) and an action to execute when the
+/// condition yields new results. Evaluated periodically by the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Trigger {
+    /// Human-readable name for this trigger.
+    pub name: String,
+    /// Description of what this trigger does.
+    pub description: String,
+    /// Datalog query that defines the trigger condition.
+    pub condition: String,
+    /// Extra datalog rules for the condition query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition_rules: Option<String>,
+    /// Action to perform when the condition yields new results.
+    pub action: TriggerAction,
+    /// Whether this trigger is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// When this trigger was created.
+    pub created_at: DateTime<Utc>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1409,6 +1395,7 @@ mod tests {
             supersedes: None,
             tags: vec!["agent".to_string(), "phenomenology".to_string()],
             created_at: Utc.with_ymd_and_hms(2026, 2, 2, 12, 0, 0).unwrap(),
+            expires_at: None,
         };
 
         let json = serde_json::to_string_pretty(&fact).unwrap();
@@ -1453,6 +1440,7 @@ mod tests {
             supersedes: None,
             tags: vec![],
             created_at: Utc.with_ymd_and_hms(2026, 2, 2, 12, 0, 0).unwrap(),
+            expires_at: None,
         };
 
         let json = serde_json::to_string_pretty(&fact).unwrap();
@@ -1539,24 +1527,13 @@ mod tests {
     }
 
     #[test]
-    fn strong_ref_deserializes_from_cbor_with_cid_link() {
-        use ipld_core::cid::Cid;
-
-        // Create a real CID for testing
-        let cid: Cid = "bafyreig6fcgjwnxmqojqjwmvhpayivpsyfjtaqt42bvxfv5nzjvrlvveoy"
-            .parse()
-            .unwrap();
-
-        // Build CBOR with a proper CID link
-        // StrongRef has fields: uri (string) and cid (CID link)
-        let cbor_value = serde_ipld_dagcbor::to_vec(&serde_json::json!({
+    fn strong_ref_deserializes_from_json() {
+        let json = serde_json::json!({
             "uri": "at://did:plc:test/app.bsky.feed.post/abc",
-            "cid": cid.to_string()
-        }))
-        .unwrap();
+            "cid": "bafyreig6fcgjwnxmqojqjwmvhpayivpsyfjtaqt42bvxfv5nzjvrlvveoy"
+        });
 
-        // This tests that string CIDs work in CBOR
-        let strong_ref: StrongRef = serde_ipld_dagcbor::from_slice(&cbor_value).unwrap();
+        let strong_ref: StrongRef = serde_json::from_value(json).unwrap();
         assert_eq!(strong_ref.uri, "at://did:plc:test/app.bsky.feed.post/abc");
         assert_eq!(
             strong_ref.cid,

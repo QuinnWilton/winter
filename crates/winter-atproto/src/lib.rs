@@ -6,33 +6,27 @@
 //! ## Features
 //!
 //! - **HTTP Client**: XRPC client for record CRUD operations
-//! - **CAR Parsing**: Parse CAR files from `getRepo`
-//! - **Firehose**: WebSocket subscription to `subscribeRepos`
+//! - **Jetstream**: JSON WebSocket subscription for real-time updates
 //! - **Cache**: Thread-safe in-memory cache for facts and rules
-//! - **Sync**: Coordinator for CAR hydration with firehose subscription
+//! - **Sync**: Coordinator for list_all_records hydration with Jetstream subscription
 
 pub mod cache;
 pub mod car;
 mod client;
 pub mod dispatch;
 mod error;
-pub mod firehose;
+pub mod jetstream;
 mod records;
 pub mod sync;
 mod types;
 mod uri;
 
-pub use cache::{
-    CacheUpdate, CachedRecord, FirehoseCommit, FirehoseOp, RepoCache, ScopeFilter, SyncState,
-};
-pub use dispatch::{
-    dispatch_create_or_update, dispatch_delete, extract_record_to_result, is_tracked_collection,
-};
-// Re-export FactDeclaration types explicitly for clarity
+pub use cache::{CacheUpdate, CachedRecord, RepoCache, ScopeFilter, SyncState};
 pub use car::{CarParseResult, parse_car};
+pub use dispatch::{dispatch_create_or_update_json, dispatch_delete, extract_record_to_result, is_tracked_collection};
 pub use client::{ApplyWritesResponse, AtprotoClient, CommitInfo, WriteOp, WriteResult};
 pub use error::AtprotoError;
-pub use firehose::{DEFAULT_FIREHOSE_URL, FirehoseClient, firehose_url_for_pds, resolve_firehose_url};
+pub use jetstream::{DEFAULT_JETSTREAM_URL, JetstreamClient, OperatorEvent, OperatorEventCallback};
 pub use records::*;
 pub use sync::{SyncCoordinator, SyncCoordinatorBuilder};
 pub use types::*;

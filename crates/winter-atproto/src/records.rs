@@ -42,6 +42,9 @@ pub const WIKI_ENTRY_COLLECTION: &str = "diy.razorgirl.winter.wikiEntry";
 /// Lexicon NSID for Winter wiki link records.
 pub const WIKI_LINK_COLLECTION: &str = "diy.razorgirl.winter.wikiLink";
 
+/// Lexicon NSID for Winter trigger records.
+pub const TRIGGER_COLLECTION: &str = "diy.razorgirl.winter.trigger";
+
 /// Lexicon NSID for WhiteWind blog entry records.
 pub const BLOG_COLLECTION: &str = "com.whtwnd.blog.entry";
 

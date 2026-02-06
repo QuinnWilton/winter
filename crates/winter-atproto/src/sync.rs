@@ -1,33 +1,37 @@
-//! Sync coordinator for cache hydration and firehose subscription.
+//! Sync coordinator for cache hydration and Jetstream subscription.
 //!
 //! Orchestrates the startup sequence:
-//! 1. Start firehose (queue events)
-//! 2. Fetch CAR file
-//! 3. Parse and populate cache
-//! 4. Replay queued events
-//! 5. Go live
+//! 1. Download full repo as CAR file (single HTTP request)
+//! 2. Parse MST and populate cache
+//! 3. Start Jetstream WebSocket for live updates
 
 use std::sync::Arc;
 
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
 use crate::cache::{RepoCache, SyncState};
-use crate::car::parse_car;
-use crate::firehose::{DEFAULT_FIREHOSE_URL, FirehoseClient, apply_commit};
+use crate::car;
+use crate::jetstream::{
+    DEFAULT_JETSTREAM_URL, JetstreamClient, OperatorEventCallback,
+};
 use crate::{AtprotoClient, AtprotoError};
 
 /// Sync coordinator for managing cache synchronization.
 pub struct SyncCoordinator {
-    /// ATProto client for fetching CAR files.
+    /// ATProto client for fetching records.
     client: AtprotoClient,
     /// DID of the repository to sync.
     did: String,
-    /// Firehose URL.
-    firehose_url: String,
+    /// Jetstream URL.
+    jetstream_url: String,
     /// Cache to populate.
     cache: Arc<RepoCache>,
+    /// Operator DID for watching tool approvals.
+    operator_did: Option<String>,
+    /// Callback for operator events (tool approvals, etc.).
+    operator_callback: Option<OperatorEventCallback>,
 }
 
 impl SyncCoordinator {
@@ -36,14 +40,31 @@ impl SyncCoordinator {
         Self {
             client,
             did: did.into(),
-            firehose_url: DEFAULT_FIREHOSE_URL.to_string(),
+            jetstream_url: DEFAULT_JETSTREAM_URL.to_string(),
             cache,
+            operator_did: None,
+            operator_callback: None,
         }
     }
 
-    /// Set a custom firehose URL.
-    pub fn with_firehose_url(mut self, url: impl Into<String>) -> Self {
-        self.firehose_url = url.into();
+    /// Set a custom Jetstream URL.
+    pub fn with_jetstream_url(mut self, url: impl Into<String>) -> Self {
+        self.jetstream_url = url.into();
+        self
+    }
+
+    /// Set the operator DID for watching tool approvals via Jetstream.
+    pub fn with_operator_did(mut self, did: impl Into<String>) -> Self {
+        let did = did.into();
+        if !did.is_empty() {
+            self.operator_did = Some(did);
+        }
+        self
+    }
+
+    /// Set a callback for operator events from Jetstream.
+    pub fn with_operator_callback(mut self, callback: OperatorEventCallback) -> Self {
+        self.operator_callback = Some(callback);
         self
     }
 
@@ -54,152 +75,22 @@ impl SyncCoordinator {
 
     /// Start synchronization.
     ///
-    /// This spawns a firehose listener task, fetches the CAR file,
-    /// populates the cache, replays queued events, and goes live.
+    /// This downloads the full repo as a CAR file, parses the MST,
+    /// populates the cache, then starts a Jetstream WebSocket for live updates.
     ///
-    /// Returns a handle to the firehose task.
+    /// Returns a handle to the Jetstream task.
     pub async fn start(
         &self,
         shutdown_rx: watch::Receiver<bool>,
     ) -> Result<JoinHandle<()>, AtprotoError> {
-        info!(did = %self.did, firehose = %self.firehose_url, "starting sync coordinator");
-
-        // Clear any stale pending events from a previous sync attempt
-        // This prevents unbounded queue growth on reconnection
-        self.cache.clear_pending().await;
+        info!(did = %self.did, jetstream = %self.jetstream_url, "starting sync coordinator");
 
         // Set state to syncing
         self.cache.set_state(SyncState::Syncing);
 
-        // 1. Spawn firehose listener (starts queuing events immediately)
-        let firehose = FirehoseClient::new(
-            self.firehose_url.clone(),
-            self.did.clone(),
-            Arc::clone(&self.cache),
-        );
-
-        let firehose_handle = {
-            let shutdown_rx = shutdown_rx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = firehose.run(shutdown_rx).await {
-                    error!(error = %e, "firehose task failed");
-                }
-            })
-        };
-
-        // Give the firehose a moment to connect
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-        // 2. Fetch CAR file
-        info!(did = %self.did, "fetching repository CAR");
-        let (car_bytes, repo_rev) = self.client.get_repo(&self.did).await?;
-
-        info!(
-            size = car_bytes.len(),
-            rev = ?repo_rev,
-            "fetched CAR file"
-        );
-
-        // 3. Parse CAR and populate cache
-        let parse_result = parse_car(&car_bytes).await?;
-
-        // Store the repo revision
-        if let Some(ref rev) = parse_result.rev {
-            self.cache.set_repo_rev(rev.clone()).await;
-        } else if let Some(ref rev) = repo_rev {
-            self.cache.set_repo_rev(rev.clone()).await;
-        }
-
-        // Populate cache from parsed CAR
-        let facts = parse_result
-            .facts
-            .into_iter()
-            .map(|(rkey, (fact, cid))| (rkey, fact, cid));
-        let rules = parse_result
-            .rules
-            .into_iter()
-            .map(|(rkey, (rule, cid))| (rkey, rule, cid));
-        let thoughts = parse_result
-            .thoughts
-            .into_iter()
-            .map(|(rkey, (thought, cid))| (rkey, thought, cid));
-        let notes = parse_result
-            .notes
-            .into_iter()
-            .map(|(rkey, (note, cid))| (rkey, note, cid));
-        let jobs = parse_result
-            .jobs
-            .into_iter()
-            .map(|(rkey, (job, cid))| (rkey, job, cid));
-        let follows = parse_result
-            .follows
-            .into_iter()
-            .map(|(rkey, (follow, cid))| (rkey, follow, cid));
-        let likes = parse_result
-            .likes
-            .into_iter()
-            .map(|(rkey, (like, cid))| (rkey, like, cid));
-        let reposts = parse_result
-            .reposts
-            .into_iter()
-            .map(|(rkey, (repost, cid))| (rkey, repost, cid));
-        let posts = parse_result
-            .posts
-            .into_iter()
-            .map(|(rkey, (post, cid))| (rkey, post, cid));
-        let directives = parse_result
-            .directives
-            .into_iter()
-            .map(|(rkey, (directive, cid))| (rkey, directive, cid));
-        let declarations = parse_result
-            .declarations
-            .into_iter()
-            .map(|(rkey, (declaration, cid))| (rkey, declaration, cid));
-        let tools = parse_result
-            .tools
-            .into_iter()
-            .map(|(rkey, (tool, cid))| (rkey, tool, cid));
-        let tool_approvals = parse_result
-            .tool_approvals
-            .into_iter()
-            .map(|(rkey, (approval, cid))| (rkey, approval, cid));
-        let blog_entries = parse_result
-            .blog_entries
-            .into_iter()
-            .map(|(rkey, (entry, cid))| (rkey, entry, cid));
-        let wiki_entries = parse_result
-            .wiki_entries
-            .into_iter()
-            .map(|(rkey, (entry, cid))| (rkey, entry, cid));
-        let wiki_links = parse_result
-            .wiki_links
-            .into_iter()
-            .map(|(rkey, (link, cid))| (rkey, link, cid));
-
-        self.cache.populate_from_car_full(
-            facts,
-            rules,
-            thoughts,
-            notes,
-            jobs,
-            parse_result.identity,
-            follows,
-            likes,
-            reposts,
-            posts,
-            directives,
-            declarations,
-            tools,
-            tool_approvals,
-            blog_entries,
-            wiki_entries,
-            wiki_links,
-        );
-
-        // Populate daemon state if present (contains followers list)
-        if let Some((state, cid)) = parse_result.daemon_state {
-            self.cache.set_daemon_state(state, cid).await;
-        }
+        // 1. Download and parse CAR file
+        info!(did = %self.did, "downloading repo CAR file");
+        self.populate_cache().await?;
 
         info!(
             facts = self.cache.fact_count(),
@@ -207,40 +98,32 @@ impl SyncCoordinator {
             "cache populated from CAR"
         );
 
-        // 4. Replay queued firehose events
-        // Suppress broadcasts during replay to prevent broadcast channel lag,
-        // which would trigger expensive full TSV regeneration in DatalogCache.
-        // The Synchronized event (sent when going Live) will trigger
-        // populate_from_repo_cache() to do a full sync instead.
-        let current_rev = self.cache.repo_rev().await;
-        let pending = self.cache.drain_pending().await;
+        // 2. Go live
+        self.cache.set_state(SyncState::Live);
 
-        debug!(
-            pending = pending.len(),
-            "replaying pending firehose events (broadcasts suppressed)"
+        // 3. Start Jetstream for live updates
+        let mut jetstream = JetstreamClient::new(
+            self.jetstream_url.clone(),
+            self.did.clone(),
+            Arc::clone(&self.cache),
         );
-        self.cache.set_suppress_broadcasts(true);
 
-        for commit in pending {
-            // Skip events already included in CAR (based on revision comparison)
-            if let Some(ref car_rev) = current_rev
-                && commit.rev <= *car_rev
-            {
-                trace_skip_commit(&commit.rev, car_rev);
-                continue;
-            }
-
-            // Apply the commit
-            if let Err(e) = apply_commit(&self.cache, &commit) {
-                warn!(rev = %commit.rev, error = %e, "failed to apply pending commit");
-            }
+        if let Some(ref operator_did) = self.operator_did {
+            jetstream = jetstream.with_operator_did(operator_did.clone());
         }
 
-        // Re-enable broadcasts before going live
-        self.cache.set_suppress_broadcasts(false);
+        if let Some(ref callback) = self.operator_callback {
+            jetstream = jetstream.with_operator_callback(Arc::clone(callback));
+        }
 
-        // 5. Go live
-        self.cache.set_state(SyncState::Live);
+        let jetstream_handle = {
+            let shutdown_rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = jetstream.run(shutdown_rx).await {
+                    error!(error = %e, "jetstream task failed");
+                }
+            })
+        };
 
         info!(
             facts = self.cache.fact_count(),
@@ -248,24 +131,72 @@ impl SyncCoordinator {
             "sync coordinator is live"
         );
 
-        Ok(firehose_handle)
+        Ok(jetstream_handle)
     }
-}
 
-fn trace_skip_commit(commit_rev: &str, car_rev: &str) {
-    tracing::trace!(
-        commit_rev = %commit_rev,
-        car_rev = %car_rev,
-        "skipping commit already in CAR"
-    );
+    /// Populate the cache by downloading the full repo as a CAR file.
+    ///
+    /// This is much faster than fetching per-collection via list_all_records
+    /// because it's a single HTTP request for the entire repo.
+    async fn populate_cache(&self) -> Result<(), AtprotoError> {
+        // Suppress broadcasts during bulk population
+        self.cache.set_suppress_broadcasts(true);
+
+        // Download full repo as CAR
+        let (car_bytes, _rev) = self.client.get_repo(&self.did).await?;
+        info!(bytes = car_bytes.len(), "downloaded repo CAR file");
+
+        // Parse CAR and extract all records
+        let parsed = car::parse_car(&car_bytes).await?;
+
+        // Set repo revision
+        if let Some(ref rev) = parsed.rev {
+            self.cache.set_repo_rev(rev.clone()).await;
+        }
+
+        // Populate cache from parsed CAR result
+        self.cache.populate_from_car_full(
+            parsed.facts.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.rules.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.thoughts.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.notes.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.jobs.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.identity,
+            parsed.follows.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.likes.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.reposts.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.posts.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.directives.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.declarations.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.tools.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.tool_approvals.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.blog_entries.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.wiki_entries.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.wiki_links.into_iter().map(|(k, (v, c))| (k, v, c)),
+            parsed.triggers.into_iter().map(|(k, (v, c))| (k, v, c)),
+        );
+
+        // Set identity and daemon state from CAR (singletons handled separately)
+        if let Some((identity, cid)) = parsed.daemon_state {
+            // Note: daemon_state is set here, identity was already set via populate_from_car_full
+            self.cache.set_daemon_state(identity, cid).await;
+        }
+
+        // Re-enable broadcasts
+        self.cache.set_suppress_broadcasts(false);
+
+        Ok(())
+    }
 }
 
 /// Builder for creating a SyncCoordinator with optional configuration.
 pub struct SyncCoordinatorBuilder {
     client: AtprotoClient,
     did: String,
-    firehose_url: Option<String>,
+    jetstream_url: Option<String>,
     cache: Option<Arc<RepoCache>>,
+    operator_did: Option<String>,
+    operator_callback: Option<OperatorEventCallback>,
 }
 
 impl SyncCoordinatorBuilder {
@@ -274,14 +205,16 @@ impl SyncCoordinatorBuilder {
         Self {
             client,
             did: did.into(),
-            firehose_url: None,
+            jetstream_url: None,
             cache: None,
+            operator_did: None,
+            operator_callback: None,
         }
     }
 
-    /// Set a custom firehose URL.
-    pub fn firehose_url(mut self, url: impl Into<String>) -> Self {
-        self.firehose_url = Some(url.into());
+    /// Set a custom Jetstream URL.
+    pub fn jetstream_url(mut self, url: impl Into<String>) -> Self {
+        self.jetstream_url = Some(url.into());
         self
     }
 
@@ -291,14 +224,34 @@ impl SyncCoordinatorBuilder {
         self
     }
 
+    /// Set the operator DID.
+    pub fn operator_did(mut self, did: impl Into<String>) -> Self {
+        self.operator_did = Some(did.into());
+        self
+    }
+
+    /// Set the operator event callback.
+    pub fn operator_callback(mut self, callback: OperatorEventCallback) -> Self {
+        self.operator_callback = Some(callback);
+        self
+    }
+
     /// Build the sync coordinator.
     #[allow(clippy::unwrap_or_default)]
     pub fn build(self) -> SyncCoordinator {
         let cache = self.cache.unwrap_or_else(RepoCache::new);
         let mut coordinator = SyncCoordinator::new(self.client, self.did, cache);
 
-        if let Some(url) = self.firehose_url {
-            coordinator = coordinator.with_firehose_url(url);
+        if let Some(url) = self.jetstream_url {
+            coordinator = coordinator.with_jetstream_url(url);
+        }
+
+        if let Some(did) = self.operator_did {
+            coordinator = coordinator.with_operator_did(did);
+        }
+
+        if let Some(callback) = self.operator_callback {
+            coordinator = coordinator.with_operator_callback(callback);
         }
 
         coordinator
@@ -313,10 +266,20 @@ mod tests {
     fn test_builder() {
         let client = AtprotoClient::new("https://example.com");
         let coordinator = SyncCoordinatorBuilder::new(client, "did:plc:test")
-            .firehose_url("wss://custom.relay")
+            .jetstream_url("wss://custom.jetstream")
             .build();
 
         assert_eq!(coordinator.did, "did:plc:test");
-        assert_eq!(coordinator.firehose_url, "wss://custom.relay");
+        assert_eq!(coordinator.jetstream_url, "wss://custom.jetstream");
+    }
+
+    #[test]
+    fn test_builder_with_operator() {
+        let client = AtprotoClient::new("https://example.com");
+        let coordinator = SyncCoordinatorBuilder::new(client, "did:plc:test")
+            .operator_did("did:plc:operator")
+            .build();
+
+        assert_eq!(coordinator.operator_did, Some("did:plc:operator".to_string()));
     }
 }
