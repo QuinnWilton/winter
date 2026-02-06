@@ -38,21 +38,19 @@ pub struct AppState {
 
 /// Create the web router.
 ///
-/// If `firehose_url` and `did` are provided, subscribes to real-time thought updates.
+/// If `did` is provided, subscribes to real-time thought updates via Jetstream.
 pub fn create_router(
     client: AtprotoClient,
     static_dir: Option<&str>,
-    firehose_url: Option<String>,
     did: Option<String>,
 ) -> Router {
-    create_router_with_secrets(client, static_dir, firehose_url, did, None)
+    create_router_with_secrets(client, static_dir, did, None)
 }
 
 /// Create the web router with optional secret manager.
 pub fn create_router_with_secrets(
     client: AtprotoClient,
     static_dir: Option<&str>,
-    firehose_url: Option<String>,
     did: Option<String>,
     secrets: Option<SecretManager>,
 ) -> Router {
@@ -64,10 +62,10 @@ pub fn create_router_with_secrets(
         secrets: secrets.map(|s| Arc::new(RwLock::new(s))),
     });
 
-    // Subscribe to firehose for real-time thought updates
-    if let (Some(firehose_url), Some(did)) = (firehose_url, did) {
+    // Subscribe to Jetstream for real-time thought updates
+    if let Some(did) = did {
         tokio::spawn(async move {
-            subscribe_thoughts(firehose_url, did, thought_tx).await;
+            subscribe_thoughts(did, thought_tx).await;
         });
     }
 
@@ -775,6 +773,7 @@ async fn create_fact(
         supersedes: None,
         tags: parse_comma_separated(&form.tags),
         created_at: Utc::now(),
+        expires_at: None,
     };
 
     let rkey = Tid::now().to_string();
@@ -820,6 +819,7 @@ async fn update_fact(
         supersedes: existing.supersedes,
         tags: parse_comma_separated(&form.tags),
         created_at: existing.created_at,
+        expires_at: existing.expires_at,
     };
 
     match state.client.put_record(FACT_COLLECTION, &rkey, &fact).await {

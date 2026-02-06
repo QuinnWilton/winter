@@ -14,7 +14,7 @@ tokio = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }
 futures-util = { workspace = true }
 
-# WebSocket for firehose
+# WebSocket for Jetstream
 tokio-tungstenite = { workspace = true }
 
 # Web framework
@@ -29,13 +29,6 @@ askama_axum = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_ipld_dagcbor = { workspace = true }
-serde_bytes = { workspace = true }
-ciborium = { workspace = true }
-ipld-core = { workspace = true }
-
-# CAR file parsing
-iroh-car = { workspace = true }
 
 # Date/time
 chrono = { workspace = true }
