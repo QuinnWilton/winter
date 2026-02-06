@@ -978,6 +978,12 @@ pub struct CustomTool {
     /// Subprocess commands this tool needs to run (e.g., ["git"]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_commands: Vec<String>,
+    /// Tools this tool wants to call (for chaining).
+    /// Custom tools are referenced by AT URI (e.g., "at://did:plc:xxx/diy.razorgirl.winter.tool/rkey").
+    /// Built-in MCP tools use plain names (e.g., "query_facts").
+    /// AT URIs enable cross-agent tool sharing between different PDS instances.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_tools: Vec<String>,
     /// Version number, incremented on each update.
     #[serde(deserialize_with = "deserialize_i32_or_default")]
     pub version: i32,
@@ -1026,6 +1032,17 @@ pub struct ToolApproval {
     /// Which subprocess commands are granted (e.g., ["git"]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_commands: Vec<String>,
+    /// Which tools this tool is allowed to call.
+    /// Custom tools are referenced by AT URI (e.g., "at://did:plc:xxx/diy.razorgirl.winter.tool/rkey").
+    /// Built-in MCP tools use plain names (e.g., "query_facts").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    /// The DID of the Winter instance this approval is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub winter_did: Option<String>,
+    /// Operator's DID (for verification).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_did: Option<String>,
     /// DID of the operator who approved/denied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approved_by: Option<String>,
