@@ -27,6 +27,7 @@ fn parse_bool_env(s: &str) -> Result<bool, String> {
 mod bootstrap;
 mod daemon;
 mod migrate;
+pub mod trigger_engine;
 
 #[derive(Parser)]
 #[command(name = "winter")]
@@ -55,10 +56,6 @@ enum Commands {
         /// Notification poll interval in seconds
         #[arg(long, default_value = "5")]
         poll_interval: u64,
-
-        /// Awaken interval in seconds
-        #[arg(long, default_value = "3600")]
-        awaken_interval: u64,
 
         /// Follower sync interval in seconds (for populating is_followed_by predicate).
         /// New followers are detected immediately via Follow notifications.
@@ -128,10 +125,6 @@ enum Commands {
         /// Static files directory
         #[arg(long)]
         static_dir: Option<String>,
-
-        /// Firehose URL for real-time thought updates (e.g., wss://bsky.network)
-        #[arg(long, env = "WINTER_FIREHOSE_URL")]
-        firehose_url: Option<String>,
     },
 
     /// Initialize identity and default rules
@@ -234,7 +227,6 @@ async fn main() -> Result<()> {
             handle,
             app_password,
             poll_interval,
-            awaken_interval,
             follower_sync_interval,
             fast_forward,
         } => {
@@ -243,7 +235,6 @@ async fn main() -> Result<()> {
                 &handle,
                 &app_password,
                 poll_interval,
-                awaken_interval,
                 follower_sync_interval,
                 fast_forward,
             )
@@ -269,17 +260,8 @@ async fn main() -> Result<()> {
             app_password,
             port,
             static_dir,
-            firehose_url,
         } => {
-            run_web_server(
-                &pds_url,
-                &handle,
-                &app_password,
-                port,
-                static_dir.as_deref(),
-                firehose_url,
-            )
-            .await
+            run_web_server(&pds_url, &handle, &app_password, port, static_dir.as_deref()).await
         }
 
         Commands::Bootstrap {
@@ -384,26 +366,18 @@ async fn run_mcp_server(pds_url: &str, handle: &str, app_password: &str) -> Resu
             .map_err(|e| miette::miette!("failed to create datalog cache: {}", e))?;
 
     // Start sync coordinator to populate repo cache from PDS
-    // Resolve actual PDS firehose from DID document (only our commits, not full network)
-    let firehose_url = match std::env::var("WINTER_FIREHOSE_URL").ok().filter(|s| !s.is_empty()) {
-        Some(url) => url,
-        None => winter_atproto::resolve_firehose_url(&did, pds_url).await,
-    };
-
-    let sync_coordinator = SyncCoordinator::new(sync_client, &did, Arc::clone(&repo_cache))
-        .with_firehose_url(&firehose_url);
+    let sync_coordinator = SyncCoordinator::new(sync_client, &did, Arc::clone(&repo_cache));
 
     // Create a shutdown channel (MCP server runs until process exits)
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Start the sync (downloads CAR file and subscribes to firehose)
+    // Start the sync (list_all_records + Jetstream for live updates)
     let _sync_handle = sync_coordinator
         .start(shutdown_rx)
         .await
         .map_err(|e| miette::miette!("failed to start sync: {}", e))?;
 
     // Connect datalog cache to repo cache for derived fact population
-    // This also populates is_followed_by from the daemon state record in the CAR file
     datalog_cache.start_update_listener(Arc::clone(&repo_cache));
 
     // Set the caches on the tool registry
@@ -500,19 +474,12 @@ async fn run_mcp_server_http(
             .map_err(|e| miette::miette!("failed to create datalog cache: {}", e))?;
 
     // Start sync coordinator to populate repo cache from PDS
-    // Resolve actual PDS firehose from DID document (only our commits, not full network)
-    let firehose_url = match std::env::var("WINTER_FIREHOSE_URL").ok().filter(|s| !s.is_empty()) {
-        Some(url) => url,
-        None => winter_atproto::resolve_firehose_url(&did, pds_url).await,
-    };
-
-    let sync_coordinator = SyncCoordinator::new(sync_client, &did, Arc::clone(&repo_cache))
-        .with_firehose_url(&firehose_url);
+    let sync_coordinator = SyncCoordinator::new(sync_client, &did, Arc::clone(&repo_cache));
 
     // Create a shutdown channel (HTTP server runs until process exits)
     let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Start the sync (downloads CAR file and subscribes to firehose)
+    // Start the sync (list_all_records + Jetstream for live updates)
     let _sync_handle = sync_coordinator
         .start(shutdown_rx)
         .await
@@ -565,7 +532,6 @@ async fn run_web_server(
     app_password: &str,
     port: u16,
     static_dir: Option<&str>,
-    firehose_url: Option<String>,
 ) -> Result<()> {
     use winter_atproto::AtprotoClient;
     use winter_mcp::SecretManager;
@@ -577,7 +543,6 @@ async fn run_web_server(
         .await
         .map_err(|e| miette::miette!("{}", e))?;
 
-    // Get DID for firehose subscription
     let did = client.did().await;
 
     // Load secret manager for the secrets page
@@ -595,20 +560,7 @@ async fn run_web_server(
         }
     };
 
-    // Resolve actual PDS firehose from DID document (only our commits, not full network)
-    let firehose_url = match firehose_url.filter(|s| !s.is_empty()) {
-        Some(url) => Some(url),
-        None => {
-            let did_str = did.as_deref().unwrap_or("");
-            if !did_str.is_empty() {
-                Some(winter_atproto::resolve_firehose_url(did_str, pds_url).await)
-            } else {
-                None
-            }
-        }
-    };
-
-    let router = create_router_with_secrets(client, static_dir, firehose_url, did, secrets);
+    let router = create_router_with_secrets(client, static_dir, did, secrets);
 
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port))
         .await
