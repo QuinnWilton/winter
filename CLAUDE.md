@@ -14,7 +14,7 @@ Winter is built on two foundational systems:
 
 All state lives as ATProto records in Winter's PDS (Personal Data Server). There is no local database.
 
-- **Records**: Structured data (facts, notes, directives, jobs, tools, thoughts)
+- **Records**: Structured data (facts, wiki entries, directives, jobs, tools, thoughts)
 - **Firehose**: Real-time sync via commit stream subscription
 - **State singleton**: `diy.razorgirl.winter.state` (key: `self`) persists cursors across restarts
 - **Versioning**: All changes tracked in ATProto commit history
@@ -43,7 +43,9 @@ Derived predicates are **protected**—they reflect authoritative PDS state and 
 | `directive` | TID | Identity components (values, interests, beliefs, etc.) |
 | `fact` | TID | Structured knowledge with predicate/args/tags |
 | `rule` | TID | Datalog rules (head, body, constraints) |
-| `note` | TID | Free-form markdown (investigations, reflections) |
+| `note` | TID | Free-form markdown (legacy, migrated to wiki entries) |
+| `wikiEntry` | TID | Semantic wiki pages with slug-based linking |
+| `wikiLink` | TID | Typed semantic links between records |
 | `thought` | TID | Stream of consciousness (insight, plan, reflection, etc.) |
 | `job` | TID | Scheduled tasks (once or interval) |
 | `tool` | TID | Custom JavaScript/TypeScript tool code |
@@ -99,8 +101,8 @@ Rules define reusable derivations. They have a `head` (conclusion), `body` (cond
 // Find mutual follows (use _ for rkey when not needed)
 mutual(X) :- follows(Self, X, _), is_followed_by(X, Self).
 
-// Find notes tagged with "research"
-note_tag(URI, "research", _).
+// Find wiki entries tagged with "research"
+wiki_entry_tag(URI, "research", _).
 
 // Get all approved tools
 has_tool(Name, "true", _).
@@ -267,11 +269,21 @@ These predicates are automatically generated from PDS records. They exist only i
 | `has_tool` | 3 | (name, approved_bool, rkey) | Your custom tools (approved: true/false) |
 | `has_job` | 3 | (name, schedule_type, rkey) | Your scheduled jobs (once/interval) |
 
-#### Notes
+#### Wiki Entries
 
 | Predicate | Arity | Arguments | Description |
 |-----------|-------|-----------|-------------|
-| `has_note` | 6 | (uri, title, category, created_at, last_updated, rkey) | Your notes |
+| `has_wiki_entry` | 7 | (uri, title, slug, status, created_at, last_updated, rkey) | Your wiki entries |
+| `wiki_entry_alias` | 3 | (entry_uri, alias, rkey) | Aliases for wiki entries (one row per alias) |
+| `wiki_entry_tag` | 3 | (entry_uri, tag, rkey) | Tags on wiki entries (one row per tag) |
+| `wiki_entry_supersedes` | 3 | (new_uri, old_uri, rkey) | Wiki entry version chains |
+| `has_wiki_link` | 5 | (source_uri, target_uri, link_type, created_at, rkey) | Typed semantic links |
+
+#### Notes (Legacy)
+
+| Predicate | Arity | Arguments | Description |
+|-----------|-------|-----------|-------------|
+| `has_note` | 6 | (uri, title, category, created_at, last_updated, rkey) | Your notes (use `winter migrate notes-to-wiki-entries` to migrate) |
 | `note_tag` | 3 | (note_uri, tag, rkey) | Tags on notes (one row per tag) |
 | `note_related_fact` | 3 | (note_uri, fact_uri, rkey) | Facts linked to notes |
 
@@ -293,6 +305,53 @@ These predicates are automatically generated from PDS records. They exist only i
 | Predicate | Arity | Arguments | Description |
 |-----------|-------|-----------|-------------|
 | `fact_tag` | 3 | (fact_uri, tag, rkey) | Tags on facts (one row per tag) |
+
+---
+
+## Wiki
+
+### Wiki Entries
+
+Wiki entries replace notes as the primary knowledge storage. They use slug-based linking, aliases, and lifecycle status.
+
+**Tools**: `create_wiki_entry`, `update_wiki_entry`, `delete_wiki_entry`, `get_wiki_entry`, `get_wiki_entry_by_slug`, `list_wiki_entries`, `create_wiki_link`, `delete_wiki_link`, `list_wiki_links`
+
+### Wiki-Link Syntax
+
+Wiki entries support `[[wiki-link]]` syntax in markdown content. Links are auto-resolved to WikiLink records on create/update.
+
+| Syntax | Meaning | Example |
+|--------|---------|---------|
+| `[[slug]]` | Same-user entry by slug or alias | `[[atproto-protocol]]` |
+| `[[slug\|display text]]` | Same-user with custom display text | `[[atproto-protocol\|AT Protocol]]` |
+| `[[handle/slug]]` | Cross-user entry by handle + slug | `[[alice.bsky.social/federation]]` |
+| `[[did:plc:xxx/slug]]` | Cross-user entry by DID + slug | `[[did:plc:rayfp.../federation]]` |
+
+### Wiki Query Examples
+
+```datalog
+// Backlinks to an entry
+backlink(Source, Type) :- has_wiki_link(Source, "at://did:.../wikiEntry/...", Type, _, _).
+
+// Resolve slug or alias to URI
+resolve(URI) :- has_wiki_entry(URI, _, "my-slug", _, _, _, _).
+resolve(URI) :- wiki_entry_alias(URI, "My Alias", _).
+
+// Dependency chain (transitive)
+depends(X, Y) :- has_wiki_link(X, Y, "depends-on", _, _).
+depends(X, Z) :- depends(X, Y), depends(Y, Z).
+
+// Orphan entries (no inbound links)
+has_inbound(T) :- has_wiki_link(_, T, _, _, _).
+orphan(URI, Title) :- has_wiki_entry(URI, Title, _, "stable", _, _, _), !has_inbound(URI).
+
+// Find entries by tag
+research_entries(URI, Title) :- has_wiki_entry(URI, Title, _, _, _, _, _), wiki_entry_tag(URI, "research", _).
+```
+
+### Migration from Notes
+
+Run `winter migrate notes-to-wiki-entries` (or `--dry-run` to preview) to convert existing notes to wiki entries. Slugs are auto-generated from titles. Categories become tags.
 
 ---
 

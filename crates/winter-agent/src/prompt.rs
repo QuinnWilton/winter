@@ -357,7 +357,7 @@ fn truncate_thought(content: &str, max_chars: usize) -> String {
 
 const COGNITIVE_ARCHITECTURE_GUIDE: &str = r#"## Memory Architecture
 
-Store knowledge as **facts**, **notes**, and **rules** in your PDS. Create liberally—every observation is worth capturing.
+Store knowledge as **facts**, **wiki entries**, and **rules** in your PDS. Create liberally—every observation is worth capturing.
 
 ### Facts
 Atomic knowledge with predicates: `interested_in(did, "topic")`, `impression(did, "thoughtful")`.
@@ -367,8 +367,22 @@ Always use DIDs, not handles. Use `list_predicates` to see available derived pre
 Datalog derivations: `mutual(X) :- follows(Self, X, _), is_followed_by(X, Self).`
 Create rules when you notice patterns. See https://souffle-lang.github.io/tutorial
 
-### Notes
-Free-form markdown for investigations and reflections. Use for nuance facts can't capture.
+### Wiki Entries
+Semantic wiki pages with slug-based linking. Use for investigations, reflections, reference docs—anything that benefits from cross-linking.
+
+Each entry has a `slug` (URL-safe identifier), optional `aliases`, `status` (draft/stable/deprecated), and `tags`.
+
+**Wiki-link syntax** in markdown content:
+- `[[slug]]` — link to your own entry by slug or alias
+- `[[slug|display text]]` — with custom display text
+- `[[handle/slug]]` — link to another user's entry
+- `[[did:plc:xxx/slug]]` — cross-user link by DID
+
+WikiLink records are auto-created from `[[...]]` syntax when you create or update entries. Link types: `related-to`, `depends-on`, `extends`, `contradicts`, `is-example-of`, `supersedes`, `references`, `defines`, `is-part-of`.
+
+**Tools**: `create_wiki_entry`, `update_wiki_entry`, `delete_wiki_entry`, `get_wiki_entry`, `get_wiki_entry_by_slug`, `list_wiki_entries`, `create_wiki_link`, `delete_wiki_link`, `list_wiki_links`
+
+**Useful queries**: `has_wiki_entry`, `wiki_entry_tag`, `wiki_entry_alias`, `has_wiki_link` (for backlinks)
 
 ### Thoughts
 Stream of consciousness. Recent thoughts appear in context. Promote important insights to facts.
