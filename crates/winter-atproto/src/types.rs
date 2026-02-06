@@ -136,8 +136,10 @@ where
         where
             D: serde::Deserializer<'de>,
         {
-            // Try to deserialize the inner value
-            deserializer.deserialize_any(CidVisitor)
+            // serde_ipld_dagcbor wraps CID links as newtype structs containing Cid
+            use ipld_core::cid::Cid;
+            let cid = Cid::deserialize(deserializer)?;
+            Ok(cid.to_string())
         }
     }
 
@@ -755,6 +757,12 @@ fn default_true() -> bool {
     true
 }
 
+/// Default datetime for legacy records missing timestamps.
+/// Uses Unix epoch (1970-01-01) to make it obvious this is a fallback value.
+fn default_datetime() -> DateTime<Utc> {
+    DateTime::UNIX_EPOCH
+}
+
 /// Free-form note record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -773,8 +781,10 @@ pub struct Note {
     #[serde(default, deserialize_with = "deserialize_null_as_default")]
     pub tags: Vec<String>,
     /// When this note was created.
+    #[serde(default = "default_datetime")]
     pub created_at: DateTime<Utc>,
     /// When this note was last updated.
+    #[serde(default = "default_datetime")]
     pub last_updated: DateTime<Utc>,
 }
 
