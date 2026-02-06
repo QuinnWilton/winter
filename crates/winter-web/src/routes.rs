@@ -21,6 +21,7 @@ use winter_atproto::{
     IDENTITY_KEY, Identity, JOB_COLLECTION, Job, JobSchedule, JobStatus, NOTE_COLLECTION, Note,
     RULE_COLLECTION, Rule, SECRET_META_COLLECTION, SECRET_META_KEY, SecretMeta, THOUGHT_COLLECTION,
     TOOL_APPROVAL_COLLECTION, TOOL_COLLECTION, Thought, Tid, ToolApproval, ToolApprovalStatus,
+    WIKI_ENTRY_COLLECTION, WIKI_LINK_COLLECTION, WikiEntry, WikiLink,
 };
 use winter_mcp::SecretManager;
 
@@ -105,6 +106,14 @@ pub fn create_router_with_secrets(
         .route("/api/notes", post(create_note))
         .route("/api/notes/{rkey}", post(update_note))
         .route("/api/notes/{rkey}/delete", post(delete_note))
+        // Wiki
+        .route("/wiki", get(wiki_page))
+        .route("/wiki/new", get(wiki_new))
+        .route("/wiki/{slug_or_rkey}", get(wiki_detail))
+        .route("/wiki/{rkey}/edit", get(wiki_edit))
+        .route("/api/wiki", post(create_wiki_entry_web))
+        .route("/api/wiki/{rkey}", post(update_wiki_entry_web))
+        .route("/api/wiki/{rkey}/delete", post(delete_wiki_entry_web))
         // Directives
         .route("/directives", get(directives_page))
         .route("/directives/new", get(directive_new))
@@ -2174,6 +2183,407 @@ async fn delete_note(
     Redirect::to("/notes")
 }
 
+// =============================================================================
+// Wiki
+// =============================================================================
+
+async fn wiki_page(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let entries = match state
+        .client
+        .list_all_records::<WikiEntry>(WIKI_ENTRY_COLLECTION)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(error = %e, "failed to load wiki entries");
+            Vec::new()
+        }
+    };
+
+    let mut entries_html = String::new();
+    for item in &entries {
+        let rkey = item.uri.split('/').next_back().unwrap_or("");
+        let preview = item
+            .value
+            .summary
+            .as_deref()
+            .unwrap_or_else(|| &item.value.content);
+        let preview = truncate_chars(preview, 120);
+        let status_class = match item.value.status.as_str() {
+            "draft" => "status-draft",
+            "deprecated" => "status-deprecated",
+            _ => "status-stable",
+        };
+
+        entries_html.push_str(&format!(
+            r#"<div class="wiki-entry">
+                <div class="entry-header">
+                    <a href="/wiki/{}" class="title">{}</a>
+                    <span class="status {}">{}</span>
+                </div>
+                <div class="slug">/{}</div>
+                <div class="preview">{}</div>
+                <div class="meta">
+                    <span class="rkey">{}</span>
+                    <span class="tags">{}</span>
+                </div>
+            </div>"#,
+            html_escape(&item.value.slug),
+            html_escape(&item.value.title),
+            status_class,
+            html_escape(&item.value.status),
+            html_escape(&item.value.slug),
+            html_escape(&preview),
+            rkey,
+            item.value.tags.join(", ")
+        ));
+    }
+
+    Html(
+        WIKI_HTML
+            .replace("<!-- ENTRIES -->", &entries_html)
+            .replace("<!-- COUNT -->", &entries.len().to_string()),
+    )
+}
+
+async fn wiki_detail(
+    State(state): State<Arc<AppState>>,
+    Path(slug_or_rkey): Path<String>,
+) -> impl IntoResponse {
+    // Try to find by slug first, then by rkey
+    let entries = match state
+        .client
+        .list_all_records::<WikiEntry>(WIKI_ENTRY_COLLECTION)
+        .await
+    {
+        Ok(n) => n,
+        Err(_) => return Html(WIKI_NOT_FOUND_HTML.to_string()),
+    };
+
+    let found = entries.iter().find(|item| {
+        item.value.slug == slug_or_rkey
+            || item.value.aliases.iter().any(|a| a == &slug_or_rkey)
+            || item.uri.split('/').next_back() == Some(&slug_or_rkey)
+    });
+
+    let item = match found {
+        Some(item) => item,
+        None => return Html(WIKI_NOT_FOUND_HTML.to_string()),
+    };
+
+    let rkey = item.uri.split('/').next_back().unwrap_or("");
+    let entry = &item.value;
+
+    // Render wiki links in content
+    let rendered_content = render_wiki_content(&html_escape(&entry.content), &entries);
+
+    let tags_html = if entry.tags.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p class=\"tags\">Tags: {}</p>",
+            entry
+                .tags
+                .iter()
+                .map(|t| html_escape(t))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    let aliases_html = if entry.aliases.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<p class=\"aliases\">Aliases: {}</p>",
+            entry
+                .aliases
+                .iter()
+                .map(|a| html_escape(a))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    let summary_html = entry
+        .summary
+        .as_ref()
+        .map(|s| format!("<p class=\"summary\">{}</p>", html_escape(s)))
+        .unwrap_or_default();
+
+    let supersedes_html = entry
+        .supersedes
+        .as_ref()
+        .map(|s| format!("<p class=\"supersedes\">Supersedes: <code>{}</code></p>", html_escape(s)))
+        .unwrap_or_default();
+
+    let status_class = match entry.status.as_str() {
+        "draft" => "status-draft",
+        "deprecated" => "status-deprecated",
+        _ => "status-stable",
+    };
+
+    // Find backlinks (entries that link to this one via wiki links)
+    let backlinks_html = build_backlinks_html(state.as_ref(), rkey).await;
+
+    Html(
+        WIKI_DETAIL_HTML
+            .replace("<!-- RKEY -->", rkey)
+            .replace("<!-- TITLE -->", &html_escape(&entry.title))
+            .replace("<!-- SLUG -->", &html_escape(&entry.slug))
+            .replace("<!-- STATUS -->", &html_escape(&entry.status))
+            .replace("<!-- STATUS_CLASS -->", status_class)
+            .replace("<!-- SUMMARY -->", &summary_html)
+            .replace("<!-- CONTENT -->", &rendered_content)
+            .replace("<!-- TAGS -->", &tags_html)
+            .replace("<!-- ALIASES -->", &aliases_html)
+            .replace("<!-- SUPERSEDES -->", &supersedes_html)
+            .replace("<!-- BACKLINKS -->", &backlinks_html)
+            .replace(
+                "<!-- CREATED_AT -->",
+                &entry.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+            )
+            .replace(
+                "<!-- UPDATED_AT -->",
+                &entry.last_updated.format("%Y-%m-%d %H:%M UTC").to_string(),
+            ),
+    )
+}
+
+async fn wiki_new() -> impl IntoResponse {
+    Html(
+        WIKI_FORM_HTML
+            .replace("<!-- TITLE -->", "New Wiki Entry")
+            .replace("<!-- ACTION -->", "/api/wiki")
+            .replace("<!-- RKEY -->", "")
+            .replace("<!-- ENTRY_TITLE -->", "")
+            .replace("<!-- SLUG -->", "")
+            .replace("<!-- CONTENT -->", "")
+            .replace("<!-- STATUS -->", "stable")
+            .replace("<!-- SUMMARY -->", "")
+            .replace("<!-- ALIASES -->", "")
+            .replace("<!-- TAGS -->", "")
+            .replace("<!-- SUPERSEDES -->", ""),
+    )
+}
+
+async fn wiki_edit(
+    State(state): State<Arc<AppState>>,
+    Path(rkey): Path<String>,
+) -> impl IntoResponse {
+    let entry = match state
+        .client
+        .get_record::<WikiEntry>(WIKI_ENTRY_COLLECTION, &rkey)
+        .await
+    {
+        Ok(n) => n.value,
+        Err(_) => return Html(WIKI_NOT_FOUND_HTML.to_string()),
+    };
+
+    Html(
+        WIKI_FORM_HTML
+            .replace("<!-- TITLE -->", "Edit Wiki Entry")
+            .replace("<!-- ACTION -->", &format!("/api/wiki/{}", rkey))
+            .replace("<!-- RKEY -->", &rkey)
+            .replace("<!-- ENTRY_TITLE -->", &html_escape(&entry.title))
+            .replace("<!-- SLUG -->", &html_escape(&entry.slug))
+            .replace("<!-- CONTENT -->", &html_escape(&entry.content))
+            .replace("<!-- STATUS -->", &html_escape(&entry.status))
+            .replace(
+                "<!-- SUMMARY -->",
+                &html_escape(entry.summary.as_deref().unwrap_or("")),
+            )
+            .replace("<!-- ALIASES -->", &entry.aliases.join(", "))
+            .replace("<!-- TAGS -->", &entry.tags.join(", "))
+            .replace(
+                "<!-- SUPERSEDES -->",
+                &html_escape(entry.supersedes.as_deref().unwrap_or("")),
+            ),
+    )
+}
+
+async fn create_wiki_entry_web(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<WikiEntryForm>,
+) -> impl IntoResponse {
+    let now = Utc::now();
+    let entry = WikiEntry {
+        title: form.title,
+        slug: form.slug.clone(),
+        aliases: parse_comma_separated(&form.aliases),
+        summary: form.summary.filter(|s| !s.is_empty()),
+        content: form.content,
+        status: form.status.unwrap_or_else(|| "stable".to_string()),
+        supersedes: form.supersedes.filter(|s| !s.is_empty()),
+        tags: parse_comma_separated(&form.tags),
+        created_at: now,
+        last_updated: now,
+    };
+
+    let rkey = Tid::now().to_string();
+    match state
+        .client
+        .create_record(WIKI_ENTRY_COLLECTION, Some(&rkey), &entry)
+        .await
+    {
+        Ok(_) => Redirect::to(&format!("/wiki/{}", entry.slug)),
+        Err(e) => {
+            warn!(error = %e, "failed to create wiki entry");
+            Redirect::to("/wiki")
+        }
+    }
+}
+
+async fn update_wiki_entry_web(
+    State(state): State<Arc<AppState>>,
+    Path(rkey): Path<String>,
+    Form(form): Form<WikiEntryForm>,
+) -> impl IntoResponse {
+    let existing = match state
+        .client
+        .get_record::<WikiEntry>(WIKI_ENTRY_COLLECTION, &rkey)
+        .await
+    {
+        Ok(n) => n.value,
+        Err(_) => return Redirect::to("/wiki"),
+    };
+
+    let entry = WikiEntry {
+        title: form.title,
+        slug: existing.slug.clone(), // Slug is immutable
+        aliases: parse_comma_separated(&form.aliases),
+        summary: form.summary.filter(|s| !s.is_empty()),
+        content: form.content,
+        status: form.status.unwrap_or(existing.status),
+        supersedes: form.supersedes.filter(|s| !s.is_empty()),
+        tags: parse_comma_separated(&form.tags),
+        created_at: existing.created_at,
+        last_updated: Utc::now(),
+    };
+
+    match state
+        .client
+        .put_record(WIKI_ENTRY_COLLECTION, &rkey, &entry)
+        .await
+    {
+        Ok(_) => Redirect::to(&format!("/wiki/{}", entry.slug)),
+        Err(e) => {
+            warn!(error = %e, "failed to update wiki entry");
+            Redirect::to(&format!("/wiki/{}", entry.slug))
+        }
+    }
+}
+
+async fn delete_wiki_entry_web(
+    State(state): State<Arc<AppState>>,
+    Path(rkey): Path<String>,
+) -> impl IntoResponse {
+    let _ = state
+        .client
+        .delete_record(WIKI_ENTRY_COLLECTION, &rkey)
+        .await;
+    Redirect::to("/wiki")
+}
+
+/// Render wiki-link syntax in content, replacing [[slug]] with HTML links.
+fn render_wiki_content(escaped_content: &str, all_entries: &[winter_atproto::ListRecordItem<WikiEntry>]) -> String {
+    // Since content is already HTML-escaped, we need to look for escaped brackets
+    // [[...]] becomes &amp;#91;&amp;#91;...&amp;#93;&amp;#93; but actually html_escape doesn't
+    // touch brackets, so [[...]] remains as [[...]] in the escaped output.
+    let re = regex::Regex::new(r"\[\[([^\]|]+?)(?:\|([^\]]+))?\]\]").unwrap();
+
+    re.replace_all(escaped_content, |caps: &regex::Captures| {
+        let reference = caps[1].trim();
+        let display_text = caps.get(2).map(|m| m.as_str().trim().to_string());
+
+        // For local slugs, try to resolve
+        if !reference.contains('/') && !reference.starts_with("did:") {
+            let found = all_entries.iter().find(|item| {
+                item.value.slug == reference
+                    || item.value.aliases.iter().any(|a| a == reference)
+            });
+
+            let display = display_text.as_deref().unwrap_or(reference);
+
+            if found.is_some() {
+                format!(
+                    r#"<a href="/wiki/{}" class="wiki-link">{}</a>"#,
+                    reference, display
+                )
+            } else {
+                format!(
+                    r#"<a href="/wiki/{}" class="wiki-link wiki-link-missing">{}</a>"#,
+                    reference, display
+                )
+            }
+        } else {
+            let display = display_text.as_deref().unwrap_or(reference);
+            format!(
+                r#"<span class="wiki-link-external">{}</span>"#,
+                display
+            )
+        }
+    })
+    .to_string()
+}
+
+/// Build backlinks HTML by checking wiki links targeting this entry.
+async fn build_backlinks_html(state: &AppState, target_rkey: &str) -> String {
+    let links = match state
+        .client
+        .list_all_records::<WikiLink>(WIKI_LINK_COLLECTION)
+        .await
+    {
+        Ok(l) => l,
+        Err(_) => return String::new(),
+    };
+
+    let entries = match state
+        .client
+        .list_all_records::<WikiEntry>(WIKI_ENTRY_COLLECTION)
+        .await
+    {
+        Ok(e) => e,
+        Err(_) => return String::new(),
+    };
+
+    // Find links that target this entry (by rkey in the AT URI)
+    let backlinks: Vec<String> = links
+        .iter()
+        .filter(|link| {
+            link.value
+                .target
+                .split('/')
+                .next_back()
+                .map(|rk| rk == target_rkey)
+                .unwrap_or(false)
+        })
+        .filter_map(|link| {
+            // Find the source entry
+            let source_rkey = link.value.source.split('/').next_back()?;
+            let source_entry = entries.iter().find(|e| {
+                e.uri.split('/').next_back() == Some(source_rkey)
+            })?;
+
+            Some(format!(
+                r#"<li><a href="/wiki/{}">{}</a> <span class="link-type">({})</span></li>"#,
+                html_escape(&source_entry.value.slug),
+                html_escape(&source_entry.value.title),
+                html_escape(&link.value.link_type),
+            ))
+        })
+        .collect();
+
+    if backlinks.is_empty() {
+        String::new()
+    } else {
+        format!(
+            r#"<h2>Backlinks</h2><ul class="backlinks">{}</ul>"#,
+            backlinks.join("")
+        )
+    }
+}
+
 async fn thoughts_sse(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let rx = state.thought_tx.subscribe();
     create_sse_stream(rx)
@@ -2228,6 +2638,18 @@ struct NoteForm {
     content: String,
     category: Option<String>,
     tags: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WikiEntryForm {
+    title: String,
+    slug: String,
+    content: String,
+    status: Option<String>,
+    summary: Option<String>,
+    aliases: Option<String>,
+    tags: Option<String>,
+    supersedes: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2315,6 +2737,7 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <a href="/rules">Rules</a>
         <a href="/declarations">Declarations</a>
         <a href="/notes">Notes</a>
+        <a href="/wiki">Wiki</a>
         <a href="/directives">Directives</a>
         <a href="/identity">Identity</a>
         <a href="/jobs">Jobs</a>
@@ -5090,6 +5513,246 @@ const DECLARATION_FORM_HTML: &str = r#"<!DOCTYPE html>
         <button type="submit" class="btn btn-primary">Save</button>
         <a href="/declarations" class="btn btn-cancel">Cancel</a>
     </form>
+</body>
+</html>"#;
+
+const WIKI_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Winter - Wiki</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 2rem;
+            background: #0a0a0a;
+            color: #e0e0e0;
+        }
+        h1 { color: #88c0d0; }
+        h1 a { color: #88c0d0; text-decoration: none; }
+        a { color: #81a1c1; }
+        .header { display: flex; justify-content: space-between; align-items: center; }
+        .count { color: #888; }
+        .btn { padding: 0.5rem 1rem; background: #5e81ac; color: #fff; border: none; border-radius: 4px; text-decoration: none; }
+        .btn:hover { background: #81a1c1; }
+        .wiki-entry {
+            padding: 1rem;
+            margin: 1rem 0;
+            background: #2e3440;
+            border-radius: 4px;
+        }
+        .entry-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.5rem;
+        }
+        .title { font-weight: bold; color: #88c0d0; text-decoration: none; }
+        .title:hover { text-decoration: underline; }
+        .slug { color: #888; font-size: 0.9rem; font-family: monospace; }
+        .preview { color: #aaa; line-height: 1.5; margin-top: 0.5rem; }
+        .meta { margin-top: 0.5rem; font-size: 0.85rem; color: #666; }
+        .rkey { font-family: monospace; }
+        .tags { color: #81a1c1; }
+        .status { font-size: 0.85rem; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .status-stable { color: #a3be8c; background: rgba(163, 190, 140, 0.15); }
+        .status-draft { color: #ebcb8b; background: rgba(235, 203, 139, 0.15); }
+        .status-deprecated { color: #bf616a; background: rgba(191, 97, 106, 0.15); }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1><a href="/">Winter</a> / Wiki</h1>
+        <a href="/wiki/new" class="btn">New Entry</a>
+    </div>
+    <p class="count"><!-- COUNT --> entries</p>
+    <div id="entries"><!-- ENTRIES --></div>
+</body>
+</html>"#;
+
+const WIKI_DETAIL_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Winter - <!-- TITLE --></title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 2rem;
+            background: #0a0a0a;
+            color: #e0e0e0;
+        }
+        h1 { color: #88c0d0; }
+        h1 a { color: #88c0d0; text-decoration: none; }
+        a { color: #81a1c1; }
+        .header { display: flex; justify-content: space-between; align-items: center; }
+        .actions { display: flex; gap: 0.5rem; }
+        .btn { padding: 0.5rem 1rem; background: #5e81ac; color: #fff; border: none; border-radius: 4px; text-decoration: none; cursor: pointer; }
+        .btn:hover { background: #81a1c1; }
+        .btn-danger { background: #bf616a; }
+        .btn-danger:hover { background: #d08770; }
+        .status { font-size: 0.85rem; padding: 0.2rem 0.5rem; border-radius: 3px; }
+        .status-stable { color: #a3be8c; background: rgba(163, 190, 140, 0.15); }
+        .status-draft { color: #ebcb8b; background: rgba(235, 203, 139, 0.15); }
+        .status-deprecated { color: #bf616a; background: rgba(191, 97, 106, 0.15); }
+        .slug { color: #888; font-family: monospace; margin-bottom: 1rem; }
+        .summary { color: #aaa; font-style: italic; margin-bottom: 1rem; }
+        .content { white-space: pre-wrap; line-height: 1.6; background: #2e3440; padding: 1rem; border-radius: 4px; }
+        .tags, .aliases { color: #81a1c1; margin-top: 1rem; }
+        .supersedes { color: #888; margin-top: 0.5rem; }
+        .timestamps { color: #888; font-size: 0.85rem; margin-top: 1rem; }
+        .wiki-link { color: #a3be8c; text-decoration: underline; }
+        .wiki-link-missing { color: #bf616a; }
+        .wiki-link-external { color: #d08770; }
+        .backlinks { list-style: none; padding: 0; }
+        .backlinks li { padding: 0.3rem 0; }
+        .link-type { color: #888; font-size: 0.85rem; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1><a href="/wiki">Wiki</a> / <!-- TITLE --></h1>
+        <div class="actions">
+            <a href="/wiki/<!-- RKEY -->/edit" class="btn">Edit</a>
+            <form method="POST" action="/api/wiki/<!-- RKEY -->/delete" style="display:inline">
+                <button class="btn btn-danger" onclick="return confirm('Delete this wiki entry?')">Delete</button>
+            </form>
+        </div>
+    </div>
+    <div class="slug">/<!-- SLUG --> <span class="status <!-- STATUS_CLASS -->"><!-- STATUS --></span></div>
+    <!-- SUMMARY -->
+    <!-- ALIASES -->
+    <div class="content"><!-- CONTENT --></div>
+    <!-- TAGS -->
+    <!-- SUPERSEDES -->
+    <!-- BACKLINKS -->
+    <div class="timestamps">
+        Created: <!-- CREATED_AT --><br>
+        Updated: <!-- UPDATED_AT -->
+    </div>
+</body>
+</html>"#;
+
+const WIKI_NOT_FOUND_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Winter - Wiki Entry Not Found</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 2rem;
+            background: #0a0a0a;
+            color: #e0e0e0;
+        }
+        h1 { color: #88c0d0; }
+        a { color: #81a1c1; }
+    </style>
+</head>
+<body>
+    <h1>Wiki Entry Not Found</h1>
+    <p>The requested wiki entry does not exist.</p>
+    <a href="/wiki">Back to Wiki</a>
+</body>
+</html>"#;
+
+const WIKI_FORM_HTML: &str = r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Winter - <!-- TITLE --></title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 2rem;
+            background: #0a0a0a;
+            color: #e0e0e0;
+        }
+        h1 { color: #88c0d0; }
+        h1 a { color: #88c0d0; text-decoration: none; }
+        a { color: #81a1c1; }
+        form { margin-top: 1rem; }
+        label { display: block; margin-bottom: 0.5rem; color: #88c0d0; }
+        input, textarea, select {
+            width: 100%;
+            padding: 0.5rem;
+            margin-bottom: 1rem;
+            background: #2e3440;
+            border: 1px solid #4c566a;
+            border-radius: 4px;
+            color: #e0e0e0;
+            font-family: inherit;
+            box-sizing: border-box;
+        }
+        textarea { min-height: 300px; font-family: monospace; }
+        .btn { padding: 0.5rem 1rem; background: #5e81ac; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
+        .btn:hover { background: #81a1c1; }
+        .hint { font-size: 0.85rem; color: #888; margin-top: -0.75rem; margin-bottom: 1rem; }
+    </style>
+</head>
+<body>
+    <h1><a href="/wiki">Wiki</a> / <!-- TITLE --></h1>
+    <form method="POST" action="<!-- ACTION -->">
+        <label for="title">Title</label>
+        <input type="text" id="title" name="title" value="<!-- ENTRY_TITLE -->" required>
+
+        <label for="slug">Slug</label>
+        <input type="text" id="slug" name="slug" value="<!-- SLUG -->" pattern="[a-z0-9-]+" required>
+        <div class="hint">Lowercase letters, numbers, and hyphens only. Used for [[slug]] linking.</div>
+
+        <label for="status">Status</label>
+        <select id="status" name="status">
+            <option value="stable">Stable</option>
+            <option value="draft">Draft</option>
+            <option value="deprecated">Deprecated</option>
+        </select>
+
+        <label for="summary">Summary (optional)</label>
+        <input type="text" id="summary" name="summary" value="<!-- SUMMARY -->" maxlength="512">
+        <div class="hint">Plain-text abstract for previews.</div>
+
+        <label for="content">Content</label>
+        <textarea id="content" name="content" required><!-- CONTENT --></textarea>
+        <div class="hint">Markdown with [[wiki-link]] syntax. Use [[slug]] to link to other entries.</div>
+
+        <label for="aliases">Aliases (optional)</label>
+        <input type="text" id="aliases" name="aliases" value="<!-- ALIASES -->">
+        <div class="hint">Comma-separated alternative names for [[alias]] resolution.</div>
+
+        <label for="tags">Tags (optional)</label>
+        <input type="text" id="tags" name="tags" value="<!-- TAGS -->">
+        <div class="hint">Comma-separated tags for categorization.</div>
+
+        <label for="supersedes">Supersedes (optional)</label>
+        <input type="text" id="supersedes" name="supersedes" value="<!-- SUPERSEDES -->">
+        <div class="hint">AT URI of the previous version of this entry.</div>
+
+        <button type="submit" class="btn">Save</button>
+    </form>
+    <script>
+        // Set the correct status option as selected
+        const statusSelect = document.getElementById('status');
+        const currentStatus = '<!-- STATUS -->';
+        if (currentStatus) {
+            for (const option of statusSelect.options) {
+                if (option.value === currentStatus) {
+                    option.selected = true;
+                    break;
+                }
+            }
+        }
+    </script>
 </body>
 </html>"#;
 
