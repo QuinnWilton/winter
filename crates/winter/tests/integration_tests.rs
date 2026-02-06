@@ -16,6 +16,7 @@ fn test_fact(predicate: &str, args: &[&str]) -> Fact {
         supersedes: None,
         tags: vec![],
         created_at: chrono::Utc::now(),
+        expires_at: None,
     }
 }
 
@@ -266,19 +267,8 @@ mod agent_context {
     #[test]
     fn context_includes_trigger() {
         let identity = test_identity();
-        let trigger = ContextTrigger::Notification {
-            kind: "mention".to_string(),
-            author_did: "did:plc:abc".to_string(),
-            author_handle: "alice.bsky.social".to_string(),
-            text: Some("Hello Winter!".to_string()),
-            uri: "at://did:plc:abc/app.bsky.feed.post/123".to_string(),
-            cid: "bafyreiabc123".to_string(),
-            parent: None,
-            root: None,
-            facets: vec![],
-        };
-
-        let context = AgentContext::new(identity).with_trigger(trigger);
+        let context =
+            AgentContext::new(identity).with_trigger(ContextTrigger::PersistentSession);
         assert!(context.trigger.is_some());
     }
 
@@ -295,43 +285,18 @@ mod agent_context {
     }
 
     #[test]
-    fn prompt_builder_includes_notification_trigger() {
+    fn prompt_builder_includes_persistent_session_trigger() {
         let identity = test_identity();
         let directives = test_directives();
-        let trigger = ContextTrigger::Notification {
-            kind: "mention".to_string(),
-            author_did: "did:plc:abc".to_string(),
-            author_handle: "alice.bsky.social".to_string(),
-            text: Some("Hello Winter!".to_string()),
-            uri: "at://did:plc:abc/app.bsky.feed.post/123".to_string(),
-            cid: "bafyreiabc123".to_string(),
-            parent: None,
-            root: None,
-            facets: vec![],
-        };
 
         let context = AgentContext::new(identity)
             .with_directives(directives)
-            .with_trigger(trigger);
+            .with_trigger(ContextTrigger::PersistentSession);
         let prompt = PromptBuilder::build(&context);
 
-        assert!(prompt.contains("mention"));
-        assert!(prompt.contains("@alice.bsky.social"));
-        assert!(prompt.contains("Hello Winter!"));
-        // Verify threading info is included
-        assert!(prompt.contains("parent_uri"));
-        assert!(prompt.contains("parent_cid"));
-        assert!(prompt.contains("root_uri"));
-        assert!(prompt.contains("root_cid"));
-    }
-
-    #[test]
-    fn prompt_builder_includes_awaken_trigger() {
-        let identity = test_identity();
-        let context = AgentContext::new(identity).with_trigger(ContextTrigger::Awaken);
-        let prompt = PromptBuilder::build(&context);
-
-        assert!(prompt.contains("awaken"));
+        assert!(prompt.contains("Persistent Session"));
+        assert!(prompt.contains("check_inbox"));
+        assert!(prompt.contains("acknowledge_inbox"));
     }
 }
 

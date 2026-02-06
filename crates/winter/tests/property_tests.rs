@@ -122,6 +122,7 @@ proptest! {
             supersedes: None,
             tags: tags.clone(),
             created_at: chrono::Utc::now(),
+            expires_at: None,
         };
 
         // Serialize and deserialize
@@ -256,6 +257,7 @@ mod datalog {
                 supersedes: None,
                 tags: vec!["tag1".to_string()],
                 created_at: chrono::Utc::now(),
+                expires_at: None,
             };
 
             let fact2 = Fact {
@@ -266,6 +268,7 @@ mod datalog {
                 supersedes: None,
                 tags: vec!["tag2".to_string()],
                 created_at: chrono::Utc::now(),
+                expires_at: None,
             };
 
             // Same predicate and args means same semantic fact
