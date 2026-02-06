@@ -204,6 +204,7 @@ mod identity;
 mod jobs;
 mod notes;
 mod pds;
+pub mod permissions;
 mod rules;
 mod thoughts;
 
@@ -1065,6 +1066,12 @@ pub struct ToolState {
     pub deno: Option<DenoExecutor>,
     /// Interruption state for background sessions (optional).
     pub interruption: Option<Arc<InterruptionState>>,
+    /// Shared tool session store for chaining tokens (optional).
+    /// Set when HTTP server is running to enable tool chaining.
+    pub tool_sessions: Option<Arc<permissions::ToolSessionStore>>,
+    /// Internal MCP URL for tool chaining (e.g., "http://127.0.0.1:3847").
+    /// Set by the HTTP server so Deno tools can call back into the same server.
+    pub internal_mcp_url: Option<String>,
 }
 
 /// Registry of available tools.
@@ -1090,6 +1097,8 @@ impl ToolRegistry {
                 secrets: None,
                 deno: None,
                 interruption: None,
+                tool_sessions: None,
+                internal_mcp_url: None,
             })),
         }
     }
@@ -1117,6 +1126,8 @@ impl ToolRegistry {
                 secrets: None,
                 deno: None,
                 interruption: None,
+                tool_sessions: None,
+                internal_mcp_url: None,
             })),
         }
     }
@@ -1144,6 +1155,8 @@ impl ToolRegistry {
                 secrets: None,
                 deno: None,
                 interruption: None,
+                tool_sessions: None,
+                internal_mcp_url: None,
             })),
         }
     }
@@ -1202,6 +1215,20 @@ impl ToolRegistry {
     pub async fn set_interruption(&self, interruption: Arc<InterruptionState>) {
         let mut guard = self.state.write().await;
         guard.interruption = Some(interruption);
+    }
+
+    /// Set the tool session store for chaining tokens.
+    /// Called when the HTTP server starts to enable tool chaining.
+    pub async fn set_tool_sessions(&self, sessions: Arc<permissions::ToolSessionStore>) {
+        let mut guard = self.state.write().await;
+        guard.tool_sessions = Some(sessions);
+    }
+
+    /// Set the internal MCP URL for tool chaining.
+    /// Called by the HTTP server with its own localhost address.
+    pub async fn set_internal_mcp_url(&self, url: String) {
+        let mut guard = self.state.write().await;
+        guard.internal_mcp_url = Some(url);
     }
 
     /// Get all tool metadata (definitions + permissions).
@@ -1278,6 +1305,154 @@ impl ToolRegistry {
             .filter(|t| t.agent_allowed)
             .map(|t| format!("mcp__winter__{}", t.definition.name))
             .collect()
+    }
+
+    /// Get the DID of this Winter instance (from the ATProto client).
+    pub async fn get_did(&self) -> Option<String> {
+        let state = self.state.read().await;
+        state.atproto.did().await
+    }
+
+    /// Execute a custom tool by its rkey (for AT URI-based tool chaining).
+    ///
+    /// Looks up the tool by rkey instead of name, enabling AT URI resolution.
+    pub async fn execute_custom_tool_by_rkey(
+        &self,
+        rkey: &str,
+        input: &HashMap<String, Value>,
+    ) -> CallToolResult {
+        let state = self.state.read().await;
+
+        // Look up the tool by rkey
+        let tool = match state
+            .atproto
+            .get_record::<winter_atproto::CustomTool>(winter_atproto::TOOL_COLLECTION, rkey)
+            .await
+        {
+            Ok(record) => record.value,
+            Err(e) => {
+                return CallToolResult::error(format!(
+                    "Tool with rkey '{}' not found: {}",
+                    rkey, e
+                ))
+            }
+        };
+
+        // Build arguments in the format run_custom_tool expects
+        let mut arguments = HashMap::new();
+        arguments.insert("name".to_string(), Value::String(tool.name.clone()));
+        arguments.insert("input".to_string(), json!(input));
+
+        custom_tools::run_custom_tool(
+            &state,
+            state.secrets.as_ref(),
+            state.deno.as_ref(),
+            &arguments,
+        )
+        .await
+    }
+
+    /// Execute a remote tool fetched from another agent's PDS.
+    ///
+    /// Fetches the tool code from the remote PDS and executes it locally
+    /// in a sandboxed Deno environment (no network, no secrets, no workspace).
+    /// The caller's session has already validated that this tool_ref is allowed.
+    pub async fn execute_remote_tool(
+        &self,
+        did: &str,
+        rkey: &str,
+        input: &HashMap<String, Value>,
+    ) -> CallToolResult {
+        let state = self.state.read().await;
+
+        let Some(ref deno) = state.deno else {
+            return CallToolResult::error("Deno executor not configured");
+        };
+
+        // Resolve the remote DID to a PDS URL
+        let pds_url = match custom_tools::resolve_pds_for_did(did).await {
+            Some(url) => url,
+            None => {
+                return CallToolResult::error(format!(
+                    "Could not resolve PDS for DID: {}",
+                    did
+                ))
+            }
+        };
+
+        // Fetch the tool record from the remote PDS (public XRPC)
+        let url = format!(
+            "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
+            pds_url, did, "diy.razorgirl.winter.tool", rkey
+        );
+
+        let response = match reqwest::get(&url).await {
+            Ok(r) => r,
+            Err(e) => {
+                return CallToolResult::error(format!(
+                    "Failed to fetch remote tool: {}",
+                    e
+                ))
+            }
+        };
+
+        if !response.status().is_success() {
+            return CallToolResult::error(format!(
+                "Remote tool not found (HTTP {}): at://{}/diy.razorgirl.winter.tool/{}",
+                response.status(),
+                did,
+                rkey
+            ));
+        }
+
+        let body: serde_json::Value = match response.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                return CallToolResult::error(format!(
+                    "Failed to parse remote tool response: {}",
+                    e
+                ))
+            }
+        };
+
+        let tool: winter_atproto::CustomTool = match body
+            .get("value")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+        {
+            Some(t) => t,
+            None => {
+                return CallToolResult::error("Failed to parse remote tool record")
+            }
+        };
+
+        tracing::info!(
+            tool = %tool.name,
+            did = %did,
+            rkey = %rkey,
+            "Executing remote tool (sandboxed)"
+        );
+
+        // Remote tools always run sandboxed — no network, no secrets, no workspace.
+        // This is safe because we're executing untrusted code from another PDS.
+        let permissions = crate::deno::DenoPermissions::default();
+
+        match deno.execute(&tool.code, &serde_json::json!(input), permissions).await {
+            Ok(output) => CallToolResult::success(
+                json!({
+                    "result": output.result,
+                    "duration_ms": output.duration_ms,
+                    "sandboxed": true,
+                    "remote": true,
+                    "source_did": did,
+                    "tool_name": tool.name,
+                })
+                .to_string(),
+            ),
+            Err(e) => CallToolResult::error(format!(
+                "Remote tool execution failed (sandboxed): {}",
+                e
+            )),
+        }
     }
 
     /// Execute a tool by name.

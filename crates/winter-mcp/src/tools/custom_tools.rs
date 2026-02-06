@@ -20,6 +20,7 @@ use winter_atproto::{
     TOOL_COLLECTION, Tid, ToolApproval, ToolApprovalStatus,
 };
 
+use super::permissions::PermissionVec;
 use super::{ToolMeta, ToolState};
 
 /// Maximum code size (64KB).
@@ -67,6 +68,11 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Subprocess commands this tool needs to run (e.g., ['git'])"
+                    },
+                    "required_tools": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Tools this tool needs to call for chaining. Use AT URIs for custom tools (e.g., 'at://did:plc:xxx/diy.razorgirl.winter.tool/rkey') and plain names for built-in MCP tools (e.g., 'query_facts'). AT URIs enable cross-agent tool sharing."
                     }
                 },
                 "required": ["name", "description", "code", "input_schema"]
@@ -107,6 +113,11 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Subprocess commands this tool needs to run (optional)"
+                    },
+                    "required_tools": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Tools this tool needs to call (optional). Use AT URIs for custom tools, plain names for built-in MCP tools."
                     }
                 },
                 "required": ["name", "code"]
@@ -235,15 +246,270 @@ async fn find_tool_by_name(
     Ok(None)
 }
 
+/// Build a mapping from tool name to AT URI for allowed_tools entries.
+/// This lets Deno tools call chained tools by name instead of AT URI.
+///
+/// If multiple AT URIs resolve to the same tool name (e.g., same-named tools
+/// on different PDSs), the name is ambiguous and excluded from the map.
+/// Tool code must use AT URIs directly to disambiguate.
+async fn build_tool_name_map(state: &ToolState, allowed_tools: &[String]) -> HashMap<String, String> {
+    use super::permissions::parse_at_uri;
+    use std::collections::HashSet;
+
+    let mut name_map = HashMap::new();
+    if allowed_tools.is_empty() {
+        return name_map;
+    }
+
+    // Collect (AT URI, DID, rkey) tuples to resolve
+    let at_uri_tools: Vec<(&str, &str, &str)> = allowed_tools
+        .iter()
+        .filter_map(|t| {
+            parse_at_uri(t).map(|(did, _col, rkey)| (t.as_str(), did, rkey))
+        })
+        .collect();
+
+    if at_uri_tools.is_empty() {
+        return name_map;
+    }
+
+    // Resolve local tools (same PDS)
+    if let Ok(tools) = state
+        .atproto
+        .list_all_records::<CustomTool>(TOOL_COLLECTION)
+        .await
+    {
+        for item in &tools {
+            let rkey = item.uri.split('/').next_back().unwrap_or("");
+            for (at_uri, _did, uri_rkey) in &at_uri_tools {
+                if rkey == *uri_rkey {
+                    name_map.insert(item.value.name.clone(), at_uri.to_string());
+                }
+            }
+        }
+    }
+
+    // Resolve remote tools — fetch tool record from each remote DID's PDS
+    let local_did = state.atproto.did().await;
+    for (at_uri, did, rkey) in &at_uri_tools {
+        if local_did.as_deref() == Some(*did) {
+            continue; // Already resolved above
+        }
+        // Fetch individual tool record from remote PDS
+        if let Some(pds_url) = resolve_pds_for_did(did).await {
+            let url = format!(
+                "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
+                pds_url, did, TOOL_COLLECTION, rkey
+            );
+            if let Ok(response) = reqwest::get(&url).await {
+                if response.status().is_success() {
+                    if let Ok(body) = response.json::<serde_json::Value>().await {
+                        if let Some(value) = body.get("value") {
+                            if let Ok(tool) = serde_json::from_value::<CustomTool>(value.clone()) {
+                                name_map.insert(tool.name.clone(), at_uri.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Remove ambiguous names (multiple AT URIs resolved to the same name)
+    let mut seen_names: HashMap<String, Vec<String>> = HashMap::new();
+    for (name, uri) in &name_map {
+        seen_names
+            .entry(name.clone())
+            .or_default()
+            .push(uri.clone());
+    }
+    let ambiguous: HashSet<String> = seen_names
+        .into_iter()
+        .filter(|(_, uris)| uris.len() > 1)
+        .map(|(name, uris)| {
+            warn!(
+                name = %name,
+                uris = ?uris,
+                "Ambiguous tool name maps to multiple AT URIs — use AT URIs in tool code to disambiguate"
+            );
+            name
+        })
+        .collect();
+    for name in &ambiguous {
+        name_map.remove(name);
+    }
+
+    name_map
+}
+
 /// Get approval for a tool.
+///
+/// Checks both Winter's PDS (for auto-approvals and legacy) and the operator's PDS
+/// (for operator-granted approvals). Operator PDS approvals take precedence.
 async fn get_approval(state: &ToolState, tool_rkey: &str) -> Option<ToolApproval> {
-    // Approvals are keyed by tool_rkey
+    // First check operator's PDS if WINTER_OPERATOR_DID is set
+    match std::env::var("WINTER_OPERATOR_DID") {
+        Ok(operator_did) => {
+            info!(
+                operator_did = %operator_did,
+                tool_rkey = %tool_rkey,
+                "Checking operator's PDS for approval"
+            );
+            if let Some(approval) = get_operator_approval(&operator_did, tool_rkey).await {
+                // Verify winter_did if set
+                if let Some(ref winter_did) = approval.winter_did {
+                    if let Some(our_did) = state.atproto.did().await {
+                        if winter_did != &our_did {
+                            warn!(
+                                expected = %our_did,
+                                found = %winter_did,
+                                "Operator approval winter_did mismatch, ignoring"
+                            );
+                            // Fall through to local check
+                        } else {
+                            info!(tool_rkey = %tool_rkey, "Found valid operator approval");
+                            return Some(approval);
+                        }
+                    } else {
+                        return Some(approval);
+                    }
+                } else {
+                    info!(tool_rkey = %tool_rkey, "Found operator approval (no winter_did binding)");
+                    return Some(approval);
+                }
+            }
+        }
+        Err(_) => {
+            info!(
+                tool_rkey = %tool_rkey,
+                "WINTER_OPERATOR_DID not set, skipping operator PDS check"
+            );
+        }
+    }
+
+    // Fallback: check Winter's own PDS (auto-approvals and legacy approvals)
+    info!(tool_rkey = %tool_rkey, "Checking Winter's own PDS for approval (fallback)");
     state
         .atproto
         .get_record::<ToolApproval>(TOOL_APPROVAL_COLLECTION, tool_rkey)
         .await
         .ok()
         .map(|r| r.value)
+}
+
+/// Fetch tool approval from operator's PDS (public XRPC, no auth needed).
+async fn get_operator_approval(operator_did: &str, tool_rkey: &str) -> Option<ToolApproval> {
+    // Resolve operator's PDS endpoint
+    let pds_url = match resolve_pds_for_did(operator_did).await {
+        Some(url) => url,
+        None => {
+            warn!(
+                operator_did = %operator_did,
+                tool_rkey = %tool_rkey,
+                "Could not resolve PDS URL for operator DID"
+            );
+            return None;
+        }
+    };
+
+    let url = format!(
+        "{}/xrpc/com.atproto.repo.getRecord?repo={}&collection={}&rkey={}",
+        pds_url,
+        operator_did,
+        "diy.razorgirl.winter.toolApproval",
+        tool_rkey
+    );
+
+    let response = match reqwest::get(&url).await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                error = %e,
+                operator_did = %operator_did,
+                tool_rkey = %tool_rkey,
+                "Failed to fetch operator approval from PDS"
+            );
+            return None;
+        }
+    };
+
+    if !response.status().is_success() {
+        let status = response.status();
+        info!(
+            status = %status,
+            operator_did = %operator_did,
+            tool_rkey = %tool_rkey,
+            "No approval record found on operator's PDS"
+        );
+        return None;
+    }
+
+    // Parse the response — ATProto getRecord returns { uri, cid, value }
+    let body: serde_json::Value = match response.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                error = %e,
+                tool_rkey = %tool_rkey,
+                "Failed to parse operator approval response"
+            );
+            return None;
+        }
+    };
+    let value = match body.get("value") {
+        Some(v) => v,
+        None => {
+            warn!(
+                tool_rkey = %tool_rkey,
+                "Operator approval response missing 'value' field"
+            );
+            return None;
+        }
+    };
+    match serde_json::from_value::<ToolApproval>(value.clone()) {
+        Ok(approval) => Some(approval),
+        Err(e) => {
+            warn!(
+                error = %e,
+                tool_rkey = %tool_rkey,
+                "Failed to deserialize operator approval record"
+            );
+            None
+        }
+    }
+}
+
+/// Resolve the PDS URL for a DID via the DID document.
+pub(crate) async fn resolve_pds_for_did(did: &str) -> Option<String> {
+    let doc_url = if did.starts_with("did:plc:") {
+        format!("https://plc.directory/{}", did)
+    } else if did.starts_with("did:web:") {
+        let domain = did.strip_prefix("did:web:")?;
+        format!("https://{}/.well-known/did.json", domain)
+    } else {
+        return None;
+    };
+
+    let response = reqwest::get(&doc_url).await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let doc: serde_json::Value = response.json().await.ok()?;
+
+    // Find the ATProto PDS service endpoint
+    let services = doc.get("service")?.as_array()?;
+    for service in services {
+        let service_type = service.get("type")?.as_str()?;
+        if service_type == "AtprotoPersonalDataServer" {
+            return service
+                .get("serviceEndpoint")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim_end_matches('/').to_string());
+        }
+    }
+
+    None
 }
 
 /// Check if a tool is approved for its current version.
@@ -404,6 +670,16 @@ pub async fn create_custom_tool(
         })
         .unwrap_or_default();
 
+    let required_tools: Vec<String> = arguments
+        .get("required_tools")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let now = Utc::now();
     let tool = CustomTool {
         name: name.to_string(),
@@ -413,12 +689,17 @@ pub async fn create_custom_tool(
         required_secrets: required_secrets.clone(),
         requires_workspace: if requires_workspace { Some(true) } else { None },
         required_commands: required_commands.clone(),
+        required_tools: required_tools.clone(),
         version: 1,
         created_at: now,
         last_updated: Some(now),
     };
 
     let rkey = Tid::now().to_string();
+
+    // Check if tool is safe (auto-approval eligible)
+    let perms = PermissionVec::from_tool(&tool);
+    let is_safe = perms.is_safe();
 
     match state
         .atproto
@@ -431,29 +712,75 @@ pub async fn create_custom_tool(
                 cache.upsert_tool(rkey.clone(), tool.clone(), response.cid.clone());
             }
 
-            // Notify operator
-            notify_operator(
-                state,
-                name,
-                &rkey,
-                &required_secrets,
-                requires_workspace,
-                &required_commands,
-            )
-            .await;
+            if is_safe {
+                // Auto-approve safe tools — no operator intervention needed
+                info!(tool = %name, "Auto-approving safe tool (no network, no secrets, no writes, safe MCP tools only)");
+                let auto_approval = ToolApproval {
+                    tool_rkey: rkey.clone(),
+                    tool_version: 1,
+                    status: ToolApprovalStatus::Approved,
+                    allow_network: Some(false),
+                    allowed_secrets: Vec::new(),
+                    workspace_path: None,
+                    allow_workspace_read: Some(perms.workspace_read),
+                    allow_workspace_write: Some(false),
+                    allowed_commands: Vec::new(),
+                    allowed_tools: tool.required_tools.clone(),
+                    winter_did: None,
+                    operator_did: None,
+                    approved_by: Some("auto".to_string()),
+                    reason: Some("Auto-approved: safe tool (no network, no secrets, no writes)".to_string()),
+                    created_at: Utc::now(),
+                };
+                if let Err(e) = state
+                    .atproto
+                    .put_record(TOOL_APPROVAL_COLLECTION, &rkey, &auto_approval)
+                    .await
+                {
+                    warn!(error = %e, "Failed to auto-approve safe tool");
+                } else if let Some(cache) = &state.cache {
+                    cache.upsert_tool_approval(rkey.clone(), auto_approval, String::new());
+                }
 
-            CallToolResult::success(
-                json!({
-                    "rkey": rkey,
-                    "uri": response.uri,
-                    "cid": response.cid,
-                    "name": name,
-                    "version": 1,
-                    "status": "pending_approval",
-                    "message": "Tool created. The operator has been notified for approval. You can test it sandboxed with run_custom_tool."
-                })
-                .to_string(),
-            )
+                CallToolResult::success(
+                    json!({
+                        "rkey": rkey,
+                        "uri": response.uri,
+                        "cid": response.cid,
+                        "name": name,
+                        "version": 1,
+                        "status": "approved",
+                        "auto_approved": true,
+                        "message": "Tool created and auto-approved (safe tool: no network, no secrets, no writes). Ready to run."
+                    })
+                    .to_string(),
+                )
+            } else {
+                // Unsafe tool — notify operator for approval
+                notify_operator(
+                    state,
+                    name,
+                    &rkey,
+                    &required_secrets,
+                    requires_workspace,
+                    &required_commands,
+                )
+                .await;
+
+                CallToolResult::success(
+                    json!({
+                        "rkey": rkey,
+                        "uri": response.uri,
+                        "cid": response.cid,
+                        "name": name,
+                        "version": 1,
+                        "status": "pending_approval",
+                        "auto_approved": false,
+                        "message": "Tool created. The operator has been notified for approval. You can test it sandboxed with run_custom_tool."
+                    })
+                    .to_string(),
+                )
+            }
         }
         Err(e) => CallToolResult::error(format!("Failed to create tool: {}", e)),
     }
@@ -521,6 +848,16 @@ pub async fn update_custom_tool(
             .collect();
     }
 
+    if let Some(tools_list) = arguments
+        .get("required_tools")
+        .and_then(|v| v.as_array())
+    {
+        tool.required_tools = tools_list
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+    }
+
     // Delete any existing approval (code changed = re-approval required)
     if state
         .atproto
@@ -534,6 +871,10 @@ pub async fn update_custom_tool(
         }
     }
 
+    // Check if updated tool is safe
+    let perms = PermissionVec::from_tool(&tool);
+    let is_safe = perms.is_safe();
+
     match state
         .atproto
         .put_record(TOOL_COLLECTION, &rkey, &tool)
@@ -545,29 +886,75 @@ pub async fn update_custom_tool(
                 cache.upsert_tool(rkey.clone(), tool.clone(), response.cid.clone());
             }
 
-            // Notify operator
-            notify_operator(
-                state,
-                name,
-                &rkey,
-                &tool.required_secrets,
-                tool.requires_workspace.unwrap_or(false),
-                &tool.required_commands,
-            )
-            .await;
+            if is_safe {
+                // Auto-approve safe tools
+                info!(tool = %name, "Auto-approving updated safe tool");
+                let auto_approval = ToolApproval {
+                    tool_rkey: rkey.clone(),
+                    tool_version: tool.version,
+                    status: ToolApprovalStatus::Approved,
+                    allow_network: Some(false),
+                    allowed_secrets: Vec::new(),
+                    workspace_path: None,
+                    allow_workspace_read: Some(perms.workspace_read),
+                    allow_workspace_write: Some(false),
+                    allowed_commands: Vec::new(),
+                    allowed_tools: tool.required_tools.clone(),
+                    winter_did: None,
+                    operator_did: None,
+                    approved_by: Some("auto".to_string()),
+                    reason: Some("Auto-approved: safe tool (no network, no secrets, no writes)".to_string()),
+                    created_at: Utc::now(),
+                };
+                if let Err(e) = state
+                    .atproto
+                    .put_record(TOOL_APPROVAL_COLLECTION, &rkey, &auto_approval)
+                    .await
+                {
+                    warn!(error = %e, "Failed to auto-approve safe tool");
+                } else if let Some(cache) = &state.cache {
+                    cache.upsert_tool_approval(rkey.clone(), auto_approval, String::new());
+                }
 
-            CallToolResult::success(
-                json!({
-                    "rkey": rkey,
-                    "uri": response.uri,
-                    "cid": response.cid,
-                    "name": name,
-                    "version": tool.version,
-                    "status": "pending_approval",
-                    "message": "Tool updated. Previous approval revoked. The operator has been notified."
-                })
-                .to_string(),
-            )
+                CallToolResult::success(
+                    json!({
+                        "rkey": rkey,
+                        "uri": response.uri,
+                        "cid": response.cid,
+                        "name": name,
+                        "version": tool.version,
+                        "status": "approved",
+                        "auto_approved": true,
+                        "message": "Tool updated and auto-approved (safe tool). Ready to run."
+                    })
+                    .to_string(),
+                )
+            } else {
+                // Notify operator for unsafe tools
+                notify_operator(
+                    state,
+                    name,
+                    &rkey,
+                    &tool.required_secrets,
+                    tool.requires_workspace.unwrap_or(false),
+                    &tool.required_commands,
+                )
+                .await;
+
+                CallToolResult::success(
+                    json!({
+                        "rkey": rkey,
+                        "uri": response.uri,
+                        "cid": response.cid,
+                        "name": name,
+                        "version": tool.version,
+                        "status": "pending_approval",
+                        "auto_approved": false,
+                        "message": "Tool updated. Previous approval revoked. The operator has been notified."
+                    })
+                    .to_string(),
+                )
+            }
         }
         Err(e) => CallToolResult::error(format!("Failed to update tool: {}", e)),
     }
@@ -639,12 +1026,14 @@ pub async fn list_custom_tools(
             "required_secrets": item.value.required_secrets,
             "requires_workspace": item.value.requires_workspace,
             "required_commands": item.value.required_commands,
+            "required_tools": item.value.required_tools,
             "allow_network": approval.as_ref().and_then(|a| a.allow_network),
             "allowed_secrets": approval.as_ref().map(|a| &a.allowed_secrets),
             "workspace_path": approval.as_ref().and_then(|a| a.workspace_path.as_ref()),
             "allow_workspace_read": approval.as_ref().and_then(|a| a.allow_workspace_read),
             "allow_workspace_write": approval.as_ref().and_then(|a| a.allow_workspace_write),
             "allowed_commands": approval.as_ref().map(|a| &a.allowed_commands),
+            "allowed_tools": approval.as_ref().map(|a| &a.allowed_tools),
         }));
     }
 
@@ -685,6 +1074,7 @@ pub async fn get_custom_tool(
             "required_secrets": tool.required_secrets,
             "requires_workspace": tool.requires_workspace,
             "required_commands": tool.required_commands,
+            "required_tools": tool.required_tools,
             "version": tool.version,
             "approved": approved,
             "approval": approval.map(|a| json!({
@@ -696,6 +1086,7 @@ pub async fn get_custom_tool(
                 "allow_workspace_read": a.allow_workspace_read,
                 "allow_workspace_write": a.allow_workspace_write,
                 "allowed_commands": a.allowed_commands,
+                "allowed_tools": a.allowed_tools,
                 "reason": a.reason,
             })),
             "created_at": tool.created_at.to_rfc3339(),
@@ -736,6 +1127,9 @@ pub async fn run_custom_tool(
     let approval = get_approval(state, &rkey).await;
     let approved = is_approved(&approval, tool.version);
 
+    // Track the chaining token for cleanup after execution
+    let mut chaining_token: Option<String> = None;
+
     // Build permissions based on approval
     let permissions = if approved {
         let approval = approval.unwrap();
@@ -751,7 +1145,7 @@ pub async fn run_custom_tool(
 
         // Build workspace permission if granted
         let workspace = match (
-            approval.workspace_path,
+            approval.workspace_path.clone(),
             approval.allow_workspace_read,
             approval.allow_workspace_write,
         ) {
@@ -765,11 +1159,57 @@ pub async fn run_custom_tool(
             _ => None,
         };
 
+        // Build tool chaining permissions
+        let allowed_tools = approval.allowed_tools.clone();
+
+        // Build name→AT URI map so Deno tools can call by name
+        let tool_name_map = build_tool_name_map(state, &allowed_tools).await;
+
+        let (tool_token, mcp_url) = if !allowed_tools.is_empty() {
+            // Use the internal MCP URL set by the HTTP server (same container, localhost)
+            let url = match &state.internal_mcp_url {
+                Some(url) => url.clone(),
+                None => {
+                    tracing::warn!("Tool chaining requested but internal_mcp_url not set (HTTP server not running?)");
+                    "http://127.0.0.1:3847".to_string()
+                }
+            };
+
+            // Register a session in the shared store to get a token
+            let token = if let Some(ref sessions) = state.tool_sessions {
+                let caller_perms = PermissionVec::from_approval(&approval);
+                let token = sessions
+                    .register(
+                        allowed_tools.iter().cloned().collect(),
+                        caller_perms,
+                        0, // depth 0 for initial execution
+                    )
+                    .await;
+                Some(token)
+            } else {
+                tracing::warn!(
+                    "Tool chaining requested but no session store available (HTTP server not running?)"
+                );
+                None
+            };
+
+            // Store token for cleanup after execution
+            chaining_token = token.clone();
+
+            (token, Some(url))
+        } else {
+            (None, None)
+        };
+
         DenoPermissions {
             network: approval.allow_network.unwrap_or(false),
             secrets: secret_values,
             workspace,
-            allowed_commands: approval.allowed_commands,
+            allowed_commands: approval.allowed_commands.clone(),
+            allowed_tools,
+            tool_name_map,
+            tool_token,
+            mcp_url,
         }
     } else {
         // Sandboxed execution - no network, no secrets, no workspace, no commands
@@ -788,7 +1228,7 @@ pub async fn run_custom_tool(
         "Executing custom tool"
     );
 
-    match deno.execute(&tool.code, &input, permissions).await {
+    let result = match deno.execute(&tool.code, &input, permissions).await {
         Ok(output) => CallToolResult::success(
             json!({
                 "result": output.result,
@@ -807,7 +1247,16 @@ pub async fn run_custom_tool(
             },
             e
         )),
+    };
+
+    // Clean up the chaining session token (if one was registered)
+    if let Some(ref token) = chaining_token {
+        if let Some(ref sessions) = state.tool_sessions {
+            sessions.remove(token).await;
+        }
     }
+
+    result
 }
 
 pub async fn delete_custom_tool(

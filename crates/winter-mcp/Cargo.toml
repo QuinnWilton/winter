@@ -41,6 +41,12 @@ tempfile = { workspace = true }
 dirs = "5"
 base64.workspace = true
 
+# UUID for tool execution tokens
+uuid = { workspace = true }
+
+# HTTP client for operator PDS lookups
+reqwest = { workspace = true }
+
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = { workspace = true }

@@ -61,6 +61,16 @@ pub struct DenoPermissions {
     pub workspace: Option<WorkspacePermission>,
     /// Subprocess commands the tool can run (e.g., ["git"]).
     pub allowed_commands: Vec<String>,
+    /// MCP tools this tool is allowed to call via chaining.
+    /// When non-empty, a helper module is generated and MCP URL/token are passed.
+    pub allowed_tools: Vec<String>,
+    /// Mapping from tool name to AT URI for custom tools in allowed_tools.
+    /// Allows calling tools by name (e.g., "color_namer") instead of AT URI.
+    pub tool_name_map: HashMap<String, String>,
+    /// Token for authenticating to the /mcp/internal endpoint.
+    pub tool_token: Option<String>,
+    /// URL of the MCP server's internal endpoint.
+    pub mcp_url: Option<String>,
 }
 
 /// Output from a Deno tool execution.
@@ -122,11 +132,69 @@ impl DenoExecutor {
         let secret_names_json =
             serde_json::to_string(&secret_names).unwrap_or_else(|_| "[]".to_string());
 
+        // Generate tool chaining helper if allowed_tools is non-empty
+        let tool_chaining_code = if !permissions.allowed_tools.is_empty() {
+            let allowed_tools_json = serde_json::to_string(&permissions.allowed_tools)
+                .unwrap_or_else(|_| "[]".to_string());
+            let name_map_json = serde_json::to_string(&permissions.tool_name_map)
+                .unwrap_or_else(|_| "{{}}".to_string());
+            format!(
+                r#"
+// Tool chaining helper - allows calling other MCP tools
+const _mcpUrl = Deno.env.get("WINTER_MCP_URL") || "";
+const _toolToken = Deno.env.get("WINTER_TOOL_TOKEN") || "";
+const _allowedTools: string[] = {allowed_tools};
+const _toolNameMap: Record<string, string> = {name_map};
+
+// Resolve a tool reference: names get mapped to AT URIs if known.
+function _resolveToolRef(toolRef: string): string {{
+    if (_toolNameMap[toolRef]) return _toolNameMap[toolRef];
+    return toolRef;
+}}
+
+// Call a tool by name or AT URI.
+// Custom tools can be called by name (e.g., "color_namer")
+// or AT URI (e.g., "at://did:plc:xxx/diy.razorgirl.winter.tool/rkey").
+// Built-in MCP tools use plain names (e.g., "query_facts").
+async function callTool(toolRef: string, args: Record<string, unknown>): Promise<unknown> {{
+    const resolved = _resolveToolRef(toolRef);
+    if (!_allowedTools.includes(resolved)) {{
+        throw new Error(`Tool '${{toolRef}}' is not in the allowed tools list: ${{_allowedTools.join(", ")}}`);
+    }}
+    if (!_mcpUrl || !_toolToken) {{
+        throw new Error("Tool chaining not configured (missing MCP URL or token)");
+    }}
+    const resp = await fetch(`${{_mcpUrl}}/mcp/internal`, {{
+        method: "POST",
+        headers: {{
+            "Content-Type": "application/json",
+            "X-Tool-Token": _toolToken,
+        }},
+        body: JSON.stringify({{ tool_ref: resolved, arguments: args }}),
+    }});
+    if (!resp.ok) {{
+        const text = await resp.text();
+        throw new Error(`Tool call failed (${{resp.status}}): ${{text}}`);
+    }}
+    const result = await resp.json();
+    if (!result.success) {{
+        throw new Error(result.error || "Tool call failed");
+    }}
+    return result.result;
+}}
+"#,
+                allowed_tools = allowed_tools_json,
+                name_map = name_map_json,
+            )
+        } else {
+            String::new()
+        };
+
         // Create wrapper that imports the tool and handles stdin/stdout
         let wrapper_code = format!(
             r#"
 import tool from "file://{}";
-
+{tool_chaining}
 async function readStdin(): Promise<string> {{
     const buf = new Uint8Array(1024 * 1024); // 1MB buffer
     let totalRead = 0;
@@ -164,6 +232,7 @@ for (const name of secretNames) {{
 const context = {{
     secrets,
     workspace: Deno.env.get("WINTER_WORKSPACE") || null,
+    callTool: typeof callTool !== "undefined" ? callTool : undefined,
 }};
 
 const inputText = await readStdin();
@@ -177,6 +246,7 @@ try {{
 }}
 "#,
             tool_file.path().display(),
+            tool_chaining = tool_chaining_code,
             secret_names = secret_names_json
         );
 
@@ -192,6 +262,9 @@ try {{
 
         if permissions.network {
             cmd.arg("--allow-net");
+        } else if !permissions.allowed_tools.is_empty() {
+            // Tool chaining needs localhost access even without general network
+            cmd.arg("--allow-net=127.0.0.1,localhost");
         }
 
         // Build environment variable permissions
@@ -216,6 +289,12 @@ try {{
 
         // Always allow WINTER_WORKSPACE read (will be empty if not granted)
         env_vars.push("WINTER_WORKSPACE");
+
+        // Tool chaining env vars
+        if !permissions.allowed_tools.is_empty() {
+            env_vars.push("WINTER_MCP_URL");
+            env_vars.push("WINTER_TOOL_TOKEN");
+        }
 
         if !env_vars.is_empty() {
             cmd.arg(format!("--allow-env={}", env_vars.join(",")));
@@ -273,6 +352,14 @@ try {{
         // Add workspace path as environment variable if workspace access is granted
         if let Some(ref workspace) = permissions.workspace {
             cmd.env("WINTER_WORKSPACE", &workspace.path);
+        }
+
+        // Add tool chaining env vars
+        if let Some(ref mcp_url) = permissions.mcp_url {
+            cmd.env("WINTER_MCP_URL", mcp_url);
+        }
+        if let Some(ref token) = permissions.tool_token {
+            cmd.env("WINTER_TOOL_TOKEN", token);
         }
 
         // Deno-specific settings
@@ -439,6 +526,7 @@ export default async function(_input: {}): Promise<{ key: string }> {
             secrets,
             workspace: None,
             allowed_commands: Vec::new(),
+            ..Default::default()
         };
 
         let result = executor
@@ -476,6 +564,7 @@ export default async function(_input: {}, context: { secrets: Record<string, str
             secrets,
             workspace: None,
             allowed_commands: Vec::new(),
+            ..Default::default()
         };
 
         let result = executor
