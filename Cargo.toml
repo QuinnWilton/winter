@@ -9,6 +9,7 @@ members = [
     "crates/winter-scheduler",
     "crates/winter-web",
     "crates/winter-claude",
+    "crates/winter-wiki-web",
 ]
 resolver = "2"
 
