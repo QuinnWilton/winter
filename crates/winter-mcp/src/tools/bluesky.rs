@@ -1,6 +1,7 @@
 //! Bluesky tools for MCP.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 use winter_atproto::{ByteSlice, Facet, FacetFeature};
@@ -12,7 +13,49 @@ use super::{ToolMeta, ToolState};
 
 use base64::Engine;
 
+/// Infer MIME type from a file extension.
+fn mime_from_extension(path: &Path) -> Option<&'static str> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("png") => Some("image/png"),
+        Some("webp") => Some("image/webp"),
+        Some("gif") => Some("image/gif"),
+        _ => None,
+    }
+}
+
+/// Resolve and validate an image path within the workspace.
+///
+/// The path can be absolute (must be inside workspace) or relative
+/// (resolved against workspace root). Path traversal is rejected.
+fn resolve_workspace_path(path: &str, workspace: &Path) -> Result<PathBuf, String> {
+    let candidate = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        workspace.join(path)
+    };
+
+    // Canonicalize to resolve symlinks and ..
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|e| format!("cannot access '{}': {}", path, e))?;
+
+    // Must be inside workspace
+    if !resolved.starts_with(workspace) {
+        return Err(format!(
+            "path '{}' is outside the workspace",
+            path
+        ));
+    }
+
+    Ok(resolved)
+}
+
 /// Parse images from the JSON arguments.
+///
+/// Each image needs `alt` text plus one of:
+/// - `path`: file path (relative to workspace, or absolute within workspace)
+/// - `data`: base64-encoded image bytes
 fn parse_images(arguments: &HashMap<String, Value>) -> Result<Vec<ImageInput>, String> {
     let images_value = match arguments.get("images") {
         Some(v) => v,
@@ -24,28 +67,70 @@ fn parse_images(arguments: &HashMap<String, Value>) -> Result<Vec<ImageInput>, S
         None => return Ok(Vec::new()),
     };
 
+    let workspace = std::env::var("WINTER_WORKSPACE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
+
     let mut images = Vec::new();
     for (i, img) in images_array.iter().enumerate() {
-        let data_b64 = img
-            .get("data")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("images[{}]: missing 'data' field", i))?;
-
         let alt = img
             .get("alt")
             .and_then(|v| v.as_str())
             .ok_or_else(|| format!("images[{}]: missing 'alt' field", i))?;
 
-        let mime_type = img
-            .get("mime_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("image/jpeg")
-            .to_string();
+        let has_path = img.get("path").and_then(|v| v.as_str()).is_some();
+        let has_data = img.get("data").and_then(|v| v.as_str()).is_some();
 
-        // Decode base64 data
-        let data = base64::engine::general_purpose::STANDARD
-            .decode(data_b64)
-            .map_err(|e| format!("images[{}]: invalid base64: {}", i, e))?;
+        let (data, mime_type) = if has_path {
+            let path_str = img.get("path").unwrap().as_str().unwrap();
+
+            let workspace = workspace.as_ref().ok_or_else(|| {
+                format!(
+                    "images[{}]: file paths require WINTER_WORKSPACE to be set",
+                    i
+                )
+            })?;
+
+            let resolved = resolve_workspace_path(path_str, workspace)
+                .map_err(|e| format!("images[{}]: {}", i, e))?;
+
+            let mime = img
+                .get("mime_type")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| mime_from_extension(&resolved).map(String::from))
+                .ok_or_else(|| {
+                    format!(
+                        "images[{}]: cannot infer MIME type from '{}' — set mime_type explicitly",
+                        i, path_str
+                    )
+                })?;
+
+            let bytes = std::fs::read(&resolved)
+                .map_err(|e| format!("images[{}]: failed to read '{}': {}", i, path_str, e))?;
+
+            (bytes, mime)
+        } else if has_data {
+            let data_b64 = img.get("data").unwrap().as_str().unwrap();
+
+            let mime = img
+                .get("mime_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("image/jpeg")
+                .to_string();
+
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data_b64)
+                .map_err(|e| format!("images[{}]: invalid base64: {}", i, e))?;
+
+            (bytes, mime)
+        } else {
+            return Err(format!(
+                "images[{}]: must provide either 'path' (workspace file) or 'data' (base64)",
+                i
+            ));
+        };
 
         images.push(ImageInput {
             data,
@@ -127,15 +212,16 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     },
                     "images": {
                         "type": "array",
-                        "description": "Images to attach (max 4). Each image requires base64-encoded data and alt text.",
+                        "description": "Images to attach (max 4). Provide either a workspace file path or base64 data for each image.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "data": { "type": "string", "description": "Base64-encoded image data" },
+                                "path": { "type": "string", "description": "File path relative to the workspace (e.g., 'output/chart.png'). MIME type is inferred from extension." },
+                                "data": { "type": "string", "description": "Base64-encoded image data (alternative to path)" },
                                 "alt": { "type": "string", "description": "Alt text description (required for accessibility)" },
-                                "mime_type": { "type": "string", "description": "MIME type (default: image/jpeg). Supported: image/jpeg, image/png, image/webp, image/gif" }
+                                "mime_type": { "type": "string", "description": "MIME type (auto-detected from path extension, or default image/jpeg for base64). Supported: image/jpeg, image/png, image/webp, image/gif" }
                             },
-                            "required": ["data", "alt"]
+                            "required": ["alt"]
                         }
                     },
                     "facets": {
@@ -185,15 +271,16 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     },
                     "images": {
                         "type": "array",
-                        "description": "Images to attach (max 4). Each image requires base64-encoded data and alt text.",
+                        "description": "Images to attach (max 4). Provide either a workspace file path or base64 data for each image.",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "data": { "type": "string", "description": "Base64-encoded image data" },
+                                "path": { "type": "string", "description": "File path relative to the workspace (e.g., 'output/chart.png'). MIME type is inferred from extension." },
+                                "data": { "type": "string", "description": "Base64-encoded image data (alternative to path)" },
                                 "alt": { "type": "string", "description": "Alt text description (required for accessibility)" },
-                                "mime_type": { "type": "string", "description": "MIME type (default: image/jpeg). Supported: image/jpeg, image/png, image/webp, image/gif" }
+                                "mime_type": { "type": "string", "description": "MIME type (auto-detected from path extension, or default image/jpeg for base64). Supported: image/jpeg, image/png, image/webp, image/gif" }
                             },
-                            "required": ["data", "alt"]
+                            "required": ["alt"]
                         }
                     },
                     "facets": {
