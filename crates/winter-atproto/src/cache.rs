@@ -17,7 +17,7 @@ const MAX_PENDING_EVENTS: usize = 10_000;
 
 use crate::{
     BlogEntry, CustomTool, DaemonState, Directive, Fact, FactDeclaration, Follow, Identity, Job,
-    Like, Note, Post, Repost, Rule, Thought, ToolApproval,
+    Like, Note, Post, Repost, Rule, Thought, ToolApproval, WikiEntry, WikiLink,
 };
 
 /// Synchronization state of the cache.
@@ -181,6 +181,25 @@ pub enum CacheUpdate {
     BlogEntryUpdated { rkey: String, entry: BlogEntry },
     /// A blog entry was deleted.
     BlogEntryDeleted { rkey: String },
+    /// A wiki entry was created.
+    WikiEntryCreated {
+        rkey: String,
+        entry: WikiEntry,
+    },
+    /// A wiki entry was updated.
+    WikiEntryUpdated {
+        rkey: String,
+        entry: WikiEntry,
+    },
+    /// A wiki entry was deleted.
+    WikiEntryDeleted { rkey: String },
+    /// A wiki link was created.
+    WikiLinkCreated {
+        rkey: String,
+        link: WikiLink,
+    },
+    /// A wiki link was deleted.
+    WikiLinkDeleted { rkey: String },
     /// A fact declaration was created.
     DeclarationCreated {
         rkey: String,
@@ -262,6 +281,10 @@ pub struct RepoCache {
     tool_approvals: DashMap<String, CachedRecord<ToolApproval>>,
     /// Cached blog entries by rkey.
     blog_entries: DashMap<String, CachedRecord<BlogEntry>>,
+    /// Cached wiki entries by rkey.
+    wiki_entries: DashMap<String, CachedRecord<WikiEntry>>,
+    /// Cached wiki links by rkey.
+    wiki_links: DashMap<String, CachedRecord<WikiLink>>,
     /// Cached fact declarations by rkey.
     declarations: DashMap<String, CachedRecord<FactDeclaration>>,
     // =========================================================================
@@ -309,6 +332,8 @@ impl RepoCache {
             tools: DashMap::new(),
             tool_approvals: DashMap::new(),
             blog_entries: DashMap::new(),
+            wiki_entries: DashMap::new(),
+            wiki_links: DashMap::new(),
             declarations: DashMap::new(),
             state: AtomicU8::new(SyncState::Disconnected as u8),
             repo_rev: RwLock::new(None),
@@ -1274,6 +1299,121 @@ impl RepoCache {
     }
 
     // =========================================================================
+    // WikiEntry methods
+    // =========================================================================
+
+    /// Get a wiki entry by rkey.
+    pub fn get_wiki_entry(&self, rkey: &str) -> Option<CachedRecord<WikiEntry>> {
+        self.wiki_entries.get(rkey).map(|r| r.value().clone())
+    }
+
+    /// List all wiki entries.
+    pub fn list_wiki_entries(&self) -> Vec<(String, CachedRecord<WikiEntry>)> {
+        self.wiki_entries
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect()
+    }
+
+    /// Get the number of cached wiki entries.
+    pub fn wiki_entry_count(&self) -> usize {
+        self.wiki_entries.len()
+    }
+
+    /// Insert or update a wiki entry.
+    pub fn upsert_wiki_entry(&self, rkey: String, entry: WikiEntry, cid: String) {
+        use dashmap::mapref::entry::Entry;
+
+        let cached = CachedRecord {
+            value: entry.clone(),
+            cid,
+        };
+
+        let is_update = match self.wiki_entries.entry(rkey.clone()) {
+            Entry::Occupied(mut e) => {
+                e.insert(cached);
+                true
+            }
+            Entry::Vacant(e) => {
+                e.insert(cached);
+                false
+            }
+        };
+
+        let update = if is_update {
+            CacheUpdate::WikiEntryUpdated {
+                rkey: rkey.clone(),
+                entry: entry.clone(),
+            }
+        } else {
+            CacheUpdate::WikiEntryCreated {
+                rkey: rkey.clone(),
+                entry: entry.clone(),
+            }
+        };
+
+        self.broadcast(update);
+        trace!(rkey = %rkey, title = %entry.title, "cache: wiki entry upserted");
+    }
+
+    /// Delete a wiki entry.
+    pub fn delete_wiki_entry(&self, rkey: &str) {
+        if self.wiki_entries.remove(rkey).is_some() {
+            self.broadcast(CacheUpdate::WikiEntryDeleted {
+                rkey: rkey.to_string(),
+            });
+            trace!(rkey = %rkey, "cache: wiki entry deleted");
+        }
+    }
+
+    // =========================================================================
+    // WikiLink methods
+    // =========================================================================
+
+    /// Get a wiki link by rkey.
+    pub fn get_wiki_link(&self, rkey: &str) -> Option<CachedRecord<WikiLink>> {
+        self.wiki_links.get(rkey).map(|r| r.value().clone())
+    }
+
+    /// List all wiki links.
+    pub fn list_wiki_links(&self) -> Vec<(String, CachedRecord<WikiLink>)> {
+        self.wiki_links
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect()
+    }
+
+    /// Get the number of cached wiki links.
+    pub fn wiki_link_count(&self) -> usize {
+        self.wiki_links.len()
+    }
+
+    /// Insert a wiki link.
+    pub fn insert_wiki_link(&self, rkey: String, link: WikiLink, cid: String) {
+        let cached = CachedRecord {
+            value: link.clone(),
+            cid,
+        };
+        self.wiki_links.insert(rkey.clone(), cached);
+
+        self.broadcast(CacheUpdate::WikiLinkCreated {
+            rkey: rkey.clone(),
+            link: link.clone(),
+        });
+        trace!(rkey = %rkey, link_type = %link.link_type, "cache: wiki link inserted");
+    }
+
+    /// Delete a wiki link.
+    pub fn delete_wiki_link(&self, rkey: &str) {
+        if self.wiki_links.remove(rkey).is_some() {
+            self.broadcast(CacheUpdate::WikiLinkDeleted {
+                rkey: rkey.to_string(),
+            });
+            trace!(rkey = %rkey, "cache: wiki link deleted");
+        }
+    }
+
+    // =========================================================================
     // FactDeclaration methods
     // =========================================================================
 
@@ -1404,6 +1544,8 @@ impl RepoCache {
         self.tools.clear();
         self.tool_approvals.clear();
         self.blog_entries.clear();
+        self.wiki_entries.clear();
+        self.wiki_links.clear();
         self.declarations.clear();
         debug!("cache cleared");
     }
@@ -1556,6 +1698,8 @@ impl RepoCache {
         tools: impl IntoIterator<Item = (String, CustomTool, String)>,
         tool_approvals: impl IntoIterator<Item = (String, ToolApproval, String)>,
         blog_entries: impl IntoIterator<Item = (String, BlogEntry, String)>,
+        wiki_entries: impl IntoIterator<Item = (String, WikiEntry, String)>,
+        wiki_links: impl IntoIterator<Item = (String, WikiLink, String)>,
     ) {
         // Winter collections
         for (rkey, fact, cid) in facts {
@@ -1637,6 +1781,16 @@ impl RepoCache {
                 .insert(rkey, CachedRecord { value: entry, cid });
         }
 
+        // Wiki entries and links
+        for (rkey, entry, cid) in wiki_entries {
+            self.wiki_entries
+                .insert(rkey, CachedRecord { value: entry, cid });
+        }
+        for (rkey, link, cid) in wiki_links {
+            self.wiki_links
+                .insert(rkey, CachedRecord { value: link, cid });
+        }
+
         debug!(
             facts = self.facts.len(),
             rules = self.rules.len(),
@@ -1651,6 +1805,8 @@ impl RepoCache {
             tools = self.tools.len(),
             tool_approvals = self.tool_approvals.len(),
             blog_entries = self.blog_entries.len(),
+            wiki_entries = self.wiki_entries.len(),
+            wiki_links = self.wiki_links.len(),
             "cache populated from CAR (full)"
         );
     }
@@ -1675,6 +1831,8 @@ impl Default for RepoCache {
             tools: DashMap::new(),
             tool_approvals: DashMap::new(),
             blog_entries: DashMap::new(),
+            wiki_entries: DashMap::new(),
+            wiki_links: DashMap::new(),
             declarations: DashMap::new(),
             state: AtomicU8::new(SyncState::Disconnected as u8),
             repo_rev: RwLock::new(None),

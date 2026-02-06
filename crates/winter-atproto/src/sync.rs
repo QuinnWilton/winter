@@ -167,6 +167,14 @@ impl SyncCoordinator {
             .blog_entries
             .into_iter()
             .map(|(rkey, (entry, cid))| (rkey, entry, cid));
+        let wiki_entries = parse_result
+            .wiki_entries
+            .into_iter()
+            .map(|(rkey, (entry, cid))| (rkey, entry, cid));
+        let wiki_links = parse_result
+            .wiki_links
+            .into_iter()
+            .map(|(rkey, (link, cid))| (rkey, link, cid));
 
         self.cache.populate_from_car_full(
             facts,
@@ -184,6 +192,8 @@ impl SyncCoordinator {
             tools,
             tool_approvals,
             blog_entries,
+            wiki_entries,
+            wiki_links,
         );
 
         // Populate daemon state if present (contains followers list)

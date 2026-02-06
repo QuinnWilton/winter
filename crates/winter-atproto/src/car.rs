@@ -14,7 +14,7 @@ use crate::dispatch::extract_record_to_result;
 use crate::{
     AtprotoError, BlogEntry, CustomTool, DaemonState, Directive, Fact, FactDeclaration, Follow,
     IDENTITY_COLLECTION, IDENTITY_KEY, Identity, Job, Like, Note, Post, Repost, Rule,
-    STATE_COLLECTION, STATE_KEY, Thought, ToolApproval,
+    STATE_COLLECTION, STATE_KEY, Thought, ToolApproval, WikiEntry, WikiLink,
 };
 
 /// Result of parsing a CAR file.
@@ -60,6 +60,10 @@ pub struct CarParseResult {
     pub tool_approvals: HashMap<String, (ToolApproval, String)>,
     /// Blog entries extracted from the repo, keyed by rkey.
     pub blog_entries: HashMap<String, (BlogEntry, String)>,
+    /// Wiki entries extracted from the repo, keyed by rkey.
+    pub wiki_entries: HashMap<String, (WikiEntry, String)>,
+    /// Wiki links extracted from the repo, keyed by rkey.
+    pub wiki_links: HashMap<String, (WikiLink, String)>,
 }
 
 /// Parse a CAR file and extract Winter facts and rules.
@@ -133,6 +137,8 @@ pub async fn parse_car(car_bytes: &[u8]) -> Result<CarParseResult, AtprotoError>
         tools = result.tools.len(),
         tool_approvals = result.tool_approvals.len(),
         blog_entries = result.blog_entries.len(),
+        wiki_entries = result.wiki_entries.len(),
+        wiki_links = result.wiki_links.len(),
         has_identity = result.identity.is_some(),
         has_daemon_state = result.daemon_state.is_some(),
         "extracted records from CAR"

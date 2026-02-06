@@ -322,10 +322,13 @@ define_record_dispatch! {
     crate::POST_COLLECTION => crate::Post, upsert_post, delete_post, posts;
     // WhiteWind blog
     crate::BLOG_COLLECTION => crate::BlogEntry, upsert_blog_entry, delete_blog_entry, blog_entries;
+    // Wiki
+    crate::WIKI_ENTRY_COLLECTION => crate::WikiEntry, upsert_wiki_entry, delete_wiki_entry, wiki_entries;
     // Insert-only Bluesky collections (no update, just create/delete)
     @insert crate::FOLLOW_COLLECTION => crate::Follow, insert_follow, delete_follow, follows;
     @insert crate::LIKE_COLLECTION => crate::Like, insert_like, delete_like, likes;
     @insert crate::REPOST_COLLECTION => crate::Repost, insert_repost, delete_repost, reposts;
+    @insert crate::WIKI_LINK_COLLECTION => crate::WikiLink, insert_wiki_link, delete_wiki_link, wiki_links;
 }
 
 #[cfg(test)]
@@ -363,6 +366,12 @@ mod tests {
     #[test]
     fn test_is_tracked_collection_blog() {
         assert!(is_tracked_collection(BLOG_COLLECTION));
+    }
+
+    #[test]
+    fn test_is_tracked_collection_wiki() {
+        assert!(is_tracked_collection(crate::WIKI_ENTRY_COLLECTION));
+        assert!(is_tracked_collection(crate::WIKI_LINK_COLLECTION));
     }
 
     #[test]

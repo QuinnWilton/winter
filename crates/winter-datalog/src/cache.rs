@@ -434,6 +434,26 @@ impl DatalogCache {
                 });
             }
 
+            // Wiki entries
+            let wiki_entries_list = repo_cache.list_wiki_entries();
+            info!(count = wiki_entries_list.len(), "populating wiki entries");
+            for (rkey, cached) in wiki_entries_list {
+                derived.handle_update(&CacheUpdate::WikiEntryCreated {
+                    rkey,
+                    entry: cached.value,
+                });
+            }
+
+            // Wiki links
+            let wiki_links_list = repo_cache.list_wiki_links();
+            info!(count = wiki_links_list.len(), "populating wiki links");
+            for (rkey, cached) in wiki_links_list {
+                derived.handle_update(&CacheUpdate::WikiLinkCreated {
+                    rkey,
+                    link: cached.value,
+                });
+            }
+
             // Followers from daemon state (stored in PDS so MCP can access via CAR)
             let followers = repo_cache.get_followers().await;
             if !followers.is_empty() {
@@ -533,7 +553,12 @@ impl DatalogCache {
             | ref update @ CacheUpdate::ThoughtDeleted { .. }
             | ref update @ CacheUpdate::BlogEntryCreated { .. }
             | ref update @ CacheUpdate::BlogEntryUpdated { .. }
-            | ref update @ CacheUpdate::BlogEntryDeleted { .. } => {
+            | ref update @ CacheUpdate::BlogEntryDeleted { .. }
+            | ref update @ CacheUpdate::WikiEntryCreated { .. }
+            | ref update @ CacheUpdate::WikiEntryUpdated { .. }
+            | ref update @ CacheUpdate::WikiEntryDeleted { .. }
+            | ref update @ CacheUpdate::WikiLinkCreated { .. }
+            | ref update @ CacheUpdate::WikiLinkDeleted { .. } => {
                 // Forward to DerivedFactGenerator
                 let mut derived = self.derived.write().await;
                 derived.handle_update(update);

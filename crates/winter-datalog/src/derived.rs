@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 
 use winter_atproto::{
     BlogEntry, CacheUpdate, CustomTool, Directive, DirectiveKind, Fact, Follow, Job, JobSchedule,
-    Like, Note, Post, Repost, Thought, ToolApproval, ToolApprovalStatus,
+    Like, Note, Post, Repost, Thought, ToolApproval, ToolApprovalStatus, WikiEntry, WikiLink,
 };
 
 use crate::error::DatalogError;
@@ -104,6 +104,42 @@ struct BlogMeta {
     is_draft: bool,
 }
 
+/// Metadata about a wiki entry for derived facts.
+#[derive(Debug, Clone)]
+struct WikiEntryMeta {
+    /// The wiki entry's AT URI.
+    uri: String,
+    /// Entry title.
+    title: String,
+    /// URL-safe slug.
+    slug: String,
+    /// Lifecycle status.
+    status: String,
+    /// Alternative names.
+    aliases: Vec<String>,
+    /// Tags for categorization.
+    tags: Vec<String>,
+    /// Previous version AT URI.
+    supersedes: Option<String>,
+    /// When this entry was created.
+    created_at: DateTime<Utc>,
+    /// When this entry was last updated.
+    last_updated: DateTime<Utc>,
+}
+
+/// Metadata about a wiki link for derived facts.
+#[derive(Debug, Clone)]
+struct WikiLinkMeta {
+    /// Source AT URI.
+    source: String,
+    /// Target AT URI.
+    target: String,
+    /// Semantic link type.
+    link_type: String,
+    /// When this link was created.
+    created_at: DateTime<Utc>,
+}
+
 /// Metadata about a like for derived facts.
 #[derive(Debug, Clone)]
 struct LikeMeta {
@@ -185,6 +221,10 @@ pub struct DerivedFactGenerator {
     thoughts: HashMap<String, ThoughtMeta>,
     /// Blog entry records: rkey -> blog metadata.
     blog_entries: HashMap<String, BlogMeta>,
+    /// Wiki entry records: rkey -> wiki entry metadata.
+    wiki_entries: HashMap<String, WikiEntryMeta>,
+    /// Wiki link records: rkey -> wiki link metadata.
+    wiki_links: HashMap<String, WikiLinkMeta>,
     /// Fact tags: rkey -> tags.
     fact_tags: HashMap<String, Vec<String>>,
 
@@ -218,6 +258,8 @@ impl DerivedFactGenerator {
             notes: HashMap::new(),
             thoughts: HashMap::new(),
             blog_entries: HashMap::new(),
+            wiki_entries: HashMap::new(),
+            wiki_links: HashMap::new(),
             fact_tags: HashMap::new(),
             followers: HashSet::new(),
             dirty_predicates: HashSet::new(),
@@ -276,6 +318,12 @@ impl DerivedFactGenerator {
                 | "tool_call_duration"
                 // Winter: blog
                 | "has_blog_post"
+                // Winter: wiki
+                | "has_wiki_entry"
+                | "wiki_entry_alias"
+                | "wiki_entry_tag"
+                | "wiki_entry_supersedes"
+                | "has_wiki_link"
                 // Winter: fact tags
                 | "fact_tag"
         )
@@ -642,6 +690,48 @@ impl DerivedFactGenerator {
             },
         );
 
+        // Wiki entry predicates
+        m.insert(
+            "has_wiki_entry",
+            PredicateInfo {
+                arity: 7,
+                args: &["uri", "title", "slug", "status", "created_at", "last_updated", "rkey"],
+                description: "Your wiki entries",
+            },
+        );
+        m.insert(
+            "wiki_entry_alias",
+            PredicateInfo {
+                arity: 3,
+                args: &["entry_uri", "alias", "rkey"],
+                description: "Alternative names for wiki entries (one row per alias)",
+            },
+        );
+        m.insert(
+            "wiki_entry_tag",
+            PredicateInfo {
+                arity: 3,
+                args: &["entry_uri", "tag", "rkey"],
+                description: "Tags on wiki entries (one row per tag)",
+            },
+        );
+        m.insert(
+            "wiki_entry_supersedes",
+            PredicateInfo {
+                arity: 3,
+                args: &["new_uri", "old_uri", "rkey"],
+                description: "Wiki entry version chain",
+            },
+        );
+        m.insert(
+            "has_wiki_link",
+            PredicateInfo {
+                arity: 5,
+                args: &["source_uri", "target_uri", "link_type", "created_at", "rkey"],
+                description: "Semantic links between records",
+            },
+        );
+
         // Fact tags
         m.insert(
             "fact_tag",
@@ -764,6 +854,25 @@ impl DerivedFactGenerator {
             }
             CacheUpdate::BlogEntryDeleted { rkey } => {
                 self.remove_blog_entry(rkey);
+            }
+
+            // Wiki entries
+            CacheUpdate::WikiEntryCreated { rkey, entry } => {
+                self.add_wiki_entry(rkey.clone(), entry);
+            }
+            CacheUpdate::WikiEntryUpdated { rkey, entry } => {
+                self.add_wiki_entry(rkey.clone(), entry);
+            }
+            CacheUpdate::WikiEntryDeleted { rkey } => {
+                self.remove_wiki_entry(rkey);
+            }
+
+            // Wiki links
+            CacheUpdate::WikiLinkCreated { rkey, link } => {
+                self.add_wiki_link(rkey.clone(), link);
+            }
+            CacheUpdate::WikiLinkDeleted { rkey } => {
+                self.remove_wiki_link(rkey);
             }
 
             // Facts (for tags)
@@ -1258,6 +1367,101 @@ impl DerivedFactGenerator {
     }
 
     // =========================================================================
+    // Wiki entry handling
+    // =========================================================================
+
+    fn add_wiki_entry(&mut self, rkey: String, entry: &WikiEntry) {
+        let uri = format!(
+            "at://{}/diy.razorgirl.winter.wikiEntry/{}",
+            self.self_did, rkey
+        );
+
+        let had_aliases = self
+            .wiki_entries
+            .get(&rkey)
+            .map(|m| !m.aliases.is_empty())
+            .unwrap_or(false);
+        let had_tags = self
+            .wiki_entries
+            .get(&rkey)
+            .map(|m| !m.tags.is_empty())
+            .unwrap_or(false);
+        let had_supersedes = self
+            .wiki_entries
+            .get(&rkey)
+            .map(|m| m.supersedes.is_some())
+            .unwrap_or(false);
+
+        self.wiki_entries.insert(
+            rkey,
+            WikiEntryMeta {
+                uri,
+                title: entry.title.clone(),
+                slug: entry.slug.clone(),
+                status: entry.status.clone(),
+                aliases: entry.aliases.clone(),
+                tags: entry.tags.clone(),
+                supersedes: entry.supersedes.clone(),
+                created_at: entry.created_at,
+                last_updated: entry.last_updated,
+            },
+        );
+
+        self.dirty_predicates.insert("has_wiki_entry".to_string());
+        if !entry.aliases.is_empty() || had_aliases {
+            self.dirty_predicates
+                .insert("wiki_entry_alias".to_string());
+        }
+        if !entry.tags.is_empty() || had_tags {
+            self.dirty_predicates.insert("wiki_entry_tag".to_string());
+        }
+        if entry.supersedes.is_some() || had_supersedes {
+            self.dirty_predicates
+                .insert("wiki_entry_supersedes".to_string());
+        }
+    }
+
+    fn remove_wiki_entry(&mut self, rkey: &str) {
+        if let Some(meta) = self.wiki_entries.remove(rkey) {
+            self.dirty_predicates.insert("has_wiki_entry".to_string());
+            if !meta.aliases.is_empty() {
+                self.dirty_predicates
+                    .insert("wiki_entry_alias".to_string());
+            }
+            if !meta.tags.is_empty() {
+                self.dirty_predicates.insert("wiki_entry_tag".to_string());
+            }
+            if meta.supersedes.is_some() {
+                self.dirty_predicates
+                    .insert("wiki_entry_supersedes".to_string());
+            }
+        }
+    }
+
+    // =========================================================================
+    // Wiki link handling
+    // =========================================================================
+
+    fn add_wiki_link(&mut self, rkey: String, link: &WikiLink) {
+        self.wiki_links.insert(
+            rkey,
+            WikiLinkMeta {
+                source: link.source.clone(),
+                target: link.target.clone(),
+                link_type: link.link_type.clone(),
+                created_at: link.created_at,
+            },
+        );
+        self.dirty_predicates.insert("has_wiki_link".to_string());
+    }
+
+    fn remove_wiki_link(&mut self, rkey: &str) {
+        if self.wiki_links.remove(rkey).is_some() {
+            self.dirty_predicates.insert("has_wiki_link".to_string());
+        }
+    }
+
+    // =========================================================================
     // Fact tag handling
     // =========================================================================
 
@@ -1376,6 +1580,8 @@ impl DerivedFactGenerator {
             "has_note" | "note_tag" | "note_related_fact" => self.notes.len(),
             "has_thought" | "thought_tag" | "tool_call_duration" => self.thoughts.len(),
             "has_blog_post" => self.blog_entries.len(),
+            "has_wiki_entry" | "wiki_entry_alias" | "wiki_entry_tag" | "wiki_entry_supersedes" => self.wiki_entries.len(),
+            "has_wiki_link" => self.wiki_links.len(),
             "has_tool" => self.tools.len(),
             "has_job" => self.jobs.len(),
             _ => 0,
@@ -1677,6 +1883,59 @@ impl DerivedFactGenerator {
             }
 
             // =================================================================
+            // Wiki entries
+            // =================================================================
+            "has_wiki_entry" => {
+                for (rkey, meta) in &self.wiki_entries {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        meta.uri,
+                        escape_tsv(&meta.title),
+                        meta.slug,
+                        meta.status,
+                        meta.created_at.to_rfc3339(),
+                        meta.last_updated.to_rfc3339(),
+                        rkey
+                    )?;
+                }
+            }
+            "wiki_entry_alias" => {
+                for (rkey, meta) in &self.wiki_entries {
+                    for alias in &meta.aliases {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, escape_tsv(alias), rkey)?;
+                    }
+                }
+            }
+            "wiki_entry_tag" => {
+                for (rkey, meta) in &self.wiki_entries {
+                    for tag in &meta.tags {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, tag, rkey)?;
+                    }
+                }
+            }
+            "wiki_entry_supersedes" => {
+                for (rkey, meta) in &self.wiki_entries {
+                    if let Some(ref old_uri) = meta.supersedes {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, old_uri, rkey)?;
+                    }
+                }
+            }
+            "has_wiki_link" => {
+                for (rkey, meta) in &self.wiki_links {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}\t{}",
+                        meta.source,
+                        meta.target,
+                        meta.link_type,
+                        meta.created_at.to_rfc3339(),
+                        rkey
+                    )?;
+                }
+            }
+
+            // =================================================================
             // Fact Tags
             // =================================================================
             "fact_tag" => {
@@ -1725,6 +1984,8 @@ impl DerivedFactGenerator {
             notes: self.notes.len(),
             thoughts: self.thoughts.len(),
             blog_entries: self.blog_entries.len(),
+            wiki_entries: self.wiki_entries.len(),
+            wiki_links: self.wiki_links.len(),
         }
     }
 
@@ -1768,6 +2029,8 @@ impl DerivedFactGenerator {
             notes: self.notes.clone(),
             thoughts: self.thoughts.clone(),
             blog_entries: self.blog_entries.clone(),
+            wiki_entries: self.wiki_entries.clone(),
+            wiki_links: self.wiki_links.clone(),
             fact_tags: self.fact_tags.clone(),
             followers: self.followers.clone(),
         }
@@ -1793,6 +2056,8 @@ pub struct DerivedFlushSnapshot {
     notes: HashMap<String, NoteMeta>,
     thoughts: HashMap<String, ThoughtMeta>,
     blog_entries: HashMap<String, BlogMeta>,
+    wiki_entries: HashMap<String, WikiEntryMeta>,
+    wiki_links: HashMap<String, WikiLinkMeta>,
     fact_tags: HashMap<String, Vec<String>>,
     followers: HashSet<String>,
 }
@@ -2174,6 +2439,59 @@ impl DerivedFlushSnapshot {
             }
 
             // =================================================================
+            // Wiki entries
+            // =================================================================
+            "has_wiki_entry" => {
+                for (rkey, meta) in &self.wiki_entries {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        meta.uri,
+                        escape_tsv(&meta.title),
+                        meta.slug,
+                        meta.status,
+                        meta.created_at.to_rfc3339(),
+                        meta.last_updated.to_rfc3339(),
+                        rkey
+                    )?;
+                }
+            }
+            "wiki_entry_alias" => {
+                for (rkey, meta) in &self.wiki_entries {
+                    for alias in &meta.aliases {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, escape_tsv(alias), rkey)?;
+                    }
+                }
+            }
+            "wiki_entry_tag" => {
+                for (rkey, meta) in &self.wiki_entries {
+                    for tag in &meta.tags {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, tag, rkey)?;
+                    }
+                }
+            }
+            "wiki_entry_supersedes" => {
+                for (rkey, meta) in &self.wiki_entries {
+                    if let Some(ref old_uri) = meta.supersedes {
+                        writeln!(file, "{}\t{}\t{}", meta.uri, old_uri, rkey)?;
+                    }
+                }
+            }
+            "has_wiki_link" => {
+                for (rkey, meta) in &self.wiki_links {
+                    writeln!(
+                        file,
+                        "{}\t{}\t{}\t{}\t{}",
+                        meta.source,
+                        meta.target,
+                        meta.link_type,
+                        meta.created_at.to_rfc3339(),
+                        rkey
+                    )?;
+                }
+            }
+
+            // =================================================================
             // Fact tags
             // =================================================================
             "fact_tag" => {
@@ -2209,6 +2527,8 @@ pub struct DerivedFactStats {
     pub notes: usize,
     pub thoughts: usize,
     pub blog_entries: usize,
+    pub wiki_entries: usize,
+    pub wiki_links: usize,
 }
 
 /// Escape tabs and newlines in a string for TSV output.
