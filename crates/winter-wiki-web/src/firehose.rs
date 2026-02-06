@@ -88,6 +88,7 @@ impl FirehoseConsumer {
     /// Process a firehose message. Returns the sequence number on success.
     async fn process_message(&self, data: &[u8]) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
         // Parse CBOR double-frame: header + payload
+        // Use ciborium for the header (no CID fields, supports cursor-based partial read)
         let mut cursor = Cursor::new(data);
         let header: FrameHeader = ciborium::from_reader(&mut cursor)?;
 
@@ -95,8 +96,10 @@ impl FirehoseConsumer {
             return Ok(0);
         }
 
+        // Use serde_ipld_dagcbor for the payload (understands CBOR tag 42 CID links)
+        let payload_offset = cursor.position() as usize;
         let payload: CommitPayload =
-            ciborium::from_reader(&mut cursor)?;
+            serde_ipld_dagcbor::from_slice(&data[payload_offset..])?;
 
         let seq = payload.seq;
 
