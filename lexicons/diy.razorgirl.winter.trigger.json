@@ -1,0 +1,108 @@
+{
+  "lexicon": 1,
+  "id": "diy.razorgirl.winter.trigger",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Datalog trigger record. Defines a condition query and action. Key is a TID.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["name", "description", "condition", "action", "createdAt"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Human-readable name for this trigger",
+            "maxLength": 64
+          },
+          "description": {
+            "type": "string",
+            "description": "Description of what this trigger does",
+            "maxLength": 1024
+          },
+          "condition": {
+            "type": "string",
+            "description": "Datalog query that defines the trigger condition",
+            "maxLength": 2048
+          },
+          "conditionRules": {
+            "type": "string",
+            "description": "Extra datalog rules for the condition query",
+            "maxLength": 4096
+          },
+          "action": {
+            "type": "union",
+            "description": "Action to perform when condition yields new results",
+            "refs": [
+              "#createFact",
+              "#createInboxItem",
+              "#deleteFact"
+            ]
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether this trigger is enabled",
+            "default": true
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this trigger was created"
+          }
+        }
+      }
+    },
+    "createFact": {
+      "type": "object",
+      "required": ["type", "predicate", "args"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "create_fact"
+        },
+        "predicate": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "args": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 1024 },
+          "maxLength": 10
+        },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 64 },
+          "maxLength": 20
+        }
+      }
+    },
+    "createInboxItem": {
+      "type": "object",
+      "required": ["type", "message"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "create_inbox_item"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      }
+    },
+    "deleteFact": {
+      "type": "object",
+      "required": ["type", "rkey"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "const": "delete_fact"
+        },
+        "rkey": {
+          "type": "string",
+          "maxLength": 64
+        }
+      }
+    }
+  }
+}
