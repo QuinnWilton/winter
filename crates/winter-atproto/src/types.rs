@@ -788,6 +788,67 @@ pub struct Note {
     pub last_updated: DateTime<Utc>,
 }
 
+/// Wiki entry record (diy.razorgirl.winter.wikiEntry).
+///
+/// Replaces the Note type. A wiki entry is a structured knowledge page with
+/// slug-based linking, aliases, and lifecycle status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WikiEntry {
+    /// Display title.
+    pub title: String,
+    /// URL-safe identifier for `[[slug]]` syntax. Lowercase alphanumeric + hyphens.
+    pub slug: String,
+    /// Alternative names for `[[alias]]` resolution.
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
+    pub aliases: Vec<String>,
+    /// Plain-text abstract for previews.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Markdown content with `[[wiki-link]]` syntax (max 100KB).
+    pub content: String,
+    /// Lifecycle status: draft, stable, deprecated.
+    pub status: String,
+    /// Previous version of this entry (AT URI).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    /// Tags for categorization.
+    #[serde(default, deserialize_with = "deserialize_null_as_default")]
+    pub tags: Vec<String>,
+    /// When this entry was created.
+    #[serde(default = "default_datetime")]
+    pub created_at: DateTime<Utc>,
+    /// When this entry was last updated.
+    #[serde(default = "default_datetime")]
+    pub last_updated: DateTime<Utc>,
+}
+
+/// Wiki link record (diy.razorgirl.winter.wikiLink).
+///
+/// A typed semantic link between two records (wiki entries, blog posts, etc.).
+/// Supports cross-PDS linking via AT URIs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WikiLink {
+    /// The record doing the linking (AT URI).
+    pub source: String,
+    /// The record being linked to (AT URI, can be cross-PDS).
+    pub target: String,
+    /// Semantic relationship type (e.g., "related-to", "depends-on", "extends").
+    pub link_type: String,
+    /// Section heading slug within source.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_anchor: Option<String>,
+    /// Section heading slug within target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_anchor: Option<String>,
+    /// Why this link exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// When this link was created.
+    pub created_at: DateTime<Utc>,
+}
+
 /// WhiteWind blog entry record (com.whtwnd.blog.entry).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

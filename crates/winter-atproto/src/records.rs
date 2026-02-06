@@ -36,6 +36,12 @@ pub const DIRECTIVE_COLLECTION: &str = "diy.razorgirl.winter.directive";
 /// Lexicon NSID for Winter fact declaration records.
 pub const FACT_DECLARATION_COLLECTION: &str = "diy.razorgirl.winter.factDeclaration";
 
+/// Lexicon NSID for Winter wiki entry records.
+pub const WIKI_ENTRY_COLLECTION: &str = "diy.razorgirl.winter.wikiEntry";
+
+/// Lexicon NSID for Winter wiki link records.
+pub const WIKI_LINK_COLLECTION: &str = "diy.razorgirl.winter.wikiLink";
+
 /// Lexicon NSID for WhiteWind blog entry records.
 pub const BLOG_COLLECTION: &str = "com.whtwnd.blog.entry";
 

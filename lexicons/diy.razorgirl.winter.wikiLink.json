@@ -1,0 +1,63 @@
+{
+  "lexicon": 1,
+  "id": "diy.razorgirl.winter.wikiLink",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Typed semantic link between records (wiki entries, blog posts, etc.). Key is a TID.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["source", "target", "linkType", "createdAt"],
+        "properties": {
+          "source": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "The record doing the linking"
+          },
+          "target": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "The record being linked to (can be cross-PDS)"
+          },
+          "linkType": {
+            "type": "string",
+            "description": "Semantic relationship type",
+            "knownValues": [
+              "related-to",
+              "depends-on",
+              "extends",
+              "contradicts",
+              "is-example-of",
+              "supersedes",
+              "references",
+              "defines",
+              "is-part-of"
+            ],
+            "maxLength": 64
+          },
+          "sourceAnchor": {
+            "type": "string",
+            "description": "Section heading slug within source",
+            "maxLength": 128
+          },
+          "targetAnchor": {
+            "type": "string",
+            "description": "Section heading slug within target",
+            "maxLength": 128
+          },
+          "context": {
+            "type": "string",
+            "description": "Why this link exists",
+            "maxLength": 1024
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this link was created"
+          }
+        }
+      }
+    }
+  }
+}

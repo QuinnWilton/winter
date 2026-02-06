@@ -1,0 +1,76 @@
+{
+  "lexicon": 1,
+  "id": "diy.razorgirl.winter.wikiEntry",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Wiki entry record with slug-based linking and lifecycle status. Key is a TID.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["title", "slug", "content", "status", "createdAt", "lastUpdated"],
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "Display title",
+            "maxLength": 256
+          },
+          "slug": {
+            "type": "string",
+            "description": "URL-safe identifier for [[slug]] syntax. Lowercase alphanumeric + hyphens.",
+            "maxLength": 128
+          },
+          "aliases": {
+            "type": "array",
+            "description": "Alternative names for [[alias]] resolution",
+            "items": {
+              "type": "string",
+              "maxLength": 128
+            },
+            "maxLength": 20
+          },
+          "summary": {
+            "type": "string",
+            "description": "Plain-text abstract for previews",
+            "maxLength": 512
+          },
+          "content": {
+            "type": "string",
+            "description": "Markdown content with [[wiki-link]] syntax (max 100KB)",
+            "maxLength": 102400
+          },
+          "status": {
+            "type": "string",
+            "description": "Lifecycle status",
+            "knownValues": ["draft", "stable", "deprecated"],
+            "maxLength": 32
+          },
+          "supersedes": {
+            "type": "string",
+            "format": "at-uri",
+            "description": "Previous version of this entry"
+          },
+          "tags": {
+            "type": "array",
+            "description": "Tags for categorization",
+            "items": {
+              "type": "string",
+              "maxLength": 64
+            },
+            "maxLength": 20
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this entry was created"
+          },
+          "lastUpdated": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this entry was last updated"
+          }
+        }
+      }
+    }
+  }
+}
