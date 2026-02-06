@@ -37,6 +37,7 @@ services:
       - WINTER_PDS_URL=${WINTER_PDS_URL}
       - WINTER_HANDLE=${WINTER_HANDLE}
       - WINTER_APP_PASSWORD=${WINTER_APP_PASSWORD}
+      - WINTER_OPERATOR_DID=${WINTER_OPERATOR_DID}
       - WINTER_FIREHOSE_URL=${WINTER_FIREHOSE_URL:-wss://bsky.network}
       - WINTER_WEB_URL=${WINTER_WEB_URL:-http://localhost:8080}
       - WINTER_SECRETS_PATH=/home/winter/.config/winter/secrets.json
@@ -67,6 +68,7 @@ services:
       - WINTER_PDS_URL=${WINTER_PDS_URL}
       - WINTER_HANDLE=${WINTER_HANDLE}
       - WINTER_APP_PASSWORD=${WINTER_APP_PASSWORD}
+      - WINTER_OPERATOR_DID=${WINTER_OPERATOR_DID}
       - WINTER_FIREHOSE_URL=${WINTER_FIREHOSE_URL:-wss://bsky.network}
       - WINTER_WEB_URL=${WINTER_WEB_URL:-http://localhost:8080}
       - WINTER_SECRETS_PATH=/home/winter/.config/winter/secrets.json
@@ -95,6 +97,7 @@ services:
       - WINTER_WEB_URL=${WINTER_WEB_URL:-http://localhost:8080}
       - WINTER_SECRETS_PATH=/home/winter/.config/winter/secrets.json
       - WINTER_WORKSPACE=/home/winter/workspace
+      - WINTER_OPERATOR_DID=${WINTER_OPERATOR_DID}
       - WINTER_FAST_FORWARD=${WINTER_FAST_FORWARD:-}
       # Enable HTTP MCP transport - connects to persistent mcp-server container
       - WINTER_MCP_URL=http://mcp-server:3847/mcp
