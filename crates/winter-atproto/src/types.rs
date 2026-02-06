@@ -1036,6 +1036,9 @@ pub struct CustomTool {
     /// Whether this tool needs access to the workspace directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_workspace: Option<bool>,
+    /// Whether this tool needs network access (overrides auto-detection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requires_network: Option<bool>,
     /// Subprocess commands this tool needs to run (e.g., ["git"]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_commands: Vec<String>,

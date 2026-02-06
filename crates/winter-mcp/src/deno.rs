@@ -4,7 +4,6 @@
 //! tools using Deno's permission model.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -38,17 +37,6 @@ pub enum DenoError {
     InvalidOutput(String),
 }
 
-/// Workspace access permissions.
-#[derive(Debug, Clone)]
-pub struct WorkspacePermission {
-    /// The workspace directory path.
-    pub path: PathBuf,
-    /// Whether read access is granted.
-    pub read: bool,
-    /// Whether write access is granted.
-    pub write: bool,
-}
-
 /// Permissions granted to a Deno tool.
 #[derive(Debug, Clone, Default)]
 pub struct DenoPermissions {
@@ -57,8 +45,6 @@ pub struct DenoPermissions {
     /// Secrets to expose as environment variables.
     /// Keys are env var names (e.g., "WINTER_SECRET_API_KEY").
     pub secrets: HashMap<String, String>,
-    /// Workspace directory access.
-    pub workspace: Option<WorkspacePermission>,
     /// Subprocess commands the tool can run (e.g., ["git"]).
     pub allowed_commands: Vec<String>,
     /// MCP tools this tool is allowed to call via chaining.
@@ -287,7 +273,7 @@ try {{
             env_vars.push(key.as_str());
         }
 
-        // Always allow WINTER_WORKSPACE read (will be empty if not granted)
+        // Workspace is always available to all tools
         env_vars.push("WINTER_WORKSPACE");
 
         // Tool chaining env vars
@@ -309,6 +295,9 @@ try {{
             ""
         };
 
+        // Workspace path — always granted to all tools
+        let workspace_path = std::env::var("WINTER_WORKSPACE").ok().filter(|p| !p.is_empty());
+
         let mut read_paths = format!(
             "{},{}{}",
             tool_file.path().display(),
@@ -316,21 +305,15 @@ try {{
             if permissions.network { cert_paths } else { "" }
         );
 
-        // Add workspace read permission if granted
-        if let Some(ref workspace) = permissions.workspace
-            && workspace.read
-        {
+        if let Some(ref ws) = workspace_path {
             read_paths.push(',');
-            read_paths.push_str(&workspace.path.display().to_string());
+            read_paths.push_str(ws);
         }
 
         cmd.arg(format!("--allow-read={}", read_paths));
 
-        // Add workspace write permission if granted
-        if let Some(ref workspace) = permissions.workspace
-            && workspace.write
-        {
-            cmd.arg(format!("--allow-write={}", workspace.path.display()));
+        if let Some(ref ws) = workspace_path {
+            cmd.arg(format!("--allow-write={}", ws));
         }
 
         // Add subprocess command permissions if granted
@@ -349,9 +332,9 @@ try {{
         // Add secrets
         cmd.envs(&permissions.secrets);
 
-        // Add workspace path as environment variable if workspace access is granted
-        if let Some(ref workspace) = permissions.workspace {
-            cmd.env("WINTER_WORKSPACE", &workspace.path);
+        // Workspace path always available
+        if let Some(ref ws) = workspace_path {
+            cmd.env("WINTER_WORKSPACE", ws);
         }
 
         // Add tool chaining env vars
@@ -524,7 +507,6 @@ export default async function(_input: {}): Promise<{ key: string }> {
         let permissions = DenoPermissions {
             network: false,
             secrets,
-            workspace: None,
             allowed_commands: Vec::new(),
             ..Default::default()
         };
@@ -562,7 +544,6 @@ export default async function(_input: {}, context: { secrets: Record<string, str
         let permissions = DenoPermissions {
             network: false,
             secrets,
-            workspace: None,
             allowed_commands: Vec::new(),
             ..Default::default()
         };

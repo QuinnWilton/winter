@@ -3,7 +3,7 @@
 //! This module provides tools for creating, managing, and running
 //! custom JavaScript/TypeScript tools in a sandboxed Deno environment.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::deno::{DenoExecutor, DenoPermissions, WorkspacePermission};
+use crate::deno::{DenoExecutor, DenoPermissions};
 use crate::protocol::{CallToolResult, ToolDefinition};
 use crate::secrets::SecretManager;
 use winter_atproto::{
@@ -64,6 +64,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "description": "Whether this tool needs access to the workspace directory for file operations"
                     },
+                    "requires_network": {
+                        "type": "boolean",
+                        "description": "Whether this tool needs network access. Auto-detected from code (remote imports, fetch, etc.) but set this to true to override detection."
+                    },
                     "required_commands": {
                         "type": "array",
                         "items": { "type": "string" },
@@ -108,6 +112,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "requires_workspace": {
                         "type": "boolean",
                         "description": "Whether this tool needs access to the workspace directory (optional)"
+                    },
+                    "requires_network": {
+                        "type": "boolean",
+                        "description": "Whether this tool needs network access (optional, auto-detected from code)"
                     },
                     "required_commands": {
                         "type": "array",
@@ -254,7 +262,6 @@ async fn find_tool_by_name(
 /// Tool code must use AT URIs directly to disambiguate.
 async fn build_tool_name_map(state: &ToolState, allowed_tools: &[String]) -> HashMap<String, String> {
     use super::permissions::parse_at_uri;
-    use std::collections::HashSet;
 
     let mut name_map = HashMap::new();
     if allowed_tools.is_empty() {
@@ -512,6 +519,74 @@ pub(crate) async fn resolve_pds_for_did(did: &str) -> Option<String> {
     None
 }
 
+/// Check if a tool is auto-approvable, including transitive checks for chained tools.
+///
+/// A tool is auto-approvable if:
+/// 1. Its own PermissionVec is safe (no network, no secrets, no commands, only safe MCP tools)
+/// 2. Any custom tool AT URIs it chains to are local (same PDS) and themselves auto-approvable
+///
+/// Uses a visited set to handle cycles (a cycle makes the tool not auto-approvable).
+async fn is_auto_approvable(state: &ToolState, tool: &CustomTool) -> bool {
+    let mut visited = HashSet::new();
+    is_auto_approvable_inner(state, tool, &mut visited).await
+}
+
+async fn is_auto_approvable_inner(
+    state: &ToolState,
+    tool: &CustomTool,
+    visited: &mut HashSet<String>,
+) -> bool {
+    use super::permissions::{is_at_uri, is_safe_mcp_tool, parse_at_uri};
+
+    let perms = PermissionVec::from_tool(tool);
+
+    // Check non-tool dimensions
+    if perms.network || !perms.secrets.is_empty() || !perms.commands.is_empty() {
+        return false;
+    }
+
+    // Check each tool reference
+    let our_did = state.atproto.did().await;
+    for tool_ref in &perms.mcp_tools {
+        if is_at_uri(tool_ref) {
+            // It's a custom tool reference — check if it's local and safe
+            let Some((did, _collection, rkey)) = parse_at_uri(tool_ref) else {
+                return false;
+            };
+
+            // Must be on our own PDS
+            if our_did.as_deref() != Some(did) {
+                return false;
+            }
+
+            // Cycle detection
+            if !visited.insert(rkey.to_string()) {
+                return false;
+            }
+
+            // Look up the referenced tool
+            let referenced_tool = if let Some(cache) = &state.cache {
+                cache.get_tool(rkey).map(|r| r.value)
+            } else {
+                None
+            };
+
+            let Some(referenced_tool) = referenced_tool else {
+                return false; // Can't find it — not safe to auto-approve
+            };
+
+            // Recursively check the referenced tool
+            if !Box::pin(is_auto_approvable_inner(state, &referenced_tool, visited)).await {
+                return false;
+            }
+        } else if !is_safe_mcp_tool(tool_ref) {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Check if a tool is approved for its current version.
 fn is_approved(approval: &Option<ToolApproval>, tool_version: i32) -> bool {
     approval
@@ -526,7 +601,6 @@ async fn notify_operator(
     tool_name: &str,
     tool_rkey: &str,
     required_secrets: &[String],
-    requires_workspace: bool,
     required_commands: &[String],
 ) {
     // Get operator DID from identity
@@ -553,12 +627,6 @@ async fn notify_operator(
         required_secrets.join(", ")
     };
 
-    let workspace_info = if requires_workspace {
-        "\nRequires workspace: Yes"
-    } else {
-        ""
-    };
-
     let commands_info = if required_commands.is_empty() {
         String::new()
     } else {
@@ -569,8 +637,8 @@ async fn notify_operator(
     let review_url = format!("{}/tools/{}", web_url(), tool_rkey);
     info!(url = %review_url, "Tool approval notification URL");
     let message_prefix = format!(
-        "I created/updated a tool \"{}\" that needs your approval.\n\nRequired secrets: {}{}{}\n\nPlease review at ",
-        tool_name, secrets_list, workspace_info, commands_info
+        "I created/updated a tool \"{}\" that needs your approval.\n\nRequired secrets: {}{}\n\nPlease review at ",
+        tool_name, secrets_list, commands_info
     );
     let message = format!("{}{}", message_prefix, review_url);
 
@@ -660,6 +728,10 @@ pub async fn create_custom_tool(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    let requires_network = arguments
+        .get("requires_network")
+        .and_then(|v| v.as_bool());
+
     let required_commands: Vec<String> = arguments
         .get("required_commands")
         .and_then(|v| v.as_array())
@@ -688,6 +760,7 @@ pub async fn create_custom_tool(
         input_schema,
         required_secrets: required_secrets.clone(),
         requires_workspace: if requires_workspace { Some(true) } else { None },
+        requires_network,
         required_commands: required_commands.clone(),
         required_tools: required_tools.clone(),
         version: 1,
@@ -697,9 +770,8 @@ pub async fn create_custom_tool(
 
     let rkey = Tid::now().to_string();
 
-    // Check if tool is safe (auto-approval eligible)
-    let perms = PermissionVec::from_tool(&tool);
-    let is_safe = perms.is_safe();
+    // Check if tool is safe (auto-approval eligible), including transitive chaining checks
+    let is_safe = is_auto_approvable(state, &tool).await;
 
     match state
         .atproto
@@ -714,7 +786,7 @@ pub async fn create_custom_tool(
 
             if is_safe {
                 // Auto-approve safe tools — no operator intervention needed
-                info!(tool = %name, "Auto-approving safe tool (no network, no secrets, no writes, safe MCP tools only)");
+                info!(tool = %name, "Auto-approving safe tool");
                 let auto_approval = ToolApproval {
                     tool_rkey: rkey.clone(),
                     tool_version: 1,
@@ -722,14 +794,14 @@ pub async fn create_custom_tool(
                     allow_network: Some(false),
                     allowed_secrets: Vec::new(),
                     workspace_path: None,
-                    allow_workspace_read: Some(perms.workspace_read),
-                    allow_workspace_write: Some(false),
+                    allow_workspace_read: None,
+                    allow_workspace_write: None,
                     allowed_commands: Vec::new(),
                     allowed_tools: tool.required_tools.clone(),
                     winter_did: None,
                     operator_did: None,
                     approved_by: Some("auto".to_string()),
-                    reason: Some("Auto-approved: safe tool (no network, no secrets, no writes)".to_string()),
+                    reason: Some("Auto-approved: safe tool".to_string()),
                     created_at: Utc::now(),
                 };
                 if let Err(e) = state
@@ -751,7 +823,7 @@ pub async fn create_custom_tool(
                         "version": 1,
                         "status": "approved",
                         "auto_approved": true,
-                        "message": "Tool created and auto-approved (safe tool: no network, no secrets, no writes). Ready to run."
+                        "message": "Tool created and auto-approved. Ready to run."
                     })
                     .to_string(),
                 )
@@ -762,7 +834,6 @@ pub async fn create_custom_tool(
                     name,
                     &rkey,
                     &required_secrets,
-                    requires_workspace,
                     &required_commands,
                 )
                 .await;
@@ -838,6 +909,13 @@ pub async fn update_custom_tool(
         tool.requires_workspace = if requires_workspace { Some(true) } else { None };
     }
 
+    if let Some(requires_network) = arguments
+        .get("requires_network")
+        .and_then(|v| v.as_bool())
+    {
+        tool.requires_network = Some(requires_network);
+    }
+
     if let Some(commands) = arguments
         .get("required_commands")
         .and_then(|v| v.as_array())
@@ -871,9 +949,8 @@ pub async fn update_custom_tool(
         }
     }
 
-    // Check if updated tool is safe
-    let perms = PermissionVec::from_tool(&tool);
-    let is_safe = perms.is_safe();
+    // Check if updated tool is safe (including transitive chaining checks)
+    let is_safe = is_auto_approvable(state, &tool).await;
 
     match state
         .atproto
@@ -896,14 +973,14 @@ pub async fn update_custom_tool(
                     allow_network: Some(false),
                     allowed_secrets: Vec::new(),
                     workspace_path: None,
-                    allow_workspace_read: Some(perms.workspace_read),
-                    allow_workspace_write: Some(false),
+                    allow_workspace_read: None,
+                    allow_workspace_write: None,
                     allowed_commands: Vec::new(),
                     allowed_tools: tool.required_tools.clone(),
                     winter_did: None,
                     operator_did: None,
                     approved_by: Some("auto".to_string()),
-                    reason: Some("Auto-approved: safe tool (no network, no secrets, no writes)".to_string()),
+                    reason: Some("Auto-approved: safe tool (no network, no secrets)".to_string()),
                     created_at: Utc::now(),
                 };
                 if let Err(e) = state
@@ -936,7 +1013,6 @@ pub async fn update_custom_tool(
                     name,
                     &rkey,
                     &tool.required_secrets,
-                    tool.requires_workspace.unwrap_or(false),
                     &tool.required_commands,
                 )
                 .await;
@@ -1143,34 +1219,6 @@ pub async fn run_custom_tool(
             HashMap::new()
         };
 
-        // Build workspace permission if granted
-        let read = approval.allow_workspace_read.unwrap_or(false);
-        let write = approval.allow_workspace_write.unwrap_or(false);
-        let workspace = if read || write {
-            // Use explicit path from approval, or fall back to WINTER_WORKSPACE env var
-            let path = approval
-                .workspace_path
-                .clone()
-                .or_else(|| std::env::var("WINTER_WORKSPACE").ok())
-                .filter(|p| !p.is_empty());
-            match path {
-                Some(p) => Some(WorkspacePermission {
-                    path: std::path::PathBuf::from(p),
-                    read,
-                    write,
-                }),
-                None => {
-                    tracing::warn!(
-                        tool = %rkey,
-                        "Workspace access granted but no path available (set WINTER_WORKSPACE or workspace_path in approval)"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         // Build tool chaining permissions
         let allowed_tools = approval.allowed_tools.clone();
 
@@ -1216,7 +1264,6 @@ pub async fn run_custom_tool(
         DenoPermissions {
             network: approval.allow_network.unwrap_or(false),
             secrets: secret_values,
-            workspace,
             allowed_commands: approval.allowed_commands.clone(),
             allowed_tools,
             tool_name_map,
@@ -1224,7 +1271,7 @@ pub async fn run_custom_tool(
             mcp_url,
         }
     } else {
-        // Sandboxed execution - no network, no secrets, no workspace, no commands
+        // Sandboxed execution - no network, no secrets, no commands
         DenoPermissions::default()
     };
 
@@ -1235,7 +1282,6 @@ pub async fn run_custom_tool(
         sandboxed = sandbox_mode,
         network = permissions.network,
         secrets_count = permissions.secrets.len(),
-        workspace = permissions.workspace.is_some(),
         commands_count = permissions.allowed_commands.len(),
         "Executing custom tool"
     );

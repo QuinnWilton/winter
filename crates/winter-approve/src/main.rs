@@ -10,6 +10,35 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use winter_atproto::{CustomTool, ToolApproval, ToolApprovalStatus};
 
+// Re-use the same network detection logic as the MCP server.
+// This must stay in sync with winter_mcp::tools::permissions::code_needs_network.
+fn code_needs_network(code: &str) -> bool {
+    let remote_prefixes = [
+        "\"https://", "'https://",
+        "\"http://",  "'http://",
+        "\"npm:",     "'npm:",
+        "\"jsr:",     "'jsr:",
+    ];
+
+    for prefix in &remote_prefixes {
+        if code.contains(&format!("from {}", prefix))
+            || code.contains(&format!("import {}", prefix))
+        {
+            return true;
+        }
+        if code.contains(&format!("import({}", prefix))
+            || code.contains(&format!("import ({}", prefix))
+        {
+            return true;
+        }
+    }
+
+    code.contains("fetch(")
+        || code.contains("Deno.connect")
+        || code.contains("new WebSocket")
+        || code.contains("new EventSource")
+}
+
 const TOOL_COLLECTION: &str = "diy.razorgirl.winter.tool";
 const TOOL_APPROVAL_COLLECTION: &str = "diy.razorgirl.winter.toolApproval";
 
@@ -57,15 +86,6 @@ enum Commands {
         /// Allow network access
         #[arg(long)]
         network: bool,
-        /// Allow workspace read
-        #[arg(long)]
-        workspace_read: bool,
-        /// Allow workspace write
-        #[arg(long)]
-        workspace_write: bool,
-        /// Workspace path
-        #[arg(long)]
-        workspace_path: Option<String>,
         /// Secrets to allow (comma-separated)
         #[arg(long, value_delimiter = ',')]
         secrets: Vec<String>,
@@ -421,9 +441,11 @@ async fn resolve_pds_for_did(did: &str) -> Option<String> {
 
 /// Check if a tool is safe (auto-approvable).
 fn is_safe_tool(tool: &CustomTool) -> bool {
-    tool.required_secrets.is_empty()
+    // Check explicit or detected network need
+    let needs_network = tool.requires_network.unwrap_or_else(|| code_needs_network(&tool.code));
+    !needs_network
+        && tool.required_secrets.is_empty()
         && tool.required_commands.is_empty()
-        && !tool.requires_workspace.unwrap_or(false)
         && tool.required_tools.iter().all(|t| {
             // Same safe MCP tools list as in permissions.rs
             matches!(
@@ -539,12 +561,13 @@ fn display_tool(
         None => "pending",
     };
 
+    let needs_network = tool.requires_network.unwrap_or_else(|| code_needs_network(&tool.code));
     println!("  {} (v{}) [{}] - {}", tool.name, tool.version, status, rkey);
+    if needs_network {
+        println!("    Network: yes");
+    }
     if !tool.required_secrets.is_empty() {
         println!("    Secrets: {}", tool.required_secrets.join(", "));
-    }
-    if tool.requires_workspace.unwrap_or(false) {
-        println!("    Requires workspace: yes");
     }
     if !tool.required_commands.is_empty() {
         println!("    Commands: {}", tool.required_commands.join(", "));
@@ -573,17 +596,9 @@ async fn approve_tool_interactive(
     println!("Rkey: {}", rkey);
     println!();
 
-    // Network
-    let net = if tool.code.contains("fetch(")
-        || tool.code.contains("Deno.connect")
-        || tool.description.to_lowercase().contains("network")
-        || tool.description.to_lowercase().contains("fetch")
-        || tool.description.to_lowercase().contains("http")
-    {
-        prompt_yn("Allow network access?", true)
-    } else {
-        prompt_yn("Allow network access?", false)
-    };
+    // Network — default to yes if tool requests or code needs it
+    let needs_network = tool.requires_network.unwrap_or_else(|| code_needs_network(&tool.code));
+    let net = prompt_yn("Allow network access?", needs_network);
 
     // Secrets
     let secs = prompt_select("Select secrets to grant", &tool.required_secrets, all_tools);
@@ -597,21 +612,6 @@ async fn approve_tool_interactive(
         &tool.required_tools,
         all_tools,
     );
-
-    // Workspace
-    let requires_ws = tool.requires_workspace.unwrap_or(false);
-    let (ws_read, ws_write, ws_path) = if requires_ws {
-        let r = prompt_yn("Allow workspace read?", true);
-        let w = prompt_yn("Allow workspace write?", false);
-        eprint!("Workspace path (empty for default): ");
-        let mut path_input = String::new();
-        std::io::stdin().read_line(&mut path_input).unwrap_or(0);
-        let p = path_input.trim();
-        let p = if p.is_empty() { None } else { Some(p.to_string()) };
-        (r, w, p)
-    } else {
-        (false, false, None)
-    };
 
     // Summary
     println!();
@@ -630,12 +630,6 @@ async fn approve_tool_interactive(
             .collect();
         println!("  Allowed tools: {}", names.join(", "));
     }
-    if requires_ws {
-        println!("  Workspace read: {}, write: {}", ws_read, ws_write);
-        if let Some(ref p) = ws_path {
-            println!("  Workspace path: {}", p);
-        }
-    }
     println!();
 
     if !prompt_yn("Approve with these permissions?", false) {
@@ -643,7 +637,7 @@ async fn approve_tool_interactive(
         return false;
     }
 
-    write_approval(client, winter_did, rkey, tool, all_tools, net, secs, cmds, tls, ws_read, ws_write, ws_path, None).await
+    write_approval(client, winter_did, rkey, tool, all_tools, net, secs, cmds, tls, None).await
 }
 
 /// Approve a tool using explicit flags (non-interactive).
@@ -658,12 +652,9 @@ async fn approve_tool_with_flags(
     secrets: Vec<String>,
     commands: Vec<String>,
     tools: Vec<String>,
-    workspace_read: bool,
-    workspace_write: bool,
-    workspace_path: Option<String>,
     reason: Option<String>,
 ) {
-    write_approval(client, winter_did, rkey, tool, all_tools, network, secrets, commands, tools, workspace_read, workspace_write, workspace_path, reason).await;
+    write_approval(client, winter_did, rkey, tool, all_tools, network, secrets, commands, tools, reason).await;
 }
 
 /// Write an approval record to the operator's PDS.
@@ -678,9 +669,6 @@ async fn write_approval(
     secrets: Vec<String>,
     commands: Vec<String>,
     tools: Vec<String>,
-    workspace_read: bool,
-    workspace_write: bool,
-    workspace_path: Option<String>,
     reason: Option<String>,
 ) -> bool {
     let approval = ToolApproval {
@@ -689,9 +677,9 @@ async fn write_approval(
         status: ToolApprovalStatus::Approved,
         allow_network: Some(network),
         allowed_secrets: secrets,
-        workspace_path,
-        allow_workspace_read: Some(workspace_read),
-        allow_workspace_write: Some(workspace_write),
+        workspace_path: None,
+        allow_workspace_read: None,
+        allow_workspace_write: None,
         allowed_commands: commands,
         allowed_tools: tools,
         winter_did: Some(winter_did.to_string()),
@@ -821,14 +809,20 @@ async fn main() {
                 Some((_, tool)) => {
                     println!("Tool: {} (v{})", tool.name, tool.version);
                     println!("Description: {}", tool.description);
+                    let needs_network = tool.requires_network.unwrap_or_else(|| code_needs_network(&tool.code));
                     println!("Safe: {}", if is_safe_tool(tool) { "yes" } else { "no" });
                     println!();
                     println!("Requested permissions:");
+                    if needs_network {
+                        let source = if tool.requires_network == Some(true) {
+                            "explicit"
+                        } else {
+                            "detected from code"
+                        };
+                        println!("  Network: yes ({})", source);
+                    }
                     if !tool.required_secrets.is_empty() {
                         println!("  Secrets: {}", tool.required_secrets.join(", "));
-                    }
-                    if tool.requires_workspace.unwrap_or(false) {
-                        println!("  Workspace: read/write");
                     }
                     if !tool.required_commands.is_empty() {
                         println!("  Commands: {}", tool.required_commands.join(", "));
@@ -857,9 +851,6 @@ async fn main() {
         Commands::Approve {
             rkey,
             network,
-            workspace_read,
-            workspace_write,
-            workspace_path,
             secrets,
             commands,
             tools,
@@ -891,9 +882,6 @@ async fn main() {
 
                 // Determine if any permission flags were explicitly set
                 let has_flags = network
-                    || workspace_read
-                    || workspace_write
-                    || workspace_path.is_some()
                     || !secrets.is_empty()
                     || !commands.is_empty()
                     || !tools.is_empty()
@@ -903,8 +891,7 @@ async fn main() {
                 if has_flags {
                     approve_tool_with_flags(
                         &client, &cli.winter_did, &rkey, tool, &all_tools,
-                        network, secrets, commands, tools,
-                        workspace_read, workspace_write, workspace_path, reason,
+                        network, secrets, commands, tools, reason,
                     ).await;
                 } else {
                     approve_tool_interactive(&client, &cli.winter_did, &rkey, tool, &all_tools).await;

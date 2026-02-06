@@ -43,8 +43,47 @@ pub const SAFE_MCP_TOOLS: &[&str] = &[
     "search_users",
 ];
 
+/// Detect if tool code needs network access based on common patterns.
+/// Catches remote imports, fetch calls, and other network APIs that
+/// would fail without `--allow-net`.
+pub fn code_needs_network(code: &str) -> bool {
+    // Remote ES module imports — both static and dynamic
+    // Static:  import ... from "https://...", import "https://..."
+    // Dynamic: await import("https://..."), import("npm:...")
+    let remote_prefixes = [
+        "\"https://", "'https://",
+        "\"http://",  "'http://",
+        "\"npm:",     "'npm:",
+        "\"jsr:",     "'jsr:",
+    ];
+
+    for prefix in &remote_prefixes {
+        // Static: from "https://..." or import "https://..."
+        if code.contains(&format!("from {}", prefix))
+            || code.contains(&format!("import {}", prefix))
+        {
+            return true;
+        }
+        // Dynamic: import("https://...") — with optional whitespace
+        if code.contains(&format!("import({}", prefix))
+            || code.contains(&format!("import ({}", prefix))
+        {
+            return true;
+        }
+    }
+
+    // Explicit network APIs
+    code.contains("fetch(")
+        || code.contains("Deno.connect")
+        || code.contains("new WebSocket")
+        || code.contains("new EventSource")
+}
+
 /// A permission vector — one point in the product lattice.
 /// Comparison is component-wise across all dimensions.
+///
+/// Workspace access is NOT a permission dimension — all tools get workspace access
+/// since the agent already has full filesystem access via Claude Code.
 ///
 /// The `mcp_tools` set contains:
 /// - Plain names for built-in MCP tools (e.g., "query_facts")
@@ -52,8 +91,6 @@ pub const SAFE_MCP_TOOLS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionVec {
     pub network: bool,
-    pub workspace_read: bool,
-    pub workspace_write: bool,
     pub secrets: BTreeSet<String>,
     pub commands: BTreeSet<String>,
     pub mcp_tools: BTreeSet<String>,
@@ -64,8 +101,6 @@ impl PermissionVec {
     pub fn bottom() -> Self {
         Self {
             network: false,
-            workspace_read: false,
-            workspace_write: false,
             secrets: BTreeSet::new(),
             commands: BTreeSet::new(),
             mcp_tools: BTreeSet::new(),
@@ -73,13 +108,12 @@ impl PermissionVec {
     }
 
     /// True if this vector is within the auto-approval threshold:
-    /// no network, no secrets, no commands, no writes, only safe built-in MCP tools.
+    /// no network, no secrets, no commands, only safe built-in MCP tools.
     ///
     /// Any reference to a custom tool AT URI makes this unsafe, because we can't
     /// verify the remote tool's safety without fetching it.
     pub fn is_safe(&self) -> bool {
         !self.network
-            && !self.workspace_write
             && self.secrets.is_empty()
             && self.commands.is_empty()
             && self.mcp_tools.iter().all(|t| {
@@ -95,8 +129,6 @@ impl PermissionVec {
     /// This is the core operation: A can call B iff A.dominates(B).
     pub fn dominates(&self, other: &PermissionVec) -> bool {
         (self.network || !other.network)
-            && (self.workspace_read || !other.workspace_read)
-            && (self.workspace_write || !other.workspace_write)
             && other.secrets.is_subset(&self.secrets)
             && other.commands.is_subset(&self.commands)
             && other.mcp_tools.is_subset(&self.mcp_tools)
@@ -107,8 +139,6 @@ impl PermissionVec {
     pub fn join(&self, other: &PermissionVec) -> PermissionVec {
         PermissionVec {
             network: self.network || other.network,
-            workspace_read: self.workspace_read || other.workspace_read,
-            workspace_write: self.workspace_write || other.workspace_write,
             secrets: self.secrets.union(&other.secrets).cloned().collect(),
             commands: self.commands.union(&other.commands).cloned().collect(),
             mcp_tools: self.mcp_tools.union(&other.mcp_tools).cloned().collect(),
@@ -116,14 +146,10 @@ impl PermissionVec {
     }
 
     /// Construct from a CustomTool record (requested permissions).
+    /// Network is detected from code patterns, but `requires_network` overrides.
     pub fn from_tool(tool: &CustomTool) -> Self {
         Self {
-            // Tools don't declare network need in the struct yet,
-            // so we infer: if it has secrets or commands, it likely needs more.
-            // But for safety check, network is false unless approval grants it.
-            network: false,
-            workspace_read: tool.requires_workspace.unwrap_or(false),
-            workspace_write: tool.requires_workspace.unwrap_or(false),
+            network: tool.requires_network.unwrap_or_else(|| code_needs_network(&tool.code)),
             secrets: tool.required_secrets.iter().cloned().collect(),
             commands: tool.required_commands.iter().cloned().collect(),
             mcp_tools: tool.required_tools.iter().cloned().collect(),
@@ -134,8 +160,6 @@ impl PermissionVec {
     pub fn from_approval(approval: &ToolApproval) -> Self {
         Self {
             network: approval.allow_network.unwrap_or(false),
-            workspace_read: approval.allow_workspace_read.unwrap_or(false),
-            workspace_write: approval.allow_workspace_write.unwrap_or(false),
             secrets: approval.allowed_secrets.iter().cloned().collect(),
             commands: approval.allowed_commands.iter().cloned().collect(),
             mcp_tools: approval.allowed_tools.iter().cloned().collect(),
@@ -149,12 +173,6 @@ impl PermissionVec {
 
         if !self.network && other.network {
             missing.push("network".to_string());
-        }
-        if !self.workspace_read && other.workspace_read {
-            missing.push("workspace_read".to_string());
-        }
-        if !self.workspace_write && other.workspace_write {
-            missing.push("workspace_write".to_string());
         }
 
         let missing_secrets: BTreeSet<_> = other.secrets.difference(&self.secrets).collect();
@@ -509,16 +527,12 @@ mod tests {
 
     fn pvec(
         network: bool,
-        ws_read: bool,
-        ws_write: bool,
         secrets: &[&str],
         commands: &[&str],
         mcp_tools: &[&str],
     ) -> PermissionVec {
         PermissionVec {
             network,
-            workspace_read: ws_read,
-            workspace_write: ws_write,
             secrets: secrets.iter().map(|s| s.to_string()).collect(),
             commands: commands.iter().map(|s| s.to_string()).collect(),
             mcp_tools: mcp_tools.iter().map(|s| s.to_string()).collect(),
@@ -532,60 +546,54 @@ mod tests {
 
     #[test]
     fn safe_with_safe_mcp_tools() {
-        let p = pvec(false, false, false, &[], &[], &["query_facts", "list_rules"]);
+        let p = pvec(false, &[], &[], &["query_facts", "list_rules"]);
         assert!(p.is_safe());
     }
 
     #[test]
     fn unsafe_with_network() {
-        let p = pvec(true, false, false, &[], &[], &[]);
+        let p = pvec(true, &[], &[], &[]);
         assert!(!p.is_safe());
     }
 
     #[test]
     fn unsafe_with_secrets() {
-        let p = pvec(false, false, false, &["API_KEY"], &[], &[]);
-        assert!(!p.is_safe());
-    }
-
-    #[test]
-    fn unsafe_with_write() {
-        let p = pvec(false, false, true, &[], &[], &[]);
+        let p = pvec(false, &["API_KEY"], &[], &[]);
         assert!(!p.is_safe());
     }
 
     #[test]
     fn unsafe_with_commands() {
-        let p = pvec(false, false, false, &[], &["git"], &[]);
+        let p = pvec(false, &[], &["git"], &[]);
         assert!(!p.is_safe());
     }
 
     #[test]
     fn unsafe_with_unsafe_mcp_tool() {
-        let p = pvec(false, false, false, &[], &[], &["post_to_bluesky"]);
+        let p = pvec(false, &[], &[], &["post_to_bluesky"]);
         assert!(!p.is_safe());
     }
 
     #[test]
     fn dominance_basic() {
-        let a = pvec(true, true, true, &["KEY"], &["git"], &["query_facts"]);
-        let b = pvec(false, false, false, &[], &[], &["query_facts"]);
+        let a = pvec(true, &["KEY"], &["git"], &["query_facts"]);
+        let b = pvec(false, &[], &[], &["query_facts"]);
         assert!(a.dominates(&b));
         assert!(!b.dominates(&a));
     }
 
     #[test]
     fn dominance_equal() {
-        let a = pvec(true, false, false, &["KEY"], &[], &[]);
-        let b = pvec(true, false, false, &["KEY"], &[], &[]);
+        let a = pvec(true, &["KEY"], &[], &[]);
+        let b = pvec(true, &["KEY"], &[], &[]);
         assert!(a.dominates(&b));
         assert!(b.dominates(&a));
     }
 
     #[test]
     fn incomparable_vectors() {
-        let a = pvec(true, false, false, &[], &[], &[]);
-        let b = pvec(false, false, true, &["API_KEY"], &[], &[]);
+        let a = pvec(true, &[], &[], &[]);
+        let b = pvec(false, &["API_KEY"], &[], &[]);
         assert!(!a.dominates(&b));
         assert!(!b.dominates(&a));
         assert_eq!(a.partial_cmp(&b), None);
@@ -593,20 +601,18 @@ mod tests {
 
     #[test]
     fn partial_ord_greater() {
-        let a = pvec(true, true, true, &["KEY"], &["git"], &[]);
-        let b = pvec(false, false, false, &[], &[], &[]);
+        let a = pvec(true, &["KEY"], &["git"], &[]);
+        let b = pvec(false, &[], &[], &[]);
         assert_eq!(a.partial_cmp(&b), Some(Ordering::Greater));
         assert_eq!(b.partial_cmp(&a), Some(Ordering::Less));
     }
 
     #[test]
     fn join_computes_union() {
-        let a = pvec(true, false, false, &["A"], &[], &["query_facts"]);
-        let b = pvec(false, false, true, &["B"], &["git"], &["list_rules"]);
+        let a = pvec(true, &["A"], &[], &["query_facts"]);
+        let b = pvec(false, &["B"], &["git"], &["list_rules"]);
         let joined = a.join(&b);
         assert!(joined.network);
-        assert!(!joined.workspace_read);
-        assert!(joined.workspace_write);
         assert!(joined.secrets.contains("A"));
         assert!(joined.secrets.contains("B"));
         assert!(joined.commands.contains("git"));
@@ -616,10 +622,9 @@ mod tests {
 
     #[test]
     fn missing_dimensions_reports_correctly() {
-        let caller = pvec(true, false, false, &[], &[], &[]);
-        let callee = pvec(false, false, true, &["API_KEY"], &["git"], &[]);
+        let caller = pvec(true, &[], &[], &[]);
+        let callee = pvec(false, &["API_KEY"], &["git"], &[]);
         let missing = caller.missing_dimensions(&callee);
-        assert!(missing.iter().any(|m| m == "workspace_write"));
         assert!(missing.iter().any(|m| m.contains("API_KEY")));
         assert!(missing.iter().any(|m| m.contains("git")));
         assert!(!missing.iter().any(|m| m == "network")); // caller has network
@@ -628,8 +633,8 @@ mod tests {
     #[test]
     fn cycle_detection_finds_cycle() {
         let mut permissions = HashMap::new();
-        permissions.insert("A".to_string(), pvec(true, true, true, &[], &[], &[]));
-        permissions.insert("B".to_string(), pvec(false, false, false, &[], &[], &[]));
+        permissions.insert("A".to_string(), pvec(true, &[], &[], &[]));
+        permissions.insert("B".to_string(), pvec(false, &[], &[], &[]));
 
         let mut edges = HashMap::new();
         edges.insert("A".to_string(), BTreeSet::from(["B".to_string()]));
@@ -646,9 +651,9 @@ mod tests {
     #[test]
     fn acyclic_dag_passes() {
         let mut permissions = HashMap::new();
-        permissions.insert("A".to_string(), pvec(true, true, true, &[], &[], &[]));
-        permissions.insert("B".to_string(), pvec(false, false, false, &[], &[], &[]));
-        permissions.insert("C".to_string(), pvec(false, false, false, &[], &[], &[]));
+        permissions.insert("A".to_string(), pvec(true, &[], &[], &[]));
+        permissions.insert("B".to_string(), pvec(false, &[], &[], &[]));
+        permissions.insert("C".to_string(), pvec(false, &[], &[], &[]));
 
         let mut edges = HashMap::new();
         edges.insert("A".to_string(), BTreeSet::from(["B".to_string()]));
@@ -663,11 +668,11 @@ mod tests {
         let mut permissions = HashMap::new();
         permissions.insert(
             "A".to_string(),
-            pvec(true, false, false, &[], &[], &["query_facts"]),
+            pvec(true, &[], &[], &["query_facts"]),
         );
         permissions.insert(
             "B".to_string(),
-            pvec(false, false, true, &["KEY"], &[], &[]),
+            pvec(false, &["KEY"], &[], &[]),
         );
 
         let mut edges = HashMap::new();
@@ -678,7 +683,6 @@ mod tests {
 
         // Should be join of A and B
         assert!(effective.network);
-        assert!(effective.workspace_write);
         assert!(effective.secrets.contains("KEY"));
         assert!(effective.mcp_tools.contains("query_facts"));
     }
@@ -688,9 +692,9 @@ mod tests {
         let mut permissions = HashMap::new();
         permissions.insert(
             "A".to_string(),
-            pvec(true, true, true, &["KEY"], &["git"], &[]),
+            pvec(true, &["KEY"], &["git"], &[]),
         );
-        permissions.insert("B".to_string(), pvec(false, false, false, &[], &[], &[]));
+        permissions.insert("B".to_string(), pvec(false, &[], &[], &[]));
 
         let edges = HashMap::new();
         let validator = CallGraphValidator::new(permissions, edges);
@@ -700,10 +704,10 @@ mod tests {
     #[test]
     fn validate_call_fails_when_not_dominant() {
         let mut permissions = HashMap::new();
-        permissions.insert("A".to_string(), pvec(true, false, false, &[], &[], &[]));
+        permissions.insert("A".to_string(), pvec(true, &[], &[], &[]));
         permissions.insert(
             "B".to_string(),
-            pvec(false, false, true, &["KEY"], &[], &[]),
+            pvec(false, &["KEY"], &[], &[]),
         );
 
         let edges = HashMap::new();
@@ -715,7 +719,7 @@ mod tests {
     #[test]
     fn validate_call_safe_mcp_always_allowed() {
         let mut permissions = HashMap::new();
-        permissions.insert("A".to_string(), pvec(false, false, false, &[], &[], &[]));
+        permissions.insert("A".to_string(), pvec(false, &[], &[], &[]));
 
         let edges = HashMap::new();
         let validator = CallGraphValidator::new(permissions, edges);
@@ -725,7 +729,7 @@ mod tests {
     #[test]
     fn validate_call_unsafe_mcp_requires_permission() {
         let mut permissions = HashMap::new();
-        permissions.insert("A".to_string(), pvec(false, false, false, &[], &[], &[]));
+        permissions.insert("A".to_string(), pvec(false, &[], &[], &[]));
 
         let edges = HashMap::new();
         let validator = CallGraphValidator::new(permissions, edges);
@@ -737,19 +741,12 @@ mod tests {
         let mut permissions = HashMap::new();
         permissions.insert(
             "A".to_string(),
-            pvec(false, false, false, &[], &[], &["post_to_bluesky"]),
+            pvec(false, &[], &[], &["post_to_bluesky"]),
         );
 
         let edges = HashMap::new();
         let validator = CallGraphValidator::new(permissions, edges);
         assert!(validator.validate_call("A", "post_to_bluesky").is_ok());
-    }
-
-    #[test]
-    fn workspace_read_is_safe() {
-        // Read-only workspace access is safe (no write)
-        let p = pvec(false, true, false, &[], &[], &[]);
-        assert!(p.is_safe());
     }
 
     // --- AT URI tests ---
@@ -781,10 +778,7 @@ mod tests {
 
     #[test]
     fn unsafe_with_at_uri_tool_reference() {
-        // Referencing a custom tool by AT URI always requires approval
         let p = pvec(
-            false,
-            false,
             false,
             &[],
             &[],
@@ -795,10 +789,7 @@ mod tests {
 
     #[test]
     fn safe_mcp_plus_at_uri_is_unsafe() {
-        // Even with safe MCP tools, adding an AT URI makes it unsafe
         let p = pvec(
-            false,
-            false,
             false,
             &[],
             &[],
@@ -816,7 +807,7 @@ mod tests {
         let mut permissions = HashMap::new();
         permissions.insert(
             "A".to_string(),
-            pvec(false, false, false, &[], &[], &[tool_uri]),
+            pvec(false, &[], &[], &[tool_uri]),
         );
 
         let edges = HashMap::new();
@@ -828,7 +819,7 @@ mod tests {
     fn validate_call_at_uri_without_permission() {
         let tool_uri = "at://did:plc:abc/diy.razorgirl.winter.tool/3lbxxx";
         let mut permissions = HashMap::new();
-        permissions.insert("A".to_string(), pvec(false, false, false, &[], &[], &[]));
+        permissions.insert("A".to_string(), pvec(false, &[], &[], &[]));
 
         let edges = HashMap::new();
         let validator = CallGraphValidator::new(permissions, edges);
@@ -867,5 +858,45 @@ mod tests {
     async fn session_store_invalid_token_returns_none() {
         let store = ToolSessionStore::new();
         assert!(store.get("nonexistent-token").await.is_none());
+    }
+
+    // --- Network detection tests ---
+
+    #[test]
+    fn detects_remote_es_import() {
+        assert!(code_needs_network(
+            r#"import { serve } from "https://deno.land/std/http/server.ts";"#
+        ));
+    }
+
+    #[test]
+    fn detects_npm_specifier() {
+        assert!(code_needs_network(r#"import chalk from "npm:chalk";"#));
+    }
+
+    #[test]
+    fn detects_jsr_specifier() {
+        assert!(code_needs_network(
+            r#"import { parse } from "jsr:@std/csv";"#
+        ));
+    }
+
+    #[test]
+    fn detects_fetch_call() {
+        assert!(code_needs_network("const res = await fetch(url);"));
+    }
+
+    #[test]
+    fn no_network_for_local_code() {
+        assert!(!code_needs_network(
+            r#"export default async function(input) { return input.x + 1; }"#
+        ));
+    }
+
+    #[test]
+    fn no_network_for_relative_import() {
+        assert!(!code_needs_network(
+            r#"import { helper } from "./utils.ts";"#
+        ));
     }
 }
