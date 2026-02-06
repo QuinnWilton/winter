@@ -4,8 +4,7 @@
 //! - Identity loading and management
 //! - Daemon state management
 //! - Context assembly for Claude prompts
-//! - Notification handling
-//! - Awaken cycles for autonomous thought
+//! - Persistent session with inbox-driven model
 //! - Claude SDK integration for agent invocation
 
 mod agent;
@@ -16,9 +15,7 @@ mod prompt;
 mod state;
 
 pub use agent::Agent;
-pub use context::{
-    AgentContext, ContextTrigger, ConversationHistoryMessage, CustomToolSummary, PostRef,
-};
+pub use context::{AgentContext, ContextTrigger, ConversationHistoryMessage, CustomToolSummary};
 pub use error::AgentError;
 pub use identity::IdentityManager;
 pub use prompt::PromptBuilder;

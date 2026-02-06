@@ -1,7 +1,6 @@
 //! Agent context for Claude prompts.
 
 use chrono::{DateTime, Utc};
-use winter_atproto::Facet;
 use winter_atproto::{Directive, Identity, Thought};
 
 /// A message in the DM conversation history.
@@ -43,121 +42,21 @@ pub struct CustomToolSummary {
     pub approved: bool,
 }
 
-/// Reference to a post for threading.
-#[derive(Debug, Clone)]
-pub struct PostRef {
-    /// AT URI of the post.
-    pub uri: String,
-    /// CID of the post.
-    pub cid: String,
-}
-
 /// What triggered this agent invocation.
 #[derive(Debug, Clone)]
 pub enum ContextTrigger {
-    /// A Bluesky notification.
-    Notification {
-        kind: String,
-        author_did: String,
-        author_handle: String,
-        text: Option<String>,
-        /// AT URI of the notification post.
-        uri: String,
-        /// CID of the notification post (needed for replying).
-        cid: String,
-        /// Parent post reference (for threading context).
-        /// If this notification is a reply, this is the post it replied to.
-        parent: Option<PostRef>,
-        /// Root post reference (for threading context).
-        /// The original post that started the thread.
-        root: Option<PostRef>,
-        /// Rich text facets (mentions, links, tags).
-        facets: Vec<Facet>,
-    },
-    /// A direct message.
-    DirectMessage {
-        /// Conversation ID.
-        convo_id: String,
-        /// Message ID.
-        message_id: String,
-        /// DID of the sender.
-        sender_did: String,
-        /// Handle of the sender.
-        sender_handle: String,
-        /// Message text.
-        text: String,
-        /// Rich text facets (mentions, links, tags).
-        facets: Vec<Facet>,
-        /// Recent conversation history (last 15 minutes, excluding triggering message).
-        history: Vec<ConversationHistoryMessage>,
-    },
     /// A scheduled job.
     Job { id: String, name: String },
-    /// An awaken cycle.
-    Awaken,
-    /// A background session (interruptible free time).
-    Background,
-}
-
-/// Scope for filtering thoughts by conversation context.
-///
-/// When multiple workers process notifications concurrently, thoughts need to be
-/// filtered by conversation scope to prevent cross-contamination.
-#[derive(Debug, Clone)]
-pub enum ConversationScope {
-    /// A thread on Bluesky, identified by root post URI.
-    Thread { root_uri: String },
-    /// A direct message conversation.
-    DirectMessage { convo_id: String },
-    /// A scheduled job execution.
-    Job { name: String },
-    /// Global context (awaken cycles) - matches thoughts with no trigger.
-    Global,
+    /// A persistent session (inbox-driven model).
+    PersistentSession,
 }
 
 impl ContextTrigger {
-    /// Extract the conversation scope for thought filtering.
-    pub fn conversation_scope(&self) -> ConversationScope {
-        match self {
-            ContextTrigger::Notification { root, uri, .. } => {
-                // Use root URI if available, otherwise the post is its own root
-                let root_uri = root
-                    .as_ref()
-                    .map(|r| r.uri.clone())
-                    .unwrap_or_else(|| uri.clone());
-                ConversationScope::Thread { root_uri }
-            }
-            ContextTrigger::DirectMessage { convo_id, .. } => ConversationScope::DirectMessage {
-                convo_id: convo_id.clone(),
-            },
-            ContextTrigger::Job { name, .. } => ConversationScope::Job { name: name.clone() },
-            ContextTrigger::Awaken => ConversationScope::Global,
-            ContextTrigger::Background => ConversationScope::Global,
-        }
-    }
-
     /// Generate trigger string for thought records.
-    ///
-    /// Format includes root URI for notifications to enable thread-scoped filtering:
-    /// - Notification: `notification:{uri}:root={root_uri}`
-    /// - DM: `dm:{convo_id}:{message_id}`
-    /// - Job: `job:{name}`
-    /// - Awaken: None (global thoughts)
     pub fn trigger_string(&self) -> Option<String> {
         match self {
-            ContextTrigger::Notification { uri, root, .. } => {
-                // Enhanced format: include root URI for thread continuity
-                let root_uri = root.as_ref().map(|r| &r.uri).unwrap_or(uri);
-                Some(format!("notification:{}:root={}", uri, root_uri))
-            }
-            ContextTrigger::DirectMessage {
-                convo_id,
-                message_id,
-                ..
-            } => Some(format!("dm:{}:{}", convo_id, message_id)),
             ContextTrigger::Job { name, .. } => Some(format!("job:{}", name)),
-            ContextTrigger::Awaken => None,
-            ContextTrigger::Background => Some("background".to_string()),
+            ContextTrigger::PersistentSession => Some("persistent".to_string()),
         }
     }
 }
@@ -208,21 +107,10 @@ impl AgentContext {
     /// Get a short description of the trigger for tracing.
     pub fn trigger_description(&self) -> String {
         match &self.trigger {
-            Some(ContextTrigger::Notification {
-                kind,
-                author_handle,
-                ..
-            }) => {
-                format!("notification:{}:@{}", kind, author_handle)
-            }
-            Some(ContextTrigger::DirectMessage { sender_handle, .. }) => {
-                format!("dm:@{}", sender_handle)
-            }
             Some(ContextTrigger::Job { name, .. }) => {
                 format!("job:{}", name)
             }
-            Some(ContextTrigger::Awaken) => "awaken".to_string(),
-            Some(ContextTrigger::Background) => "background".to_string(),
+            Some(ContextTrigger::PersistentSession) => "persistent".to_string(),
             None => "none".to_string(),
         }
     }

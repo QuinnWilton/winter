@@ -28,6 +28,9 @@ tracing = { workspace = true }
 # HTTP client (for logging built-in tool calls)
 reqwest = { workspace = true }
 
+# Async streams
+futures-util = { workspace = true }
+
 # Internal
 winter-atproto = { workspace = true }
 winter-datalog = { workspace = true }

@@ -4,16 +4,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use winter_claude::{
-    ClaudeResponse, Client, Config as ClaudeConfig, StreamFormat, extract_tool_calls,
-};
+use futures_util::StreamExt;
+use winter_claude::{Client, Config as ClaudeConfig, Message, StreamFormat};
 use tracing::{debug, info, warn};
 use winter_mcp::ToolRegistry;
 
 use crate::{AgentContext, AgentError, PromptBuilder};
 
-/// Built-in Claude Code tools that we want to log.
-const BUILTIN_TOOLS: &[&str] = &["Read", "WebFetch", "WebSearch", "Glob", "Grep"];
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 
 /// Agent that wraps the Claude SDK for Winter.
@@ -64,317 +61,103 @@ impl Agent {
         env
     }
 
-    /// Log built-in tool calls from the Claude response.
+    /// Execute a persistent session - inbox-driven model.
     ///
-    /// Extracts tool_use blocks from the stream-json output and sends them
-    /// to the MCP server to be recorded as Thought records.
-    async fn log_builtin_tool_calls(response: &ClaudeResponse, trigger: Option<String>) {
-        let Some(ref raw_json) = response.raw_json else {
-            return;
-        };
+    /// The persistent session runs for up to 4 hours. Winter polls the inbox
+    /// for work, handles items, and uses free time between items as she sees fit.
+    /// She self-manages session lifecycle based on context window usage.
+    pub async fn persistent_session(&self, context: AgentContext) -> Result<String, AgentError> {
+        let timeout_duration = Duration::from_secs(14400); // 4 hours max
+        match tokio::time::timeout(timeout_duration, self.persistent_session_inner(context)).await {
+            Ok(result) => result,
+            Err(_) => Err(AgentError::Timeout(
+                "persistent session timed out after 4 hours".into(),
+            )),
+        }
+    }
 
-        let tool_calls = extract_tool_calls(raw_json);
+    /// Inner implementation of persistent_session.
+    #[tracing::instrument(skip(self, context))]
+    async fn persistent_session_inner(
+        &self,
+        context: AgentContext,
+    ) -> Result<String, AgentError> {
+        info!("persistent session starting");
 
-        // Get MCP URL from environment (set in Docker via WINTER_MCP_URL)
+        let system_prompt = PromptBuilder::build(&context);
+        let env = Self::build_env(&context);
+        let _trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
+
+        let claude_config = ClaudeConfig::builder()
+            .model(DEFAULT_MODEL)
+            .system_prompt(&system_prompt)
+            .mcp_config(&self.mcp_config_path)
+            .allowed_tools(Self::allowed_tools())
+            .env(env)
+            .stream_format(StreamFormat::StreamJson)
+            .timeout_secs(14400) // 4 hours
+            .build()?;
+
+        let client = Client::new(claude_config);
+        let mut stream = client
+            .query("You are now active. Check your inbox for pending items, then use your free time as you see fit. Call check_inbox regularly.")
+            .stream()
+            .await?;
+
+        // Get MCP URL for pushing metrics
         let mcp_base_url = std::env::var("WINTER_MCP_URL")
             .ok()
             .and_then(|url| url.strip_suffix("/mcp").map(String::from))
             .unwrap_or_else(|| "http://127.0.0.1:3847".to_string());
+        let metrics_url = format!("{}/session-metrics", mcp_base_url);
+        let http_client = reqwest::Client::new();
 
-        let client = reqwest::Client::new();
+        let mut content = String::new();
 
-        for tc in tool_calls
-            .iter()
-            .filter(|tc| BUILTIN_TOOLS.contains(&tc.name.as_str()))
-        {
-            debug!(tool = %tc.name, id = %tc.id, "logging built-in tool call");
+        while let Some(msg_result) = stream.next().await {
+            match msg_result {
+                Ok(Message::Assistant { content: text, meta }) => {
+                    content.push_str(&text);
 
-            let payload = serde_json::json!({
-                "id": tc.id,
-                "name": tc.name,
-                "input": tc.input,
-                "trigger": trigger,
-            });
-
-            let url = format!("{}/builtin-tool-call", mcp_base_url);
-
-            // Fire and forget - don't block on the response
-            let client = client.clone();
-            let trigger_clone = trigger.clone();
-            let name = tc.name.clone();
-            tokio::spawn(async move {
-                if let Err(e) = client.post(&url).json(&payload).send().await {
-                    warn!(
-                        error = %e,
-                        tool = %name,
-                        trigger = ?trigger_clone,
-                        "failed to log built-in tool call"
+                    // Push per-turn metrics
+                    if let Some(tokens) = meta.tokens_used {
+                        let payload = serde_json::json!({
+                            "input_tokens": tokens.input,
+                            "output_tokens": tokens.output,
+                            "total_tokens": tokens.total,
+                            "cost_usd": meta.cost_usd.unwrap_or(0.0),
+                            "is_turn": true,
+                        });
+                        let client = http_client.clone();
+                        let url = metrics_url.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = client.post(&url).json(&payload).send().await {
+                                warn!(error = %e, "failed to push session metrics");
+                            }
+                        });
+                    }
+                }
+                Ok(Message::Result { stats, .. }) => {
+                    debug!(
+                        total_tokens = stats.total_tokens.total,
+                        cost = stats.total_cost_usd,
+                        messages = stats.total_messages,
+                        "persistent session final stats"
                     );
                 }
-            });
+                Ok(_) => {} // Init, User, System, Tool, ToolResult — ignore
+                Err(e) => {
+                    warn!(error = %e, "stream error during persistent session");
+                }
+            }
         }
-    }
-
-    /// Handle a notification by invoking Claude with context.
-    pub async fn handle_notification(
-        &self,
-        context: AgentContext,
-        user_message: &str,
-    ) -> Result<String, AgentError> {
-        let timeout_duration = Duration::from_secs(900); // 15 minutes
-        match tokio::time::timeout(
-            timeout_duration,
-            self.handle_notification_inner(context, user_message),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(AgentError::Timeout(
-                "notification processing timed out after 15 minutes".into(),
-            )),
-        }
-    }
-
-    /// Inner implementation of handle_notification.
-    #[tracing::instrument(skip(self, context), fields(trigger = %context.trigger_description()))]
-    async fn handle_notification_inner(
-        &self,
-        context: AgentContext,
-        user_message: &str,
-    ) -> Result<String, AgentError> {
-        info!("processing notification");
-
-        let system_prompt = PromptBuilder::build(&context);
-        let env = Self::build_env(&context);
-        let trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
-
-        let claude_config = ClaudeConfig::builder()
-            .model(DEFAULT_MODEL)
-            .system_prompt(&system_prompt)
-            .mcp_config(&self.mcp_config_path)
-            .allowed_tools(Self::allowed_tools())
-            .env(env)
-            .stream_format(StreamFormat::StreamJson)
-            .timeout_secs(900) // 15 minutes
-            .build()?;
-
-        let client = Client::new(claude_config);
-        let response = client.query(user_message).send_full().await?;
-
-        // Log built-in tool calls asynchronously
-        Self::log_builtin_tool_calls(&response, trigger).await;
 
         debug!(
-            response_len = response.content.len(),
-            "notification processed"
+            response_len = content.len(),
+            "persistent session complete"
         );
 
-        Ok(response.content)
+        Ok(content)
     }
 
-    /// Handle a direct message by invoking Claude with context.
-    pub async fn handle_dm(
-        &self,
-        context: AgentContext,
-        user_message: &str,
-    ) -> Result<String, AgentError> {
-        let timeout_duration = Duration::from_secs(900); // 15 minutes
-        match tokio::time::timeout(
-            timeout_duration,
-            self.handle_dm_inner(context, user_message),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(AgentError::Timeout(
-                "DM processing timed out after 15 minutes".into(),
-            )),
-        }
-    }
-
-    /// Inner implementation of handle_dm.
-    #[tracing::instrument(skip(self, context), fields(trigger = %context.trigger_description()))]
-    async fn handle_dm_inner(
-        &self,
-        context: AgentContext,
-        user_message: &str,
-    ) -> Result<String, AgentError> {
-        info!("processing direct message");
-
-        let system_prompt = PromptBuilder::build(&context);
-        let env = Self::build_env(&context);
-        let trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
-
-        let claude_config = ClaudeConfig::builder()
-            .model(DEFAULT_MODEL)
-            .system_prompt(&system_prompt)
-            .mcp_config(&self.mcp_config_path)
-            .allowed_tools(Self::allowed_tools())
-            .env(env)
-            .stream_format(StreamFormat::StreamJson)
-            .timeout_secs(900) // 15 minutes
-            .build()?;
-
-        let client = Client::new(claude_config);
-        let response = client.query(user_message).send_full().await?;
-
-        // Log built-in tool calls asynchronously
-        Self::log_builtin_tool_calls(&response, trigger).await;
-
-        debug!(response_len = response.content.len(), "DM processed");
-
-        Ok(response.content)
-    }
-
-    /// Execute an awaken cycle - autonomous thinking time.
-    pub async fn awaken(&self, context: AgentContext) -> Result<String, AgentError> {
-        let timeout_duration = Duration::from_secs(1800); // 30 minutes
-        match tokio::time::timeout(timeout_duration, self.awaken_inner(context)).await {
-            Ok(result) => result,
-            Err(_) => Err(AgentError::Timeout(
-                "awaken cycle timed out after 30 minutes".into(),
-            )),
-        }
-    }
-
-    /// Inner implementation of awaken.
-    #[tracing::instrument(skip(self, context))]
-    async fn awaken_inner(&self, context: AgentContext) -> Result<String, AgentError> {
-        info!("awaken cycle starting");
-
-        let system_prompt = PromptBuilder::build(&context);
-        let env = Self::build_env(&context);
-        let trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
-
-        let claude_config = ClaudeConfig::builder()
-            .model(DEFAULT_MODEL)
-            .system_prompt(&system_prompt)
-            .mcp_config(&self.mcp_config_path)
-            .allowed_tools(Self::allowed_tools())
-            .env(env)
-            .stream_format(StreamFormat::StreamJson)
-            .timeout_secs(1800) // 30 minutes
-            .build()?;
-
-        let client = Client::new(claude_config);
-        let response = client
-            .query("Awaken. Review your context, timeline, and thoughts. Decide what to do.")
-            .send_full()
-            .await?;
-
-        // Log built-in tool calls asynchronously
-        Self::log_builtin_tool_calls(&response, trigger).await;
-
-        debug!(
-            response_len = response.content.len(),
-            "awaken cycle complete"
-        );
-
-        Ok(response.content)
-    }
-
-    /// Execute a scheduled job.
-    pub async fn execute_job(
-        &self,
-        context: AgentContext,
-        instructions: &str,
-    ) -> Result<String, AgentError> {
-        let timeout_duration = Duration::from_secs(900); // 15 minutes
-        match tokio::time::timeout(
-            timeout_duration,
-            self.execute_job_inner(context, instructions),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(AgentError::Timeout(
-                "job execution timed out after 15 minutes".into(),
-            )),
-        }
-    }
-
-    /// Inner implementation of execute_job.
-    #[tracing::instrument(skip(self, context, instructions), fields(trigger = %context.trigger_description()))]
-    async fn execute_job_inner(
-        &self,
-        context: AgentContext,
-        instructions: &str,
-    ) -> Result<String, AgentError> {
-        info!("executing scheduled job");
-
-        let system_prompt = PromptBuilder::build(&context);
-        let env = Self::build_env(&context);
-        let trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
-
-        let claude_config = ClaudeConfig::builder()
-            .model(DEFAULT_MODEL)
-            .system_prompt(&system_prompt)
-            .mcp_config(&self.mcp_config_path)
-            .allowed_tools(Self::allowed_tools())
-            .env(env)
-            .stream_format(StreamFormat::StreamJson)
-            .timeout_secs(900) // 15 minutes
-            .build()?;
-
-        let client = Client::new(claude_config);
-        let response = client.query(instructions).send_full().await?;
-
-        // Log built-in tool calls asynchronously
-        Self::log_builtin_tool_calls(&response, trigger).await;
-
-        debug!(response_len = response.content.len(), "job complete");
-
-        Ok(response.content)
-    }
-
-    /// Execute a background session - interruptible free time.
-    ///
-    /// Background sessions run when the notification queue is empty.
-    /// The agent should periodically call `check_interruption` to see if
-    /// notifications are waiting and gracefully exit if so.
-    pub async fn background_session(&self, context: AgentContext) -> Result<String, AgentError> {
-        let timeout_duration = Duration::from_secs(7200); // 2 hours max
-        match tokio::time::timeout(timeout_duration, self.background_session_inner(context)).await {
-            Ok(result) => result,
-            Err(_) => Err(AgentError::Timeout(
-                "background session timed out after 2 hours".into(),
-            )),
-        }
-    }
-
-    /// Inner implementation of background_session.
-    #[tracing::instrument(skip(self, context))]
-    async fn background_session_inner(&self, context: AgentContext) -> Result<String, AgentError> {
-        info!("background session starting");
-
-        let system_prompt = PromptBuilder::build(&context);
-        let env = Self::build_env(&context);
-        let trigger = context.trigger.as_ref().and_then(|t| t.trigger_string());
-
-        let claude_config = ClaudeConfig::builder()
-            .model(DEFAULT_MODEL)
-            .system_prompt(&system_prompt)
-            .mcp_config(&self.mcp_config_path)
-            .allowed_tools(Self::allowed_tools())
-            .env(env)
-            .stream_format(StreamFormat::StreamJson)
-            .timeout_secs(7200) // 2 hours
-            .build()?;
-
-        let client = Client::new(claude_config);
-        let response = client
-            .query("This is your free time. Explore, learn, create—whatever interests you. Remember to call check_interruption periodically.")
-            .send_full()
-            .await?;
-
-        // Log built-in tool calls asynchronously
-        Self::log_builtin_tool_calls(&response, trigger).await;
-
-        debug!(
-            response_len = response.content.len(),
-            "background session complete"
-        );
-
-        Ok(response.content)
-    }
 }
