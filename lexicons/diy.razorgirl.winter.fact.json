@@ -52,6 +52,11 @@
             "type": "string",
             "format": "datetime",
             "description": "When this fact was created"
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "Optional expiration timestamp. Facts past this time are excluded from default queries."
           }
         }
       }
