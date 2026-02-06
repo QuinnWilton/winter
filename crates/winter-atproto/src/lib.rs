@@ -32,7 +32,7 @@ pub use dispatch::{
 pub use car::{CarParseResult, parse_car};
 pub use client::{ApplyWritesResponse, AtprotoClient, CommitInfo, WriteOp, WriteResult};
 pub use error::AtprotoError;
-pub use firehose::{DEFAULT_FIREHOSE_URL, FirehoseClient};
+pub use firehose::{DEFAULT_FIREHOSE_URL, FirehoseClient, firehose_url_for_pds, resolve_firehose_url};
 pub use records::*;
 pub use sync::{SyncCoordinator, SyncCoordinatorBuilder};
 pub use types::*;

@@ -38,14 +38,16 @@ services:
       - WINTER_HANDLE=${WINTER_HANDLE}
       - WINTER_APP_PASSWORD=${WINTER_APP_PASSWORD}
       - WINTER_OPERATOR_DID=${WINTER_OPERATOR_DID}
-      - WINTER_FIREHOSE_URL=${WINTER_FIREHOSE_URL:-wss://bsky.network}
+      - WINTER_FIREHOSE_URL=${WINTER_FIREHOSE_URL:-}
       - WINTER_WEB_URL=${WINTER_WEB_URL:-http://localhost:8080}
       - WINTER_SECRETS_PATH=/home/winter/.config/winter/secrets.json
+      - WINTER_WORKSPACE=/home/winter/workspace
       - RUST_LOG=winter=info,winter_mcp=debug
     volumes:
       - ${HOME}/.config/winter:/home/winter/.config/winter
       - ${HOME}/.cache/winter:/home/winter/.cache/winter
       - ${HOME}/.cache/deno:/home/winter/.cache/deno
+      - ${HOME}/.winter-workspace:/home/winter/workspace
     command: ["winter", "mcp-server-http", "--port", "3847"]
     # Internal only - no external port exposure needed
     # The daemon connects via Docker network
@@ -69,7 +71,7 @@ services:
       - WINTER_HANDLE=${WINTER_HANDLE}
       - WINTER_APP_PASSWORD=${WINTER_APP_PASSWORD}
       - WINTER_OPERATOR_DID=${WINTER_OPERATOR_DID}
-      - WINTER_FIREHOSE_URL=${WINTER_FIREHOSE_URL:-wss://bsky.network}
+      - WINTER_FIREHOSE_URL=${WINTER_FIREHOSE_URL:-}
       - WINTER_WEB_URL=${WINTER_WEB_URL:-http://localhost:8080}
       - WINTER_SECRETS_PATH=/home/winter/.config/winter/secrets.json
       - RUST_LOG=winter=info,winter_web=debug

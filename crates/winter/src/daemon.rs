@@ -428,10 +428,13 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
         .await
         .map_err(|e| miette::miette!("{}", e))?;
 
+    // Resolve actual PDS firehose from DID document (only our commits, not full network)
+    let firehose_url = match config.firehose_url.clone().filter(|s| !s.is_empty()) {
+        Some(url) => url,
+        None => winter_atproto::resolve_firehose_url(&did, &config.pds_url).await,
+    };
     let mut sync_coordinator = SyncCoordinator::new(sync_client, &did, Arc::clone(&cache));
-    if let Some(ref firehose_url) = config.firehose_url {
-        sync_coordinator = sync_coordinator.with_firehose_url(firehose_url);
-    }
+    sync_coordinator = sync_coordinator.with_firehose_url(&firehose_url);
 
     // Create shutdown channel
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

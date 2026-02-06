@@ -384,8 +384,11 @@ async fn run_mcp_server(pds_url: &str, handle: &str, app_password: &str) -> Resu
             .map_err(|e| miette::miette!("failed to create datalog cache: {}", e))?;
 
     // Start sync coordinator to populate repo cache from PDS
-    let firehose_url =
-        std::env::var("WINTER_FIREHOSE_URL").unwrap_or_else(|_| "wss://bsky.network".to_string());
+    // Resolve actual PDS firehose from DID document (only our commits, not full network)
+    let firehose_url = match std::env::var("WINTER_FIREHOSE_URL").ok().filter(|s| !s.is_empty()) {
+        Some(url) => url,
+        None => winter_atproto::resolve_firehose_url(&did, pds_url).await,
+    };
 
     let sync_coordinator = SyncCoordinator::new(sync_client, &did, Arc::clone(&repo_cache))
         .with_firehose_url(&firehose_url);
@@ -497,8 +500,11 @@ async fn run_mcp_server_http(
             .map_err(|e| miette::miette!("failed to create datalog cache: {}", e))?;
 
     // Start sync coordinator to populate repo cache from PDS
-    let firehose_url =
-        std::env::var("WINTER_FIREHOSE_URL").unwrap_or_else(|_| "wss://bsky.network".to_string());
+    // Resolve actual PDS firehose from DID document (only our commits, not full network)
+    let firehose_url = match std::env::var("WINTER_FIREHOSE_URL").ok().filter(|s| !s.is_empty()) {
+        Some(url) => url,
+        None => winter_atproto::resolve_firehose_url(&did, pds_url).await,
+    };
 
     let sync_coordinator = SyncCoordinator::new(sync_client, &did, Arc::clone(&repo_cache))
         .with_firehose_url(&firehose_url);
@@ -586,6 +592,19 @@ async fn run_web_server(
         Err(e) => {
             tracing::warn!(error = %e, "failed to load secrets manager");
             None
+        }
+    };
+
+    // Resolve actual PDS firehose from DID document (only our commits, not full network)
+    let firehose_url = match firehose_url.filter(|s| !s.is_empty()) {
+        Some(url) => Some(url),
+        None => {
+            let did_str = did.as_deref().unwrap_or("");
+            if !did_str.is_empty() {
+                Some(winter_atproto::resolve_firehose_url(did_str, pds_url).await)
+            } else {
+                None
+            }
         }
     };
 

@@ -91,12 +91,12 @@ COPY --from=souffle-builder /opt/souffle/bin/souffle /usr/local/bin/
 COPY --from=builder /app/target/release/winter /usr/local/bin/winter
 
 RUN useradd -m -s /bin/bash winter
-RUN mkdir -p /home/winter/.config/winter /home/winter/.cache/deno
+RUN mkdir -p /home/winter/.config/winter /home/winter/.cache/deno /home/winter/workspace
 COPY config/mcp.json /home/winter/.config/winter/mcp.json
 # Create empty secrets file with proper permissions
 RUN echo '{"version":1,"secrets":{}}' > /home/winter/.config/winter/secrets.json \
     && chmod 600 /home/winter/.config/winter/secrets.json
-RUN chown -R winter:winter /home/winter/.config /home/winter/.cache
+RUN chown -R winter:winter /home/winter/.config /home/winter/.cache /home/winter/workspace
 
 USER winter
 WORKDIR /home/winter

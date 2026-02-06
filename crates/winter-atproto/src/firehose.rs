@@ -24,7 +24,85 @@ use crate::dispatch::{dispatch_create_or_update, dispatch_delete, is_tracked_col
 use crate::{AtprotoError, IDENTITY_COLLECTION, IDENTITY_KEY, Identity};
 
 /// Default firehose URL (Bluesky relay).
+/// Prefer [`resolve_firehose_url`] to subscribe directly to the account's PDS,
+/// which only emits commits for accounts hosted there (far less traffic).
 pub const DEFAULT_FIREHOSE_URL: &str = "wss://bsky.network";
+
+/// Derive a firehose WebSocket URL from a PDS HTTP URL.
+///
+/// Converts `https://pds.example.com` → `wss://pds.example.com`.
+/// A PDS firehose only emits commits for accounts hosted on that PDS,
+/// so this avoids the global relay's full-network traffic.
+pub fn firehose_url_for_pds(pds_url: &str) -> String {
+    pds_url
+        .replace("https://", "wss://")
+        .replace("http://", "ws://")
+}
+
+/// Resolve the firehose URL for a DID by looking up its DID document.
+///
+/// The DID document contains the actual PDS service endpoint (e.g.,
+/// `https://puffball.us-east.host.bsky.network`), which may differ from the
+/// login URL (`https://bsky.social`). The PDS firehose only emits commits
+/// for accounts hosted on that PDS, avoiding the full-network relay.
+///
+/// Falls back to converting `fallback_pds_url` if DID resolution fails.
+pub async fn resolve_firehose_url(did: &str, fallback_pds_url: &str) -> String {
+    match resolve_pds_for_did(did).await {
+        Some(pds_url) => {
+            let url = firehose_url_for_pds(&pds_url);
+            tracing::info!(did = %did, pds = %pds_url, firehose = %url, "resolved PDS firehose from DID document");
+            url
+        }
+        None => {
+            let url = firehose_url_for_pds(fallback_pds_url);
+            tracing::warn!(
+                did = %did,
+                fallback = %url,
+                "failed to resolve PDS from DID document, falling back to login URL"
+            );
+            url
+        }
+    }
+}
+
+/// Resolve the PDS service endpoint from a DID document.
+///
+/// Supports `did:plc:` (via plc.directory) and `did:web:` (via .well-known).
+async fn resolve_pds_for_did(did: &str) -> Option<String> {
+    let doc_url = if did.starts_with("did:plc:") {
+        format!("https://plc.directory/{}", did)
+    } else if did.starts_with("did:web:") {
+        let domain = did.strip_prefix("did:web:")?;
+        format!("https://{}/.well-known/did.json", domain)
+    } else {
+        return None;
+    };
+
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+
+    let response = http.get(&doc_url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+
+    let doc: serde_json::Value = response.json().await.ok()?;
+    let services = doc.get("service")?.as_array()?;
+    for service in services {
+        let service_type = service.get("type")?.as_str()?;
+        if service_type == "AtprotoPersonalDataServer" {
+            return service
+                .get("serviceEndpoint")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim_end_matches('/').to_string());
+        }
+    }
+
+    None
+}
 
 /// Channel buffer size for messages between reader and processor tasks.
 /// Large enough to absorb processing bursts without blocking the reader.
@@ -852,6 +930,22 @@ mod tests {
     #[test]
     fn test_default_firehose_url() {
         assert_eq!(DEFAULT_FIREHOSE_URL, "wss://bsky.network");
+    }
+
+    #[test]
+    fn test_firehose_url_for_pds() {
+        assert_eq!(
+            firehose_url_for_pds("https://pds.example.com"),
+            "wss://pds.example.com"
+        );
+        assert_eq!(
+            firehose_url_for_pds("https://bsky.social"),
+            "wss://bsky.social"
+        );
+        assert_eq!(
+            firehose_url_for_pds("http://localhost:2583"),
+            "ws://localhost:2583"
+        );
     }
 
     #[test]
