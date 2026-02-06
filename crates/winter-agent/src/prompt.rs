@@ -138,11 +138,12 @@ impl PromptBuilder {
 
         // Recent thoughts
         if !context.recent_thoughts.is_empty() {
-            prompt.push_str("## Recent Thoughts\n\n");
+            prompt.push_str("## Recent Thoughts (newest first)\n\n");
             for thought in context.recent_thoughts.iter().take(10) {
                 // Truncate very long thoughts to avoid context window issues
                 let content = truncate_thought(&thought.content, 500);
-                prompt.push_str(&format!("- [{:?}] {}\n", thought.kind, content));
+                let time = thought.created_at.format("%H:%M UTC");
+                prompt.push_str(&format!("- [{}] [{:?}] {}\n", time, thought.kind, content));
             }
 
             // Add hint about querying all session thoughts
