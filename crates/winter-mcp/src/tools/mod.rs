@@ -207,6 +207,7 @@ mod pds;
 pub mod permissions;
 mod rules;
 mod thoughts;
+pub mod wiki;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -410,6 +411,27 @@ fn get_tool_category(tool_name: &str) -> ToolResultCategory {
             key_fields: &["rkey", "title"],
             web_path: Some("blog"),
         },
+        // Wiki tools
+        "create_wiki_entry" => SingleMutation {
+            key_fields: &["rkey", "title", "slug"],
+            web_path: Some("wiki"),
+        },
+        "update_wiki_entry" => SingleMutation {
+            key_fields: &["rkey", "title", "slug"],
+            web_path: Some("wiki"),
+        },
+        "delete_wiki_entry" => SingleMutation {
+            key_fields: &["deleted", "rkey"],
+            web_path: None,
+        },
+        "create_wiki_link" => SingleMutation {
+            key_fields: &["rkey", "source", "link_type"],
+            web_path: None,
+        },
+        "delete_wiki_link" => SingleMutation {
+            key_fields: &["deleted", "rkey"],
+            web_path: None,
+        },
         // PDS raw access
         "pds_put_record" => SingleMutation {
             key_fields: &["uri", "collection", "rkey"],
@@ -518,6 +540,16 @@ fn get_tool_category(tool_name: &str) -> ToolResultCategory {
             items_field: "posts",
             sample_key: "title",
         },
+        "list_wiki_entries" => List {
+            count_field: "count",
+            items_field: "entries",
+            sample_key: "title",
+        },
+        "list_wiki_links" => List {
+            count_field: "count",
+            items_field: "links",
+            sample_key: "link_type",
+        },
         "list_secrets" => List {
             count_field: "count",
             items_field: "secrets",
@@ -567,6 +599,10 @@ fn get_tool_category(tool_name: &str) -> ToolResultCategory {
         },
         "get_blog_post" => Get {
             key_fields: &["rkey", "title"],
+            size_field: Some("content"),
+        },
+        "get_wiki_entry" | "get_wiki_entry_by_slug" => Get {
+            key_fields: &["rkey", "title", "slug"],
             size_field: Some("content"),
         },
         "pds_get_record" => Get {
@@ -1271,6 +1307,9 @@ impl ToolRegistry {
         // Fact declaration tools
         tools.extend(declarations::tools());
 
+        // Wiki tools
+        tools.extend(wiki::tools());
+
         // PDS raw access tools
         tools.extend(pds::tools());
 
@@ -1355,7 +1394,7 @@ impl ToolRegistry {
     /// Execute a remote tool fetched from another agent's PDS.
     ///
     /// Fetches the tool code from the remote PDS and executes it locally
-    /// in a sandboxed Deno environment (no network, no secrets, no workspace).
+    /// in a sandboxed Deno environment (no network, no secrets).
     /// The caller's session has already validated that this tool_ref is allowed.
     pub async fn execute_remote_tool(
         &self,
@@ -1432,7 +1471,7 @@ impl ToolRegistry {
             "Executing remote tool (sandboxed)"
         );
 
-        // Remote tools always run sandboxed — no network, no secrets, no workspace.
+        // Remote tools always run sandboxed — no network, no secrets.
         // This is safe because we're executing untrusted code from another PDS.
         let permissions = crate::deno::DenoPermissions::default();
 
@@ -1569,6 +1608,17 @@ impl ToolRegistry {
                 "update_blog_post" => blog::update_blog_post(&state, arguments).await,
                 "list_blog_posts" => blog::list_blog_posts(&state, arguments).await,
                 "get_blog_post" => blog::get_blog_post(&state, arguments).await,
+
+                // Wiki tools
+                "create_wiki_entry" => wiki::create_wiki_entry(&state, arguments).await,
+                "update_wiki_entry" => wiki::update_wiki_entry(&state, arguments).await,
+                "delete_wiki_entry" => wiki::delete_wiki_entry(&state, arguments).await,
+                "get_wiki_entry" => wiki::get_wiki_entry(&state, arguments).await,
+                "get_wiki_entry_by_slug" => wiki::get_wiki_entry_by_slug(&state, arguments).await,
+                "list_wiki_entries" => wiki::list_wiki_entries(&state, arguments).await,
+                "create_wiki_link" => wiki::create_wiki_link(&state, arguments).await,
+                "delete_wiki_link" => wiki::delete_wiki_link(&state, arguments).await,
+                "list_wiki_links" => wiki::list_wiki_links(&state, arguments).await,
 
                 // Directive tools
                 "create_directive" => directives::create_directive(&state, arguments).await,
@@ -1826,23 +1876,34 @@ fn format_tool_call_content(
                 let category = get_tool_category(name);
 
                 // Generate summary and link based on category
-                let (summary, link) = match &category {
-                    ToolResultCategory::Excluded => (None, None),
+                let (result_for_thought, summary, link) = match &category {
+                    ToolResultCategory::Excluded => (None, None, None),
                     ToolResultCategory::SingleMutation { web_path, .. } => {
                         let sum = summarize_result(name, &json);
                         let link = web_path.and_then(|path| {
                             extract_string(&json, "rkey", None)
                                 .and_then(|rkey| make_web_link(path, &rkey))
                         });
-                        (Some(sum).filter(|s| !s.is_empty()), link)
+                        // SingleMutation results are small, keep them
+                        (Some(json), Some(sum).filter(|s| !s.is_empty()), link)
+                    }
+                    ToolResultCategory::BatchMutation { .. } => {
+                        let sum = summarize_result(name, &json);
+                        // Batch results can be large, omit full result
+                        (None, Some(sum).filter(|s| !s.is_empty()), None)
                     }
                     _ => {
                         let sum = summarize_result(name, &json);
-                        (Some(sum).filter(|s| !s.is_empty()), None)
+                        // List/Query/Get/BlueskyRead results can be very large
+                        // (e.g. list_wiki_entries with full content fields).
+                        // Omit the full result from thoughts — the summary
+                        // captures count + sample, and the agent already has
+                        // the full data from the tool call itself.
+                        (None, Some(sum).filter(|s| !s.is_empty()), None)
                     }
                 };
 
-                (Some(json), summary, link, None)
+                (result_for_thought, summary, link, None)
             } else {
                 // Non-JSON text result
                 (Some(Value::String(text.clone())), None, None, None)
@@ -2501,8 +2562,8 @@ mod tests {
         let parsed: Value = serde_json::from_str(&content).expect("should be valid JSON");
 
         assert_eq!(parsed["tool"], "record_thought");
-        // Excluded tools still have result, just no summary
-        assert!(parsed.get("result").is_some());
+        // Excluded tools have no result and no summary
+        assert!(parsed.get("result").is_none());
         assert!(parsed.get("summary").is_none());
     }
 

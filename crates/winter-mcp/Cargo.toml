@@ -47,6 +47,9 @@ uuid = { workspace = true }
 # HTTP client for operator PDS lookups
 reqwest = { workspace = true }
 
+# Regex for wiki-link syntax parsing
+regex = { workspace = true }
+
 [dev-dependencies]
 proptest = { workspace = true }
 tempfile = { workspace = true }
