@@ -17,7 +17,8 @@ use chrono::{DateTime, Utc};
 
 use winter_atproto::{
     BlogEntry, CacheUpdate, CustomTool, Directive, DirectiveKind, Fact, Follow, Job, JobSchedule,
-    Like, Note, Post, Repost, Thought, ToolApproval, ToolApprovalStatus, WikiEntry, WikiLink,
+    Like, Note, Post, Repost, Thought, ToolApproval, ToolApprovalStatus, Trigger, WikiEntry,
+    WikiLink,
 };
 
 use crate::error::DatalogError;
@@ -227,6 +228,8 @@ pub struct DerivedFactGenerator {
     wiki_links: HashMap<String, WikiLinkMeta>,
     /// Fact tags: rkey -> tags.
     fact_tags: HashMap<String, Vec<String>>,
+    /// Triggers: rkey -> (name, enabled).
+    triggers: HashMap<String, (String, bool)>,
 
     // =========================================================================
     // From Bluesky API (periodic sync)
@@ -261,6 +264,7 @@ impl DerivedFactGenerator {
             wiki_entries: HashMap::new(),
             wiki_links: HashMap::new(),
             fact_tags: HashMap::new(),
+            triggers: HashMap::new(),
             followers: HashSet::new(),
             dirty_predicates: HashSet::new(),
         }
@@ -326,6 +330,8 @@ impl DerivedFactGenerator {
                 | "has_wiki_link"
                 // Winter: fact tags
                 | "fact_tag"
+                // Winter: triggers
+                | "has_trigger"
         )
     }
 
@@ -613,6 +619,14 @@ impl DerivedFactGenerator {
                 description: "Your scheduled jobs (once/interval)",
             },
         );
+        m.insert(
+            "has_trigger",
+            PredicateInfo {
+                arity: 3,
+                args: &["name", "enabled", "rkey"],
+                description: "Your datalog triggers (enabled: true/false)",
+            },
+        );
 
         // Note predicates
         m.insert(
@@ -884,6 +898,17 @@ impl DerivedFactGenerator {
             }
             CacheUpdate::FactDeleted { rkey } => {
                 self.remove_fact_tags(rkey);
+            }
+
+            // Triggers
+            CacheUpdate::TriggerCreated { rkey, trigger } => {
+                self.add_trigger(rkey.clone(), trigger);
+            }
+            CacheUpdate::TriggerUpdated { rkey, trigger } => {
+                self.add_trigger(rkey.clone(), trigger);
+            }
+            CacheUpdate::TriggerDeleted { rkey } => {
+                self.remove_trigger(rkey);
             }
 
             // Ignored events
@@ -1489,6 +1514,22 @@ impl DerivedFactGenerator {
     }
 
     // =========================================================================
+    // Trigger handling
+    // =========================================================================
+
+    fn add_trigger(&mut self, rkey: String, trigger: &Trigger) {
+        self.triggers
+            .insert(rkey, (trigger.name.clone(), trigger.enabled));
+        self.dirty_predicates.insert("has_trigger".to_string());
+    }
+
+    fn remove_trigger(&mut self, rkey: &str) {
+        if self.triggers.remove(rkey).is_some() {
+            self.dirty_predicates.insert("has_trigger".to_string());
+        }
+    }
+
+    // =========================================================================
     // Follower sync (from API)
     // =========================================================================
 
@@ -1584,6 +1625,7 @@ impl DerivedFactGenerator {
             "has_wiki_link" => self.wiki_links.len(),
             "has_tool" => self.tools.len(),
             "has_job" => self.jobs.len(),
+            "has_trigger" => self.triggers.len(),
             _ => 0,
         };
 
@@ -1804,6 +1846,11 @@ impl DerivedFactGenerator {
                     writeln!(file, "{}\t{}\t{}", name, schedule_type, rkey)?;
                 }
             }
+            "has_trigger" => {
+                for (rkey, (name, enabled)) in &self.triggers {
+                    writeln!(file, "{}\t{}\t{}", name, enabled, rkey)?;
+                }
+            }
 
             // =================================================================
             // Notes
@@ -1986,6 +2033,7 @@ impl DerivedFactGenerator {
             blog_entries: self.blog_entries.len(),
             wiki_entries: self.wiki_entries.len(),
             wiki_links: self.wiki_links.len(),
+            triggers: self.triggers.len(),
         }
     }
 
@@ -2032,6 +2080,7 @@ impl DerivedFactGenerator {
             wiki_entries: self.wiki_entries.clone(),
             wiki_links: self.wiki_links.clone(),
             fact_tags: self.fact_tags.clone(),
+            triggers: self.triggers.clone(),
             followers: self.followers.clone(),
         }
     }
@@ -2059,6 +2108,7 @@ pub struct DerivedFlushSnapshot {
     wiki_entries: HashMap<String, WikiEntryMeta>,
     wiki_links: HashMap<String, WikiLinkMeta>,
     fact_tags: HashMap<String, Vec<String>>,
+    triggers: HashMap<String, (String, bool)>,
     followers: HashSet<String>,
 }
 
@@ -2350,6 +2400,11 @@ impl DerivedFlushSnapshot {
                     writeln!(file, "{}\t{}\t{}", name, schedule_type, rkey)?;
                 }
             }
+            "has_trigger" => {
+                for (rkey, (name, enabled)) in &self.triggers {
+                    writeln!(file, "{}\t{}\t{}", name, enabled, rkey)?;
+                }
+            }
 
             // =================================================================
             // Notes
@@ -2529,6 +2584,7 @@ pub struct DerivedFactStats {
     pub blog_entries: usize,
     pub wiki_entries: usize,
     pub wiki_links: usize,
+    pub triggers: usize,
 }
 
 /// Escape tabs and newlines in a string for TSV output.
@@ -2632,6 +2688,7 @@ mod tests {
             supersedes: None,
             tags: tags.into_iter().map(String::from).collect(),
             created_at: Utc::now(),
+            expires_at: None,
         }
     }
 

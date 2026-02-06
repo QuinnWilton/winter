@@ -7,11 +7,9 @@
 //! - Parse query results
 //! - Cache datalog state for efficient incremental queries
 //! - Generate derived facts from PDS records
-//! - Coordinate concurrent access to TSV files via actor
 
 pub mod cache;
 mod compiler;
-pub mod coordinator;
 pub mod dependency;
 pub mod derived;
 mod error;
@@ -21,7 +19,6 @@ mod validator;
 
 pub use cache::{CachedFactData, DatalogCache};
 pub use compiler::RuleCompiler;
-pub use coordinator::{DatalogCoordinator, DatalogCoordinatorHandle};
 pub use dependency::PredicateDependencyGraph;
 pub use derived::{DerivedFactGenerator, DerivedFactStats, PredicateInfo};
 pub use error::DatalogError;

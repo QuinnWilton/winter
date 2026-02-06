@@ -214,6 +214,7 @@ impl CacheTestHarness {
                         supersedes: None,
                         tags: vec![],
                         created_at: chrono::Utc::now(),
+                        expires_at: None,
                     };
                     self.repo_cache
                         .upsert_fact(rkey, fact, format!("cid_{}", rand_rkey()));
@@ -245,6 +246,7 @@ impl CacheTestHarness {
                             supersedes: None,
                             tags: vec![],
                             created_at: chrono::Utc::now(),
+                            expires_at: None,
                         };
                         self.repo_cache
                             .upsert_fact(rkey, fact, format!("flood_cid_{}", i));
@@ -274,6 +276,7 @@ impl CacheTestHarness {
                         supersedes: None,
                         tags: vec![],
                         created_at: chrono::Utc::now(),
+                        expires_at: None,
                     };
                     self.repo_cache
                         .upsert_fact(rkey.clone(), fact, format!("cid_{}", rand_rkey()));
@@ -370,6 +373,7 @@ async fn test_full_regen_flag_set_on_lag() {
             supersedes: None,
             tags: vec![],
             created_at: chrono::Utc::now(),
+            expires_at: None,
         };
         repo_cache.upsert_fact(format!("rkey{}", i), fact, format!("cid{}", i));
     }
@@ -412,6 +416,7 @@ async fn test_generation_counters_increase() {
                 supersedes: None,
                 tags: vec![],
                 created_at: chrono::Utc::now(),
+                expires_at: None,
             },
         })
         .await
@@ -476,6 +481,7 @@ proptest! {
                             supersedes: None,
                             tags: vec![],
                             created_at: chrono::Utc::now(),
+                            expires_at: None,
                         },
                     })
                     .await

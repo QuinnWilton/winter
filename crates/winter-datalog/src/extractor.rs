@@ -60,6 +60,9 @@ impl FactExtractor {
         let mut source_file = File::create(output_dir.join("_source.facts"))?;
         let mut supersedes_file = File::create(output_dir.join("_supersedes.facts"))?;
         let mut created_at_file = File::create(output_dir.join("_created_at.facts"))?;
+        let mut expires_at_file = File::create(output_dir.join("_expires_at.facts"))?;
+
+        let now = chrono::Utc::now();
 
         for item in facts {
             let fact = &item.value;
@@ -67,7 +70,9 @@ impl FactExtractor {
             let rkey = AtUri::extract_rkey(&item.uri);
             let cid = &item.cid;
             let args = fact.args.join("\t");
-            let is_current = !superseded_cids.contains(cid.as_str());
+            let is_superseded = superseded_cids.contains(cid.as_str());
+            let is_expired = fact.expires_at.map_or(false, |ea| ea <= now);
+            let is_current = !is_superseded && !is_expired;
 
             // Ensure predicate files exist
             if !current_files.contains_key(predicate) {
@@ -119,6 +124,11 @@ impl FactExtractor {
                 rkey,
                 fact.created_at.to_rfc3339()
             )?;
+
+            // Write to _expires_at.facts (sparse - only if set)
+            if let Some(ref ea) = fact.expires_at {
+                writeln!(expires_at_file, "{}\t{}", rkey, ea.to_rfc3339())?;
+            }
         }
 
         Ok(ExtractResult {
@@ -129,6 +139,7 @@ impl FactExtractor {
                 "_source",
                 "_supersedes",
                 "_created_at",
+                "_expires_at",
             ],
         })
     }
@@ -162,13 +173,21 @@ impl FactExtractor {
              .decl _supersedes(new_rkey: symbol, old_rkey: symbol)\n\
              .input _supersedes\n\n\
              .decl _created_at(rkey: symbol, timestamp: symbol)\n\
-             .input _created_at\n\n",
+             .input _created_at\n\n\
+             .decl _expires_at(rkey: symbol, timestamp: symbol)\n\
+             .input _expires_at\n\n\
+             .decl _now(timestamp: symbol)\n\n\
+             .decl _expired(rkey: symbol)\n\
+             _expired(R) :- _expires_at(R, E), _now(T), E < T.\n\n",
         );
         declared_set.insert("_fact".to_string());
         declared_set.insert("_confidence".to_string());
         declared_set.insert("_source".to_string());
         declared_set.insert("_supersedes".to_string());
         declared_set.insert("_created_at".to_string());
+        declared_set.insert("_expires_at".to_string());
+        declared_set.insert("_now".to_string());
+        declared_set.insert("_expired".to_string());
 
         // User predicates (current facts only) and _all_{predicate} (all facts with rkey at end)
         for (predicate, arity) in arities {
@@ -226,13 +245,21 @@ impl FactExtractor {
              .decl _supersedes(new_rkey: symbol, old_rkey: symbol)\n\
              .input _supersedes\n\n\
              .decl _created_at(rkey: symbol, timestamp: symbol)\n\
-             .input _created_at\n\n",
+             .input _created_at\n\n\
+             .decl _expires_at(rkey: symbol, timestamp: symbol)\n\
+             .input _expires_at\n\n\
+             .decl _now(timestamp: symbol)\n\n\
+             .decl _expired(rkey: symbol)\n\
+             _expired(R) :- _expires_at(R, E), _now(T), E < T.\n\n",
         );
         declared_set.insert("_fact".to_string());
         declared_set.insert("_confidence".to_string());
         declared_set.insert("_source".to_string());
         declared_set.insert("_supersedes".to_string());
         declared_set.insert("_created_at".to_string());
+        declared_set.insert("_expires_at".to_string());
+        declared_set.insert("_now".to_string());
+        declared_set.insert("_expired".to_string());
 
         // User predicates (current facts only) and _all_{predicate} (all facts with rkey at end)
         for (predicate, &arity) in arities {
@@ -278,13 +305,15 @@ impl FactExtractor {
     ) -> Result<(), DatalogError> {
         use std::fs::File;
 
-        // Current facts file (non-superseded only)
+        // Current facts file (non-superseded, non-expired only)
         let current_path = output_dir.join(format!("{}.facts", predicate));
         let mut current_file = File::create(&current_path)?;
 
         // All facts file (with rkey prefix)
         let all_path = output_dir.join(format!("_all_{}.facts", predicate));
         let mut all_file = File::create(&all_path)?;
+
+        let now = chrono::Utc::now();
 
         for (rkey, data) in facts {
             if data.fact.predicate != predicate {
@@ -296,8 +325,9 @@ impl FactExtractor {
             // Write to all file (always, rkey at end)
             writeln!(all_file, "{}\t{}", args, rkey)?;
 
-            // Write to current file (only if not superseded, rkey at end)
-            if !data.is_superseded {
+            // Write to current file (only if not superseded and not expired, rkey at end)
+            let is_expired = data.fact.expires_at.map_or(false, |ea| ea <= now);
+            if !data.is_superseded && !is_expired {
                 writeln!(current_file, "{}\t{}", args, rkey)?;
             }
         }
@@ -336,6 +366,7 @@ mod tests {
                 supersedes: supersedes.map(String::from),
                 tags: vec![],
                 created_at: Utc::now(),
+                expires_at: None,
             },
         }
     }
@@ -360,7 +391,8 @@ mod tests {
                 "_confidence",
                 "_source",
                 "_supersedes",
-                "_created_at"
+                "_created_at",
+                "_expires_at"
             ]
         );
 

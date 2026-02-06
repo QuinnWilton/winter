@@ -87,6 +87,7 @@ mod tests {
             supersedes: None,
             tags: vec![],
             created_at: Utc::now(),
+            expires_at: None,
         }
     }
 

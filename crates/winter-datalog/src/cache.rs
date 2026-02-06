@@ -66,8 +66,8 @@ pub struct DatalogCache {
     /// Set of CIDs that have been superseded.
     superseded_cids: RwLock<HashSet<String>>,
 
-    /// Cached rules (for compilation).
-    rules: RwLock<Vec<Rule>>,
+    /// Cached rules (for compilation), keyed by rkey.
+    rules: RwLock<HashMap<String, Rule>>,
 
     /// Cached fact declarations (for query-time .decl generation), keyed by rkey.
     declarations: RwLock<HashMap<String, FactDeclaration>>,
@@ -137,7 +137,7 @@ impl DatalogCache {
             facts_by_rkey: RwLock::new(HashMap::new()),
             cid_to_rkey: RwLock::new(HashMap::new()),
             superseded_cids: RwLock::new(HashSet::new()),
-            rules: RwLock::new(Vec::new()),
+            rules: RwLock::new(HashMap::new()),
             declarations: RwLock::new(HashMap::new()),
             declarations_by_predicate: RwLock::new(HashMap::new()),
             facts_generation: AtomicU64::new(0),
@@ -297,13 +297,13 @@ impl DatalogCache {
             }
         }
 
-        // Insert rules
+        // Insert rules (keyed by rkey)
         info!("inserting rules into cache");
         {
             let mut rules_guard = self.rules.write().await;
             rules_guard.clear();
-            for (_, cached) in rules {
-                rules_guard.push(cached.value);
+            for (rkey, cached) in rules {
+                rules_guard.insert(rkey, cached.value);
             }
         }
         info!("rules inserted, starting derived facts population");
@@ -454,6 +454,16 @@ impl DatalogCache {
                 });
             }
 
+            // Triggers
+            let triggers_list = repo_cache.list_triggers();
+            info!(count = triggers_list.len(), "populating triggers");
+            for (rkey, cached) in triggers_list {
+                derived.handle_update(&CacheUpdate::TriggerCreated {
+                    rkey,
+                    trigger: cached.value,
+                });
+            }
+
             // Followers from daemon state (stored in PDS so MCP can access via CAR)
             let followers = repo_cache.get_followers().await;
             if !followers.is_empty() {
@@ -529,8 +539,8 @@ impl DatalogCache {
             CacheUpdate::FactDeleted { rkey } => {
                 self.remove_fact(&rkey).await;
             }
-            CacheUpdate::RuleCreated { rule, .. } => {
-                self.add_rule(rule).await;
+            CacheUpdate::RuleCreated { rkey, rule } => {
+                self.add_rule(rkey, rule).await;
             }
             CacheUpdate::RuleUpdated { rkey, rule } => {
                 self.update_rule(&rkey, rule).await;
@@ -585,7 +595,11 @@ impl DatalogCache {
             | ref update @ CacheUpdate::ToolApprovalDeleted { .. }
             | ref update @ CacheUpdate::JobCreated { .. }
             | ref update @ CacheUpdate::JobUpdated { .. }
-            | ref update @ CacheUpdate::JobDeleted { .. } => {
+            | ref update @ CacheUpdate::JobDeleted { .. }
+            // Trigger records
+            | ref update @ CacheUpdate::TriggerCreated { .. }
+            | ref update @ CacheUpdate::TriggerUpdated { .. }
+            | ref update @ CacheUpdate::TriggerDeleted { .. } => {
                 // Forward to DerivedFactGenerator
                 let mut derived = self.derived.write().await;
                 derived.handle_update(update);
@@ -710,35 +724,33 @@ impl DatalogCache {
     }
 
     /// Add a rule.
-    async fn add_rule(&self, rule: Rule) {
+    async fn add_rule(&self, rkey: String, rule: Rule) {
         let mut rules = self.rules.write().await;
-        rules.push(rule);
+        rules.insert(rkey, rule);
         drop(rules);
 
         self.rules_generation.fetch_add(1, Ordering::SeqCst);
         trace!("rule added");
     }
 
-    /// Update a rule.
-    async fn update_rule(&self, _rkey: &str, rule: Rule) {
-        // For simplicity, just replace rules with same name
+    /// Update a rule by rkey.
+    async fn update_rule(&self, rkey: &str, rule: Rule) {
         let mut rules = self.rules.write().await;
-        if let Some(existing) = rules.iter_mut().find(|r| r.name == rule.name) {
-            *existing = rule;
-        } else {
-            rules.push(rule);
-        }
+        rules.insert(rkey.to_string(), rule);
         drop(rules);
 
         self.rules_generation.fetch_add(1, Ordering::SeqCst);
-        trace!("rule updated");
+        trace!(rkey = %rkey, "rule updated");
     }
 
-    /// Remove a rule.
-    async fn remove_rule(&self, _rkey: &str) {
-        // We don't have rkey -> rule mapping, so just invalidate
+    /// Remove a rule by rkey.
+    async fn remove_rule(&self, rkey: &str) {
+        let mut rules = self.rules.write().await;
+        rules.remove(rkey);
+        drop(rules);
+
         self.rules_generation.fetch_add(1, Ordering::SeqCst);
-        trace!("rule removed");
+        trace!(rkey = %rkey, "rule removed");
     }
 
     /// Execute a query using the cache.
@@ -793,9 +805,10 @@ impl DatalogCache {
         self.flush_dirty_predicates().await?;
 
         // Build dependency graph from stored rules
-        let rules = self.rules.read().await;
-        let dep_graph = PredicateDependencyGraph::from_rules(&rules);
-        drop(rules);
+        let rules_guard = self.rules.read().await;
+        let rules_vec: Vec<Rule> = rules_guard.values().cloned().collect();
+        drop(rules_guard);
+        let dep_graph = PredicateDependencyGraph::from_rules(&rules_vec);
 
         // Extract predicates from query
         let mut root_predicates = PredicateDependencyGraph::extract_query_predicates(query);
@@ -836,9 +849,48 @@ impl DatalogCache {
         let mut user_declared: HashSet<String> =
             extra_rules.map(parse_decl_statements).unwrap_or_default();
 
+        // Build predicate type map from all declaration sources (first-write-wins)
+        let mut predicate_types: HashMap<String, Vec<String>> = HashMap::new();
+
+        // 1. Stored declarations from PDS (highest priority — explicit user schemas)
+        {
+            let stored_decls = self.declarations_by_predicate.read().await;
+            for (pred_name, decl) in stored_decls.iter() {
+                let mut types: Vec<String> =
+                    decl.args.iter().map(|a| a.r#type.clone()).collect();
+                types.push("symbol".to_string()); // rkey is always symbol
+                predicate_types.insert(pred_name.clone(), types);
+            }
+        }
+
+        // 2. extra_declarations parameter
+        if let Some(decls) = extra_declarations {
+            for decl_str in decls {
+                if let Some((name, types)) = parse_declaration_arg_types(decl_str) {
+                    predicate_types.entry(name).or_insert(types);
+                }
+            }
+        }
+
+        // 3. .decl lines from extra_rules
+        if let Some(extra) = extra_rules {
+            for line in extra.lines() {
+                let line = line.trim();
+                if line.starts_with(".decl ") {
+                    if let Some((name, types)) = parse_declaration_arg_types(line) {
+                        predicate_types.entry(name).or_insert(types);
+                    }
+                }
+            }
+        }
+
         // Generate program for the required predicates
         let (base_program, declared_predicates) = self
-            .generate_program_for_predicates(&required_predicates, &user_declared)
+            .generate_program_for_predicates(
+                &required_predicates,
+                &user_declared,
+                &predicate_types,
+            )
             .await?;
 
         // Build full program
@@ -924,8 +976,15 @@ impl DatalogCache {
             // Auto-declare any new predicates (skip if user declared explicitly)
             for (name, arity) in &parsed_facts {
                 if !all_declared.contains(name) && !user_declared.contains(name) {
-                    let params: Vec<String> =
-                        (0..*arity).map(|i| format!("arg{}: symbol", i)).collect();
+                    let params: Vec<String> = if let Some(types) = predicate_types.get(name) {
+                        types
+                            .iter()
+                            .enumerate()
+                            .map(|(i, t)| format!("arg{}: {}", i, t))
+                            .collect()
+                    } else {
+                        (0..*arity).map(|i| format!("arg{}: symbol", i)).collect()
+                    };
                     program.push_str(&format!(".decl {}({})\n", name, params.join(", ")));
                     all_declared.insert(name.clone());
                 }
@@ -952,8 +1011,15 @@ impl DatalogCache {
             let heads = RuleCompiler::parse_extra_rules_heads(extra);
             for (name, arity) in heads {
                 if !all_declared.contains(&name) && !user_declared.contains(&name) {
-                    let params: Vec<String> =
-                        (0..arity).map(|i| format!("arg{}: symbol", i)).collect();
+                    let params: Vec<String> = if let Some(types) = predicate_types.get(&name) {
+                        types
+                            .iter()
+                            .enumerate()
+                            .map(|(i, t)| format!("arg{}: {}", i, t))
+                            .collect()
+                    } else {
+                        (0..arity).map(|i| format!("arg{}: symbol", i)).collect()
+                    };
                     program.push_str(&format!(".decl {}({})\n", name, params.join(", ")));
                     all_declared.insert(name);
                 }
@@ -972,7 +1038,8 @@ impl DatalogCache {
         }
 
         // Generate wrapper rule that properly handles constants as filters
-        let (wrapper, _result_arity) = generate_query_wrapper(query, Some(&all_declared));
+        let (wrapper, _result_arity) =
+            generate_query_wrapper(query, Some(&all_declared), &predicate_types);
         program.push_str(&wrapper);
 
         // Log program details for debugging derived predicate issues
@@ -1287,6 +1354,9 @@ impl DatalogCache {
         let mut created_at_file = BufWriter::new(std::fs::File::create(
             self.fact_dir.join("_created_at.facts"),
         )?);
+        let mut expires_at_file = BufWriter::new(std::fs::File::create(
+            self.fact_dir.join("_expires_at.facts"),
+        )?);
         // Create empty validation errors file - errors written per-predicate
         std::fs::File::create(self.fact_dir.join("_validation_error.facts"))?;
 
@@ -1315,6 +1385,10 @@ impl DatalogCache {
                 rkey,
                 data.fact.created_at.to_rfc3339()
             )?;
+
+            if let Some(ref ea) = data.fact.expires_at {
+                writeln!(expires_at_file, "{}\t{}", rkey, ea.to_rfc3339())?;
+            }
         }
 
         Ok(())
@@ -1345,7 +1419,7 @@ impl DatalogCache {
         facts: &HashMap<String, CachedFactData>,
         declarations_by_predicate: &HashMap<String, FactDeclaration>,
     ) -> Result<(), DatalogError> {
-        // Current facts file (non-superseded only)
+        // Current facts file (non-superseded, non-expired only)
         let current_path = self.fact_dir.join(format!("{}.facts", predicate));
         let mut current_file = BufWriter::new(std::fs::File::create(&current_path)?);
 
@@ -1361,6 +1435,8 @@ impl DatalogCache {
                 .append(true)
                 .open(&errors_path)?,
         );
+
+        let now = chrono::Utc::now();
 
         for (rkey, data) in facts.iter() {
             if data.fact.predicate != predicate {
@@ -1394,8 +1470,9 @@ impl DatalogCache {
             // Write to all file (always, rkey at end)
             writeln!(all_file, "{}\t{}", args_str, rkey)?;
 
-            // Write to current file (only if not superseded, rkey at end)
-            if !data.is_superseded {
+            // Write to current file (only if not superseded and not expired, rkey at end)
+            let is_expired = data.fact.expires_at.map_or(false, |ea| ea <= now);
+            if !data.is_superseded && !is_expired {
                 writeln!(current_file, "{}\t{}", args_str, rkey)?;
             }
         }
@@ -1415,6 +1492,7 @@ impl DatalogCache {
         &self,
         required_predicates: &HashSet<String>,
         exclude_predicates: &HashSet<String>,
+        predicate_types: &HashMap<String, Vec<String>>,
     ) -> Result<(String, HashSet<String>), DatalogError> {
         let mut program = String::new();
         let mut declared_predicates = HashSet::new();
@@ -1436,12 +1514,19 @@ impl DatalogCache {
                  .input _supersedes\n\n\
                  .decl _created_at(rkey: symbol, timestamp: symbol)\n\
                  .input _created_at\n\n\
+                 .decl _expires_at(rkey: symbol, timestamp: symbol)\n\
+                 .input _expires_at\n\n\
+                 .decl _now(timestamp: symbol)\n\n\
+                 .decl _expired(rkey: symbol)\n\
+                 _expired(R) :- _expires_at(R, E), _now(T), E < T.\n\n\
                  .decl _validation_error(rkey: symbol, predicate: symbol, error_msg: symbol)\n\
                  .input _validation_error\n\n",
             );
             for pred in METADATA_PREDICATES {
                 declared_predicates.insert((*pred).to_string());
             }
+            declared_predicates.insert("_now".to_string());
+            declared_predicates.insert("_expired".to_string());
         }
 
         // Generate input declarations for user fact predicates
@@ -1452,10 +1537,26 @@ impl DatalogCache {
             }
 
             // Current predicate (with rkey suffix)
-            let params: Vec<String> = (0..arity)
-                .map(|i| format!("arg{}: symbol", i))
-                .chain(std::iter::once("rkey: symbol".to_string()))
-                .collect();
+            // Look up types from the predicate type map; fall back to all-symbol
+            let params: Vec<String> = if let Some(types) = predicate_types.get(predicate) {
+                // Type map already includes rkey as last element
+                types
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        if i == types.len() - 1 {
+                            format!("rkey: {}", t)
+                        } else {
+                            format!("arg{}: {}", i, t)
+                        }
+                    })
+                    .collect()
+            } else {
+                (0..arity)
+                    .map(|i| format!("arg{}: symbol", i))
+                    .chain(std::iter::once("rkey: symbol".to_string()))
+                    .collect()
+            };
             program.push_str(&format!(
                 ".decl {}({})\n.input {}\n\n",
                 predicate,
@@ -1464,7 +1565,7 @@ impl DatalogCache {
             ));
             declared_predicates.insert(predicate.clone());
 
-            // _all_{predicate} variant
+            // _all_{predicate} variant (same types as current)
             let all_name = format!("_all_{}", predicate);
             if required_predicates.contains(&all_name) {
                 program.push_str(&format!(
@@ -1499,10 +1600,15 @@ impl DatalogCache {
         // Generate declarations for rule heads and compile rules
         let rules = self.rules.read().await;
 
-        // Filter rules to only those relevant to required predicates
+        // Filter rules to only those relevant to required predicates and enabled
         let relevant_rules: Vec<&winter_atproto::Rule> = rules
-            .iter()
+            .values()
             .filter(|rule| {
+                // Skip disabled rules entirely — they should not contribute
+                // declarations or compiled output to the program
+                if !rule.enabled {
+                    return false;
+                }
                 // Include rule if its head is in required predicates
                 if let Some(head_pred) = extract_rule_head_predicate(&rule.head) {
                     required_predicates.contains(&head_pred)
@@ -1512,13 +1618,21 @@ impl DatalogCache {
             })
             .collect();
 
-        // Generate declarations for rule heads
+        // Generate declarations for rule heads (using stored type info when available)
         for rule in &relevant_rules {
             if let Some((name, arity)) = extract_rule_head_with_arity(&rule.head)
                 && !declared_predicates.contains(&name)
                 && !exclude_predicates.contains(&name)
             {
-                let params: Vec<String> = (0..arity).map(|i| format!("arg{}: symbol", i)).collect();
+                let params: Vec<String> = if let Some(types) = predicate_types.get(&name) {
+                    types
+                        .iter()
+                        .enumerate()
+                        .map(|(i, t)| format!("arg{}: {}", i, t))
+                        .collect()
+                } else {
+                    (0..arity).map(|i| format!("arg{}: symbol", i)).collect()
+                };
                 program.push_str(&format!(".decl {}({})\n\n", name, params.join(", ")));
                 declared_predicates.insert(name);
             }
@@ -1528,6 +1642,13 @@ impl DatalogCache {
         if !relevant_rules.is_empty() {
             program.push_str("// Rules\n");
             for rule in relevant_rules {
+                if !rule.constraints.is_empty() {
+                    debug!(
+                        rule_name = %rule.name,
+                        constraints = ?rule.constraints,
+                        "compiling rule with constraints"
+                    );
+                }
                 let compiled = RuleCompiler::compile_single_rule(rule)?;
                 program.push_str(&compiled);
                 program.push('\n');
@@ -1607,6 +1728,11 @@ pub fn generate_input_declarations_from_arities(
          .input _supersedes\n\n\
          .decl _created_at(rkey: symbol, timestamp: symbol)\n\
          .input _created_at\n\n\
+         .decl _expires_at(rkey: symbol, timestamp: symbol)\n\
+         .input _expires_at\n\n\
+         .decl _now(timestamp: symbol)\n\n\
+         .decl _expired(rkey: symbol)\n\
+         _expired(R) :- _expires_at(R, E), _now(T), E < T.\n\n\
          .decl _validation_error(rkey: symbol, predicate: symbol, error_msg: symbol)\n\
          .input _validation_error\n\n",
     );
@@ -1615,6 +1741,9 @@ pub fn generate_input_declarations_from_arities(
     declared_set.insert("_source".to_string());
     declared_set.insert("_supersedes".to_string());
     declared_set.insert("_created_at".to_string());
+    declared_set.insert("_expires_at".to_string());
+    declared_set.insert("_now".to_string());
+    declared_set.insert("_expired".to_string());
     declared_set.insert("_validation_error".to_string());
 
     // User predicates (current facts only) and _all_{predicate} (all facts with rkey at end)
@@ -1757,6 +1886,37 @@ fn parse_single_arg(arg: &str) -> QueryArg {
     }
 }
 
+/// Parse a declaration string like `"my_pred(x: number, y: symbol)"` into
+/// `("my_pred", vec!["number", "symbol"])`.
+///
+/// Handles bare argument names (defaults to "symbol") and the `name: type` format.
+/// Returns `None` if the string doesn't look like a declaration.
+fn parse_declaration_arg_types(decl: &str) -> Option<(String, Vec<String>)> {
+    let decl = decl.trim().strip_prefix(".decl ").unwrap_or(decl);
+    let paren_idx = decl.find('(')?;
+    let close_paren = decl.rfind(')')?;
+    let name = decl[..paren_idx].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let args_str = &decl[paren_idx + 1..close_paren];
+    if args_str.trim().is_empty() {
+        return Some((name, vec![]));
+    }
+    let types = args_str
+        .split(',')
+        .map(|arg| {
+            let arg = arg.trim();
+            if let Some(colon_idx) = arg.find(':') {
+                arg[colon_idx + 1..].trim().to_string()
+            } else {
+                "symbol".to_string()
+            }
+        })
+        .collect();
+    Some((name, types))
+}
+
 /// Parse `.decl` statements from extra_rules to find user-declared predicates.
 ///
 /// This allows us to skip auto-declaring predicates that the user explicitly declared,
@@ -1826,9 +1986,14 @@ fn count_args(args_str: &str) -> usize {
 
 /// Generate a wrapper rule and output declaration for a query.
 /// This ensures constants in the query are properly used as filters.
+///
+/// The `predicate_types` map provides per-predicate argument types so that
+/// `_query_result` columns and fallback base declarations use the correct
+/// Soufflé types (e.g. `number`) instead of always defaulting to `symbol`.
 fn generate_query_wrapper(
     query: &str,
     declared_predicates: Option<&HashSet<String>>,
+    predicate_types: &HashMap<String, Vec<String>>,
 ) -> (String, usize) {
     let parsed = match parse_query(query) {
         Some(p) => p,
@@ -1856,10 +2021,59 @@ fn generate_query_wrapper(
         variables.len()
     };
 
+    // Look up the source predicate types to determine result column types.
+    // Map each result column back to its position in the source predicate.
+    let source_types = predicate_types.get(&parsed.name);
+
+    let result_column_types: Vec<String> = if variables.is_empty() {
+        // All constants/anonymous — result columns are the constants in order
+        parsed
+            .args
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, a)| match a {
+                QueryArg::Constant(_) => {
+                    let t = source_types
+                        .and_then(|ts| ts.get(pos))
+                        .map(|s| s.as_str())
+                        .unwrap_or("symbol");
+                    Some(t.to_string())
+                }
+                QueryArg::Variable(v) if v != "_" => {
+                    let t = source_types
+                        .and_then(|ts| ts.get(pos))
+                        .map(|s| s.as_str())
+                        .unwrap_or("symbol");
+                    Some(t.to_string())
+                }
+                QueryArg::Variable(_) => None,
+            })
+            .collect()
+    } else {
+        // Named variables — map each variable back to its position in the args list
+        parsed
+            .args
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, a)| match a {
+                QueryArg::Variable(v) if v != "_" => {
+                    let t = source_types
+                        .and_then(|ts| ts.get(pos))
+                        .map(|s| s.as_str())
+                        .unwrap_or("symbol");
+                    Some(t.to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+
     // Build the result predicate declaration
     let decl = if result_arity > 0 {
-        let params: Vec<String> = (0..result_arity)
-            .map(|i| format!("arg{}: symbol", i))
+        let params: Vec<String> = result_column_types
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("arg{}: {}", i, t))
             .collect();
         format!(".decl _query_result({})\n", params.join(", "))
     } else {
@@ -1892,9 +2106,17 @@ fn generate_query_wrapper(
     // Check if the base predicate needs declaration
     let base_decl = if let Some(declared) = declared_predicates {
         if !declared.contains(&parsed.name) && parsed.arity() > 0 {
-            let params: Vec<String> = (0..parsed.arity())
-                .map(|i| format!("arg{}: symbol", i))
-                .collect();
+            let params: Vec<String> = if let Some(types) = source_types {
+                types
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| format!("arg{}: {}", i, t))
+                    .collect()
+            } else {
+                (0..parsed.arity())
+                    .map(|i| format!("arg{}: symbol", i))
+                    .collect()
+            };
             format!(".decl {}({})\n", parsed.name, params.join(", "))
         } else {
             String::new()
@@ -1941,6 +2163,7 @@ mod tests {
             supersedes: None,
             tags: vec![],
             created_at: Utc::now(),
+            expires_at: None,
         }
     }
 
@@ -1974,7 +2197,9 @@ mod tests {
 
     #[test]
     fn test_generate_query_wrapper_with_constant() {
-        let (wrapper, arity) = generate_query_wrapper(r#"should_engage("did:plc:abc")"#, None);
+        let empty_types = HashMap::new();
+        let (wrapper, arity) =
+            generate_query_wrapper(r#"should_engage("did:plc:abc")"#, None, &empty_types);
         assert_eq!(arity, 1);
         assert!(wrapper.contains(".decl _query_result(arg0: symbol)"));
         assert!(wrapper.contains(".output _query_result"));
@@ -1985,7 +2210,9 @@ mod tests {
 
     #[test]
     fn test_generate_query_wrapper_mixed_args() {
-        let (wrapper, arity) = generate_query_wrapper(r#"follows(X, "did:plc:abc")"#, None);
+        let empty_types = HashMap::new();
+        let (wrapper, arity) =
+            generate_query_wrapper(r#"follows(X, "did:plc:abc")"#, None, &empty_types);
         assert_eq!(arity, 1);
         assert!(wrapper.contains(r#"_query_result(X) :- follows(X, "did:plc:abc")."#));
     }
@@ -1993,7 +2220,9 @@ mod tests {
     #[test]
     fn test_generate_query_wrapper_with_underscore() {
         // Underscore (anonymous variable) should be excluded from the head
-        let (wrapper, arity) = generate_query_wrapper(r#"did_handle(DID, Handle, _)"#, None);
+        let empty_types = HashMap::new();
+        let (wrapper, arity) =
+            generate_query_wrapper(r#"did_handle(DID, Handle, _)"#, None, &empty_types);
         assert_eq!(arity, 2);
         // Head should NOT contain underscore
         assert!(wrapper.contains("_query_result(DID, Handle) :- did_handle(DID, Handle, _)."));
@@ -2003,9 +2232,99 @@ mod tests {
     #[test]
     fn test_generate_query_wrapper_all_underscores() {
         // Query with all anonymous variables should produce nullary result
-        let (wrapper, arity) = generate_query_wrapper(r#"did_handle(_, _, _)"#, None);
+        let empty_types = HashMap::new();
+        let (wrapper, arity) =
+            generate_query_wrapper(r#"did_handle(_, _, _)"#, None, &empty_types);
         assert_eq!(arity, 0);
         assert!(wrapper.contains("_query_result() :- did_handle(_, _, _)."));
+    }
+
+    #[test]
+    fn test_generate_query_wrapper_with_typed_predicate() {
+        // When predicate_types has number types, _query_result should use them
+        let mut types = HashMap::new();
+        types.insert(
+            "scored".to_string(),
+            vec![
+                "symbol".to_string(),
+                "number".to_string(),
+                "symbol".to_string(),
+            ],
+        );
+        let (wrapper, arity) = generate_query_wrapper("scored(X, Y, _)", None, &types);
+        assert_eq!(arity, 2);
+        // X is at position 0 (symbol), Y is at position 1 (number)
+        assert!(
+            wrapper.contains(".decl _query_result(arg0: symbol, arg1: number)"),
+            "wrapper was: {}",
+            wrapper
+        );
+        assert!(wrapper.contains("_query_result(X, Y) :- scored(X, Y, _)."));
+    }
+
+    #[test]
+    fn test_generate_query_wrapper_typed_base_decl() {
+        // When the base predicate is not declared, it should use types from the map
+        let mut types = HashMap::new();
+        types.insert(
+            "metric".to_string(),
+            vec!["symbol".to_string(), "number".to_string()],
+        );
+        let declared = HashSet::new();
+        let (wrapper, _arity) =
+            generate_query_wrapper("metric(X, Y)", Some(&declared), &types);
+        assert!(
+            wrapper.contains(".decl metric(arg0: symbol, arg1: number)"),
+            "wrapper was: {}",
+            wrapper
+        );
+        assert!(wrapper.contains(".decl _query_result(arg0: symbol, arg1: number)"));
+    }
+
+    #[test]
+    fn test_generate_query_wrapper_typed_constant_only() {
+        // When all args are constants, result columns should still use correct types
+        let mut types = HashMap::new();
+        types.insert(
+            "threshold".to_string(),
+            vec!["symbol".to_string(), "number".to_string()],
+        );
+        let (wrapper, arity) =
+            generate_query_wrapper(r#"threshold("high", 42)"#, None, &types);
+        assert_eq!(arity, 2);
+        assert!(
+            wrapper.contains(".decl _query_result(arg0: symbol, arg1: number)"),
+            "wrapper was: {}",
+            wrapper
+        );
+    }
+
+    #[test]
+    fn test_parse_declaration_arg_types() {
+        // Basic name: type format
+        let (name, types) =
+            parse_declaration_arg_types("my_pred(x: number, y: symbol)").unwrap();
+        assert_eq!(name, "my_pred");
+        assert_eq!(types, vec!["number", "symbol"]);
+
+        // With .decl prefix
+        let (name, types) =
+            parse_declaration_arg_types(".decl scored(name: symbol, val: number)").unwrap();
+        assert_eq!(name, "scored");
+        assert_eq!(types, vec!["symbol", "number"]);
+
+        // Bare names default to symbol
+        let (name, types) = parse_declaration_arg_types("bare(x, y)").unwrap();
+        assert_eq!(name, "bare");
+        assert_eq!(types, vec!["symbol", "symbol"]);
+
+        // Empty args
+        let (name, types) = parse_declaration_arg_types("nullary()").unwrap();
+        assert_eq!(name, "nullary");
+        assert!(types.is_empty());
+
+        // Invalid input
+        assert!(parse_declaration_arg_types("no_parens").is_none());
     }
 
     #[test]

@@ -178,6 +178,7 @@ pub const METADATA_PREDICATES: &[&str] = &[
     "_source",
     "_supersedes",
     "_created_at",
+    "_expires_at",
     "_validation_error",
 ];
 
