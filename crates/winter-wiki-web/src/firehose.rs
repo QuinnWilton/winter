@@ -141,12 +141,12 @@ impl FirehoseConsumer {
 
             match op.action.as_str() {
                 "create" | "update" => {
-                    let cid = match &op.cid {
-                        Some(c) => c,
+                    let cid_str = match &op.cid {
+                        Some(c) => c.to_string(),
                         None => continue,
                     };
 
-                    let data = match blocks.get(cid) {
+                    let data = match blocks.get(&cid_str) {
                         Some(d) => d,
                         None => continue,
                     };
@@ -206,7 +206,7 @@ struct CommitPayload {
 struct CommitOp {
     action: String,
     path: String,
-    cid: Option<String>,
+    cid: Option<ipld_core::cid::Cid>,
 }
 
 /// Parse CAR blocks into a CID -> data map.
