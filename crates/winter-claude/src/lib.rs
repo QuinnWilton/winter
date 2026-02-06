@@ -25,9 +25,9 @@ pub mod cli;
 
 // Re-export core types for convenience
 pub use crate::core::{
-    ClaudeResponse, Config, Cost, Error, ExtractedToolCall, Message, MessageMeta, MessageType,
-    ResponseMetadata, Result, Session, SessionId, SessionManager, StreamFormat, TokenUsage,
-    ToolPermission,
+    ClaudeResponse, Config, ConversationStats, Cost, Error, ExtractedToolCall, Message,
+    MessageMeta, MessageType, ResponseMetadata, Result, Session, SessionId, SessionManager,
+    StreamFormat, TokenUsage, ToolPermission,
 };
 // Re-export MCP types when feature is enabled
 #[cfg(feature = "mcp")]

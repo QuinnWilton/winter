@@ -4,12 +4,13 @@ use std::{
 };
 
 use futures::{Stream, StreamExt};
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use tracing::{debug, error};
 
 use crate::core::{
     message::{ConversationStats, TokenUsage},
-    Error, Message, Result, StreamFormat,
+    Error, Message, MessageMeta, Result, StreamFormat,
 };
 
 /// Stream of messages from Claude AI
@@ -233,6 +234,204 @@ impl Stream for MessageStream {
     }
 }
 
+// ============================================================================
+// CLI Stream Envelope types
+// ============================================================================
+
+/// Top-level envelope from Claude Code CLI's `--output-format stream-json`.
+///
+/// The CLI wraps API messages in an envelope like:
+/// ```json
+/// {"type":"assistant","message":{"content":[...],"usage":{...}},"session_id":"..."}
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct CliStreamEnvelope {
+    #[serde(rename = "type")]
+    envelope_type: String,
+    /// Nested API message (present for assistant/user types).
+    message: Option<CliApiMessage>,
+    session_id: Option<String>,
+    // Fields for "result" type envelopes (ClaudeCliResponse format)
+    subtype: Option<String>,
+    result: Option<String>,
+    cost_usd: Option<f64>,
+    duration_ms: Option<u64>,
+    num_turns: Option<u32>,
+    is_error: Option<bool>,
+}
+
+/// The nested `message` field inside a CLI stream envelope.
+#[derive(Debug, Clone, Deserialize)]
+struct CliApiMessage {
+    content: Vec<CliContentBlock>,
+    #[serde(default)]
+    usage: Option<CliUsage>,
+}
+
+/// A content block inside the API message.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(dead_code)]
+enum CliContentBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: Option<serde_json::Value>,
+    },
+}
+
+/// Token usage from the API message.
+#[derive(Debug, Clone, Deserialize)]
+struct CliUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+}
+
+/// Convert a CLI stream envelope into a `Message`.
+fn convert_envelope(env: CliStreamEnvelope) -> Option<Message> {
+    let session_id = env.session_id.unwrap_or_default();
+
+    match env.envelope_type.as_str() {
+        "assistant" => {
+            let msg = env.message?;
+            let usage = msg.usage.as_ref();
+            let meta = MessageMeta {
+                session_id: session_id.clone(),
+                timestamp: Some(std::time::SystemTime::now()),
+                cost_usd: None,
+                duration_ms: None,
+                tokens_used: usage.map(|u| TokenUsage {
+                    input: u.input_tokens,
+                    output: u.output_tokens,
+                    total: u.input_tokens + u.output_tokens,
+                }),
+            };
+
+            // Check for tool_use blocks first
+            for block in &msg.content {
+                if let CliContentBlock::ToolUse {
+                    name,
+                    input,
+                    ..
+                } = block
+                {
+                    return Some(Message::Tool {
+                        name: name.clone(),
+                        parameters: input.clone(),
+                        meta,
+                    });
+                }
+            }
+
+            // Otherwise concatenate text blocks
+            let text: String = msg
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    CliContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+
+            Some(Message::Assistant {
+                content: text,
+                meta,
+            })
+        }
+        "user" => {
+            let msg = env.message?;
+            let meta = MessageMeta {
+                session_id,
+                timestamp: Some(std::time::SystemTime::now()),
+                cost_usd: None,
+                duration_ms: None,
+                tokens_used: None,
+            };
+
+            // Check for tool_result blocks
+            for block in &msg.content {
+                if let CliContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                } = block
+                {
+                    return Some(Message::ToolResult {
+                        tool_name: tool_use_id.clone(),
+                        result: content.clone().unwrap_or(serde_json::Value::Null),
+                        meta,
+                    });
+                }
+            }
+
+            // Otherwise treat as user text
+            let text: String = msg
+                .content
+                .iter()
+                .filter_map(|b| match b {
+                    CliContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+
+            Some(Message::User {
+                content: text,
+                meta,
+            })
+        }
+        "result" => {
+            // Result envelope — convert from ClaudeCliResponse-like fields
+            let meta = MessageMeta {
+                session_id,
+                timestamp: Some(std::time::SystemTime::now()),
+                cost_usd: env.cost_usd,
+                duration_ms: env.duration_ms,
+                tokens_used: None,
+            };
+
+            // If there's a result string, check if it's an error
+            if env.is_error.unwrap_or(false) {
+                if let Some(result_text) = env.result {
+                    return Some(Message::System {
+                        content: result_text,
+                        meta,
+                    });
+                }
+            }
+
+            Some(Message::Result {
+                meta,
+                stats: ConversationStats {
+                    total_messages: u64::from(env.num_turns.unwrap_or(0)),
+                    total_cost_usd: env.cost_usd.unwrap_or(0.0),
+                    total_duration_ms: env.duration_ms.unwrap_or(0),
+                    total_tokens: TokenUsage {
+                        input: 0,
+                        output: 0,
+                        total: 0,
+                    },
+                },
+            })
+        }
+        _ => {
+            // Unknown envelope type — skip
+            debug!("Skipping unknown CLI stream envelope type: {}", env.envelope_type);
+            None
+        }
+    }
+}
+
 /// Parses streaming messages from Claude based on the configured format.
 pub struct MessageParser {
     format: StreamFormat,
@@ -256,11 +455,21 @@ impl MessageParser {
                     return Ok(None);
                 }
 
+                // Try direct Message deserialization first
                 match serde_json::from_str::<Message>(line) {
                     Ok(message) => Ok(Some(message)),
-                    Err(e) => {
-                        error!("Failed to parse message: {}, line: {}", e, line);
-                        Err(Error::SerializationError(e))
+                    Err(_direct_err) => {
+                        // Fallback: try CLI stream envelope format
+                        match serde_json::from_str::<CliStreamEnvelope>(line) {
+                            Ok(envelope) => Ok(convert_envelope(envelope)),
+                            Err(envelope_err) => {
+                                error!(
+                                    "Failed to parse message (tried direct and envelope): {}, line: {}",
+                                    envelope_err, line
+                                );
+                                Err(Error::SerializationError(envelope_err))
+                            }
+                        }
                     }
                 }
             }
