@@ -149,6 +149,14 @@ impl WikiDb {
         Ok(())
     }
 
+    /// Delete all entries and links for a DID (used before re-backfill).
+    pub fn clear_did(&self, did: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM wiki_entries WHERE did = ?1", params![did])?;
+        conn.execute("DELETE FROM wiki_links WHERE did = ?1", params![did])?;
+        Ok(())
+    }
+
     /// Get a wiki entry by DID and slug.
     pub fn get_entry_by_slug(&self, did: &str, slug: &str) -> Result<Option<WikiEntryRow>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();

@@ -5,8 +5,9 @@ use std::sync::Arc;
 use axum::{
     Router,
     extract::{Path, Query, State},
+    http::StatusCode,
     response::{Html, IntoResponse},
-    routing::get,
+    routing::{get, post},
 };
 use serde::Deserialize;
 use tokio::sync::RwLock;
@@ -31,6 +32,7 @@ pub fn create_router(db: Arc<WikiDb>, resolver: Arc<RwLock<HandleResolver>>) -> 
         .route("/u/{handle_or_did}", get(user_entries))
         .route("/u/{handle_or_did}/{slug}", get(entry_detail))
         .route("/search", get(search))
+        .route("/admin/backfill/{handle_or_did}", post(admin_backfill))
         .with_state(state)
 }
 
@@ -236,6 +238,29 @@ async fn search(
             .replace("<!-- RESULTS -->", &results_html)
             .replace("<!-- COUNT -->", &results.len().to_string()),
     )
+}
+
+// ============================================================================
+// Admin
+// ============================================================================
+
+async fn admin_backfill(
+    State(state): State<Arc<AppState>>,
+    Path(handle_or_did): Path<String>,
+) -> impl IntoResponse {
+    let did = resolve_to_did(&state, &handle_or_did).await;
+
+    // Clear existing data for this DID and re-fetch everything
+    let _ = state.db.clear_did(&did);
+    match backfill::backfill_did(&state.db, &did).await {
+        Ok(()) => {
+            let count = state.db.list_entries_by_did(&did).map(|e| e.len()).unwrap_or(0);
+            (StatusCode::OK, format!("Backfilled {} entries for {}", count, did))
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Backfill failed: {}", e))
+        }
+    }
 }
 
 // ============================================================================
