@@ -52,6 +52,7 @@ Derived predicates are **protected**—they reflect authoritative PDS state and 
 | `toolApproval` | TID | Approval status for custom tools |
 | `secretMeta` | TID | Secret metadata (values stored locally) |
 | `factDeclaration` | TID | Schema declaration for fact predicates |
+| `trigger` | TID | Reactive datalog triggers (condition → action) |
 
 ### External Lexicons Used
 
@@ -71,7 +72,41 @@ Derived predicates are **protected**—they reflect authoritative PDS state and 
 
 **Tools**: `create_fact`, `update_fact`, `delete_fact`, `query_facts`
 
-Facts have a predicate and arguments. Each fact record also has optional metadata: `confidence` (0.0-1.0), `source` (provenance), `supersedes` (URI of previous fact), and `tags` (list of strings).
+Facts have a predicate and arguments. Each fact record also has optional metadata: `confidence` (0.0-1.0), `source` (provenance), `supersedes` (URI of previous fact), `tags` (list of strings), and `expires_at` (expiration timestamp).
+
+### Fact Expiration
+
+Facts can have an optional expiration time. Expired facts are soft-excluded from default queries (same pattern as superseded facts) but remain accessible via `_all_` variants for historical analysis.
+
+**Creating expiring facts:**
+- `expires_at` (ISO 8601 string): Explicit expiration timestamp
+- `ttl_seconds` (integer): Convenience alternative — computed to `expires_at` at creation time
+
+**Query-time behavior:**
+- `_now(Timestamp)` is auto-injected into every query with the current time
+- `_expired(Rkey)` is derived via datalog rule: `_expired(R) :- _expires_at(R, E), _now(T), E < T.`
+- Default predicate queries (e.g., `my_fact(X, Y, _)`) exclude both superseded and expired facts
+- `_all_my_fact(X, Y, Rkey)` includes expired and superseded facts
+
+**Examples:**
+```json
+// Create a fact that expires in 5 minutes
+{ "predicate": "session_emotion", "args": ["curious"], "ttl_seconds": 300 }
+
+// Create with explicit expiration
+{ "predicate": "considering_reply", "args": ["at://..."], "expires_at": "2026-02-07T00:00:00Z" }
+```
+
+```datalog
+// Find all expired facts
+_expired(R), _fact(R, P, _).
+
+// Find expiring facts and their deadlines
+_expires_at(R, T), _fact(R, P, _).
+
+// Get current time
+_now(T).
+```
 
 ### Fact Metadata Predicates
 
@@ -84,7 +119,10 @@ Every fact generates additional metadata predicates for querying:
 | `_source` | (rkey, source) | Provenance string |
 | `_supersedes` | (new_rkey, old_rkey) | Fact evolution chain |
 | `_created_at` | (rkey, timestamp) | Creation timestamp (ISO8601) |
-| `_all_<predicate>` | (arg1, arg2, ..., rkey) | All versions including superseded (same format as base) |
+| `_expires_at` | (rkey, timestamp) | Expiration timestamp (ISO8601), sparse |
+| `_now` | (timestamp) | Current time, auto-injected at query time |
+| `_expired` | (rkey) | Derived: facts past their expiration |
+| `_all_<predicate>` | (arg1, arg2, ..., rkey) | All versions including superseded/expired (same format as base) |
 
 This allows queries like "find all facts from source X" or "trace the history of a belief."
 
@@ -268,6 +306,7 @@ These predicates are automatically generated from PDS records. They exist only i
 |-----------|-------|-----------|-------------|
 | `has_tool` | 3 | (name, approved_bool, rkey) | Your custom tools (approved: true/false) |
 | `has_job` | 3 | (name, schedule_type, rkey) | Your scheduled jobs (once/interval) |
+| `has_trigger` | 3 | (name, enabled_bool, rkey) | Your datalog triggers (enabled: true/false) |
 
 #### Wiki Entries
 
@@ -413,6 +452,70 @@ Jobs have `name`, `instructions` (what to do), and `schedule`.
 - `knowledge_maintenance` - Periodic review and consolidation of facts, identifying stale or contradictory knowledge
 
 Create new jobs freely—if you want to check on something tomorrow, follow up on a conversation, or establish a new recurring practice, make a job for it.
+
+---
+
+## Triggers
+
+Triggers bridge "this is now true" → "do this thing" via datalog conditions. They enable reactive maintenance, attention management, and derived state materialization.
+
+**Evaluation model**: Periodic (every 5 minutes by default, configurable via `WINTER_TRIGGER_INTERVAL` env var). The daemon evaluates all enabled trigger conditions each cycle.
+
+**Tools**: `create_trigger`, `update_trigger`, `delete_trigger`, `list_triggers`, `test_trigger`
+
+### Trigger Structure
+
+Each trigger has:
+- `name`: Human-readable identifier
+- `description`: What this trigger does
+- `condition`: Datalog query that produces result tuples
+- `condition_rules`: Optional extra rules for the condition query
+- `action`: What to do for each new result tuple
+- `enabled`: Boolean (can be toggled without deleting)
+
+### Action Types
+
+| Action | Purpose | Variable Substitution |
+|--------|---------|----------------------|
+| `create_fact` | Create a new fact record | `$0`, `$1` in predicate args and tags |
+| `create_inbox_item` | Push a message to the inbox | `$0`, `$1` in message text |
+| `delete_fact` | Delete a fact by rkey | `$0` in rkey |
+
+### Variable Substitution
+
+`$0`, `$1`, etc. map positionally to columns in the query result tuple. Out-of-range references are left as literals.
+
+### Deduplication
+
+Each unique result tuple fires at most once. When a tuple disappears from results (condition no longer true), it's removed from the dedup set and can fire again if the condition becomes true later.
+
+**Action cap**: 50 actions per trigger per evaluation cycle. Excess tuples fire on the next cycle.
+
+### Examples
+
+```json
+// Create a trigger that flags new mutual follows
+{
+  "name": "flag_mutual_follows",
+  "description": "Create a fact when someone I follow follows me back",
+  "condition": "mutual(X) :- follows(Self, X, _), is_followed_by(X, Self), !high_context_relationship(X, _).",
+  "condition_rules": null,
+  "action": {
+    "type": "create_fact",
+    "predicate": "high_context_relationship",
+    "args": ["$0"],
+    "tags": ["auto", "social"]
+  }
+}
+```
+
+```json
+// Test a trigger condition without executing actions
+// Use test_trigger tool with condition parameter
+{
+  "condition": "stale(R, P) :- _fact(R, P, _), _created_at(R, T), T < \"2025-01-01T00:00:00Z\", !_supersedes(_, R)."
+}
+```
 
 ---
 
