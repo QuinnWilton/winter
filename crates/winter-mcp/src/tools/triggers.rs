@@ -10,7 +10,7 @@ use winter_atproto::{Tid, Trigger, TriggerAction};
 
 use std::collections::HashSet;
 
-use super::{ToolMeta, ToolState};
+use super::{ToolMeta, ToolState, parse_args};
 
 /// Collection name for triggers.
 const TRIGGER_COLLECTION: &str = "diy.razorgirl.winter.trigger";
@@ -135,6 +135,19 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "description": "Whether this trigger is enabled (default: true)",
                         "default": true
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "description": "Argument name" },
+                                "type": { "type": "string", "description": "Soufflé type (symbol, number, unsigned, float). Default: symbol" },
+                                "description": { "type": "string", "description": "What this argument represents" }
+                            },
+                            "required": ["name"]
+                        },
+                        "description": "Type annotations for _trigger_result predicate columns. Enables numeric comparisons instead of lexicographic string ordering."
                     }
                 },
                 "required": ["name", "description", "condition", "action"]
@@ -173,6 +186,19 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "enabled": {
                         "type": "boolean",
                         "description": "Enable or disable the trigger"
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "type": { "type": "string" },
+                                "description": { "type": "string" }
+                            },
+                            "required": ["name"]
+                        },
+                        "description": "Type annotations for _trigger_result (replaces existing)"
                     }
                 },
                 "required": ["rkey"]
@@ -223,6 +249,19 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "condition_rules": {
                         "type": "string",
                         "description": "Ad-hoc extra rules (used with ad-hoc condition)"
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "type": { "type": "string" },
+                                "description": { "type": "string" }
+                            },
+                            "required": ["name"]
+                        },
+                        "description": "Type annotations for ad-hoc testing (used with ad-hoc condition)"
                     }
                 },
                 "required": []
@@ -268,6 +307,14 @@ pub async fn create_trigger(
         None => return CallToolResult::error("Missing required parameter: action"),
     };
 
+    let args = match arguments.get("args").and_then(|v| v.as_array()) {
+        Some(arr) => match parse_args(arr) {
+            Ok(a) => a,
+            Err(e) => return e,
+        },
+        None => Vec::new(),
+    };
+
     let atproto = &state.atproto;
 
     let trigger = Trigger {
@@ -277,6 +324,7 @@ pub async fn create_trigger(
         condition_rules,
         action,
         enabled,
+        args,
         created_at: Utc::now(),
     };
 
@@ -356,6 +404,15 @@ pub async fn update_trigger(
         existing.action
     };
 
+    let args = if let Some(arr) = arguments.get("args").and_then(|v| v.as_array()) {
+        match parse_args(arr) {
+            Ok(a) => a,
+            Err(e) => return e,
+        }
+    } else {
+        existing.args
+    };
+
     let trigger = Trigger {
         name: name.clone(),
         description,
@@ -363,6 +420,7 @@ pub async fn update_trigger(
         condition_rules,
         action,
         enabled,
+        args,
         created_at: existing.created_at,
     };
 
@@ -429,7 +487,7 @@ pub async fn list_triggers(
         })
         .map(|(rkey, cached)| {
             let t = &cached.value;
-            json!({
+            let mut entry = json!({
                 "rkey": rkey,
                 "name": t.name,
                 "description": t.description,
@@ -438,7 +496,17 @@ pub async fn list_triggers(
                 "action": format_action(&t.action),
                 "enabled": t.enabled,
                 "created_at": t.created_at.to_rfc3339(),
-            })
+            });
+            if !t.args.is_empty() {
+                entry["args"] = json!(t.args.iter().map(|a| {
+                    json!({
+                        "name": a.name,
+                        "type": a.r#type,
+                        "description": a.description
+                    })
+                }).collect::<Vec<_>>());
+            }
+            entry
         })
         .collect();
 
@@ -460,7 +528,7 @@ pub async fn test_trigger(
         None => return CallToolResult::error("Cache not available"),
     };
     // Get condition either from existing trigger or ad-hoc
-    let (condition, condition_rules, trigger_name) = if let Some(rkey) =
+    let (condition, condition_rules, trigger_name, trigger_args) = if let Some(rkey) =
         arguments.get("rkey").and_then(|v| v.as_str())
     {
         match cache.get_trigger(rkey) {
@@ -468,6 +536,7 @@ pub async fn test_trigger(
                 cached.value.condition.clone(),
                 cached.value.condition_rules.clone(),
                 Some(cached.value.name.clone()),
+                cached.value.args.clone(),
             ),
             None => return CallToolResult::error(format!("Trigger not found: {}", rkey)),
         }
@@ -476,7 +545,14 @@ pub async fn test_trigger(
             .get("condition_rules")
             .and_then(|v| v.as_str())
             .map(String::from);
-        (condition.to_string(), rules, None)
+        let args = match arguments.get("args").and_then(|v| v.as_array()) {
+            Some(arr) => match parse_args(arr) {
+                Ok(a) => a,
+                Err(e) => return e,
+            },
+            None => Vec::new(),
+        };
+        (condition.to_string(), rules, None, args)
     } else {
         return CallToolResult::error("Either rkey or condition must be provided");
     };
@@ -484,10 +560,31 @@ pub async fn test_trigger(
     // Wrap condition body into a proper query rule
     let (query, rules) = build_trigger_query(&condition, condition_rules.as_deref());
 
+    // Build typed declaration for _trigger_result if trigger has args
+    let extra_decls: Vec<String> = if !trigger_args.is_empty() {
+        let params: Vec<String> = trigger_args
+            .iter()
+            .map(|a| format!("{}: {}", a.name, a.r#type))
+            .collect();
+        vec![format!("_trigger_result({})", params.join(", "))]
+    } else {
+        Vec::new()
+    };
+    let extra_decls_option: Option<&[String]> = if extra_decls.is_empty() {
+        None
+    } else {
+        Some(&extra_decls)
+    };
+
     // Run the query
     let query_result = if let Some(ref datalog_cache) = state.datalog_cache {
         datalog_cache
-            .execute_query(&query, rules.as_deref())
+            .execute_query_with_facts_and_declarations(
+                &query,
+                rules.as_deref(),
+                None,
+                extra_decls_option,
+            )
             .await
     } else {
         return CallToolResult::error("Datalog not available");
