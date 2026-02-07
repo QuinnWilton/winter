@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::protocol::{CallToolResult, ToolDefinition};
 use winter_atproto::{Rule, Tid, WriteOp, WriteResult};
 
-use super::{MAX_BATCH_SIZE, ToolMeta, ToolState, parse_string_array};
+use super::{MAX_BATCH_SIZE, ToolMeta, ToolState, parse_args, parse_string_array};
 
 /// Collection name for rules.
 const RULE_COLLECTION: &str = "diy.razorgirl.winter.rule";
@@ -47,6 +47,19 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "priority": {
                         "type": "integer",
                         "description": "Rule priority (lower = evaluated earlier, default 0)"
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "description": "Argument name" },
+                                "type": { "type": "string", "description": "Soufflé type (symbol, number, unsigned, float). Default: symbol" },
+                                "description": { "type": "string", "description": "What this argument represents" }
+                            },
+                            "required": ["name"]
+                        },
+                        "description": "Type annotations for the rule head predicate. Enables numeric comparisons instead of lexicographic string ordering."
                     }
                 },
                 "required": ["name", "description", "head", "body"]
@@ -88,6 +101,19 @@ pub fn definitions() -> Vec<ToolDefinition> {
                                 "priority": {
                                     "type": "integer",
                                     "description": "Rule priority (default 0)"
+                                },
+                                "args": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "name": { "type": "string" },
+                                            "type": { "type": "string" },
+                                            "description": { "type": "string" }
+                                        },
+                                        "required": ["name"]
+                                    },
+                                    "description": "Type annotations for the rule head predicate"
                                 }
                             },
                             "required": ["name", "description", "head", "body"]
@@ -191,6 +217,14 @@ pub async fn create_rule(state: &ToolState, arguments: &HashMap<String, Value>) 
         .and_then(|v| v.as_i64())
         .unwrap_or(0) as i32;
 
+    let args = match arguments.get("args").and_then(|v| v.as_array()) {
+        Some(arr) => match parse_args(arr) {
+            Ok(a) => a,
+            Err(e) => return e,
+        },
+        None => Vec::new(),
+    };
+
     let rule = Rule {
         name: name.to_string(),
         description: description.to_string(),
@@ -199,6 +233,7 @@ pub async fn create_rule(state: &ToolState, arguments: &HashMap<String, Value>) 
         constraints,
         enabled: true,
         priority,
+        args,
         created_at: Utc::now(),
     };
 
@@ -291,6 +326,14 @@ pub async fn create_rules(state: &ToolState, arguments: &HashMap<String, Value>)
 
         let priority = obj.get("priority").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
 
+        let args = match obj.get("args").and_then(|v| v.as_array()) {
+            Some(arr) => match parse_args(arr) {
+                Ok(a) => a,
+                Err(e) => return e,
+            },
+            None => Vec::new(),
+        };
+
         let rule = Rule {
             name: name.to_string(),
             description: description.to_string(),
@@ -299,6 +342,7 @@ pub async fn create_rules(state: &ToolState, arguments: &HashMap<String, Value>)
             constraints,
             enabled: true,
             priority,
+            args,
             created_at: now,
         };
 
@@ -457,14 +501,24 @@ pub async fn list_rules(state: &ToolState, arguments: &HashMap<String, Value>) -
                     format!(", {}", item.value.constraints.join(", "))
                 }
             );
-            json!({
+            let mut entry = json!({
                 "rkey": rkey,
                 "name": item.value.name,
                 "description": item.value.description,
                 "rule": rule_str,
                 "enabled": item.value.enabled,
                 "priority": item.value.priority
-            })
+            });
+            if !item.value.args.is_empty() {
+                entry["args"] = json!(item.value.args.iter().map(|a| {
+                    json!({
+                        "name": a.name,
+                        "type": a.r#type,
+                        "description": a.description
+                    })
+                }).collect::<Vec<_>>());
+            }
+            entry
         })
         .collect();
 
