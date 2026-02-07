@@ -863,6 +863,23 @@ impl DatalogCache {
             }
         }
 
+        // 1b. Stored rule head type annotations (lower priority than FactDeclarations)
+        {
+            let rules = self.rules.read().await;
+            for rule in rules.values() {
+                if !rule.enabled || rule.args.is_empty() {
+                    continue;
+                }
+                if let Some(head_pred) = extract_rule_head_predicate(&rule.head) {
+                    // Rule-derived predicates do NOT have rkey appended,
+                    // so we use the args types directly without adding a trailing symbol.
+                    let types: Vec<String> =
+                        rule.args.iter().map(|a| a.r#type.clone()).collect();
+                    predicate_types.entry(head_pred).or_insert(types);
+                }
+            }
+        }
+
         // 2. extra_declarations parameter
         if let Some(decls) = extra_declarations {
             for decl_str in decls {
