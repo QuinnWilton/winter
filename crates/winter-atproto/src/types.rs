@@ -1,6 +1,7 @@
 //! Core types for ATProto records.
 
 use chrono::{DateTime, Utc};
+use ipld_core::ipld::Ipld;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -160,7 +161,7 @@ pub enum PostEmbed {
     },
     /// Video embed.
     #[serde(rename = "app.bsky.embed.video")]
-    Video { video: serde_json::Value },
+    Video { video: Ipld },
 }
 
 /// Embedded record reference.
@@ -178,14 +179,14 @@ pub enum MediaEmbed {
     #[serde(rename = "app.bsky.embed.external")]
     External { external: EmbedExternal },
     #[serde(rename = "app.bsky.embed.video")]
-    Video { video: serde_json::Value },
+    Video { video: Ipld },
 }
 
 /// Image in an images embed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbedImage {
     pub alt: String,
-    pub image: serde_json::Value, // Blob reference
+    pub image: Ipld, // Blob reference
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aspect_ratio: Option<AspectRatio>,
 }
@@ -204,7 +205,7 @@ pub struct EmbedExternal {
     pub title: String,
     pub description: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub thumb: Option<serde_json::Value>, // Blob reference
+    pub thumb: Option<Ipld>, // Blob reference
 }
 
 /// Bluesky post record (app.bsky.feed.post).
