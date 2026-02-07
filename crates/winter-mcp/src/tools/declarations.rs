@@ -9,16 +9,16 @@ use chrono::Utc;
 use serde_json::{Value, json};
 
 use crate::protocol::{CallToolResult, ToolDefinition};
-use winter_atproto::{AtUri, FactDeclArg, FactDeclaration, Tid, WriteOp, WriteResult};
+use winter_atproto::{AtUri, FactDeclaration, Tid, WriteOp, WriteResult};
 
-use super::{ToolMeta, ToolState};
+use super::{ToolMeta, ToolState, parse_args};
 
 /// Collection name for fact declarations.
 const DECLARATION_COLLECTION: &str = "diy.razorgirl.winter.factDeclaration";
 
 /// Safely truncate a string to a maximum number of characters.
 /// This handles UTF-8 correctly by counting characters, not bytes.
-fn truncate_chars(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         s.to_string()
     } else {
@@ -643,51 +643,6 @@ pub async fn list_fact_declarations(
     )
 }
 
-/// Parse argument definitions from JSON array.
-fn parse_args(arr: &[Value]) -> Result<Vec<FactDeclArg>, CallToolResult> {
-    let mut args = Vec::with_capacity(arr.len());
-
-    for (i, v) in arr.iter().enumerate() {
-        let obj = match v.as_object() {
-            Some(o) => o,
-            None => {
-                return Err(CallToolResult::error(format!(
-                    "args[{}] must be an object",
-                    i
-                )));
-            }
-        };
-
-        let name = match obj.get("name").and_then(|v| v.as_str()) {
-            Some(n) => truncate_chars(n, 64),
-            None => {
-                return Err(CallToolResult::error(format!(
-                    "args[{}] missing required field: name",
-                    i
-                )));
-            }
-        };
-
-        let r#type = obj
-            .get("type")
-            .and_then(|v| v.as_str())
-            .map(|t| truncate_chars(t, 32))
-            .unwrap_or_else(|| "symbol".to_string());
-
-        let description = obj
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(|d| truncate_chars(d, 256));
-
-        args.push(FactDeclArg {
-            name,
-            r#type,
-            description,
-        });
-    }
-
-    Ok(args)
-}
 
 #[cfg(test)]
 mod tests {

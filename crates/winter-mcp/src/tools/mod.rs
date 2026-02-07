@@ -228,6 +228,7 @@ use crate::secrets::SecretManager;
 use winter_atproto::{AtprotoClient, RepoCache, Thought, ThoughtKind, Tid};
 use winter_datalog::DatalogCache;
 
+
 // ============================================================================
 // Tool Metadata with Permissions
 // ============================================================================
@@ -725,6 +726,56 @@ pub(crate) fn parse_string_array(
         }
     }
     Ok(result)
+}
+
+/// Parse argument definitions from a JSON array into FactDeclArg values.
+///
+/// Shared by declarations, rules, and triggers tools.
+pub(crate) fn parse_args(
+    arr: &[serde_json::Value],
+) -> Result<Vec<winter_atproto::FactDeclArg>, crate::protocol::CallToolResult> {
+    let mut args = Vec::with_capacity(arr.len());
+
+    for (i, v) in arr.iter().enumerate() {
+        let obj = match v.as_object() {
+            Some(o) => o,
+            None => {
+                return Err(crate::protocol::CallToolResult::error(format!(
+                    "args[{}] must be an object",
+                    i
+                )));
+            }
+        };
+
+        let name = match obj.get("name").and_then(|v| v.as_str()) {
+            Some(n) => declarations::truncate_chars(n, 64),
+            None => {
+                return Err(crate::protocol::CallToolResult::error(format!(
+                    "args[{}] missing required field: name",
+                    i
+                )));
+            }
+        };
+
+        let r#type = obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .map(|t| declarations::truncate_chars(t, 32))
+            .unwrap_or_else(|| "symbol".to_string());
+
+        let description = obj
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(|d| declarations::truncate_chars(d, 256));
+
+        args.push(winter_atproto::FactDeclArg {
+            name,
+            r#type,
+            description,
+        });
+    }
+
+    Ok(args)
 }
 
 /// Extract a string value from JSON, with optional truncation.
