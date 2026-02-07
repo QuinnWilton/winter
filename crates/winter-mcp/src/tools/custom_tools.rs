@@ -1447,9 +1447,12 @@ pub async fn request_secret(
                     }],
                 }];
 
-                let _ = bluesky
+                if let Err(e) = bluesky
                     .send_dm(&identity.value.operator_did, &message, Some(facets))
-                    .await;
+                    .await
+                {
+                    warn!("Failed to send secret request DM to operator: {}", e);
+                }
             }
 
             CallToolResult::success(
@@ -1532,5 +1535,60 @@ pub async fn dispatch(
         "request_secret" => Some(request_secret(state, &arguments).await),
         "list_secrets" => Some(list_secrets(state, secrets, &arguments).await),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winter_atproto::{ToolApproval, ToolApprovalStatus};
+
+    fn make_approval(status: ToolApprovalStatus, version: i32) -> ToolApproval {
+        ToolApproval {
+            tool_rkey: "abc123".to_string(),
+            tool_version: version,
+            status,
+            allow_network: None,
+            allowed_secrets: vec![],
+            workspace_path: None,
+            allow_workspace_read: None,
+            allow_workspace_write: None,
+            allowed_commands: vec![],
+            allowed_tools: vec![],
+            winter_did: None,
+            operator_did: None,
+            approved_by: None,
+            reason: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn is_approved_with_matching_version() {
+        let approval = Some(make_approval(ToolApprovalStatus::Approved, 3));
+        assert!(is_approved(&approval, 3));
+    }
+
+    #[test]
+    fn is_approved_rejects_version_mismatch() {
+        let approval = Some(make_approval(ToolApprovalStatus::Approved, 2));
+        assert!(!is_approved(&approval, 3));
+    }
+
+    #[test]
+    fn is_approved_rejects_denied() {
+        let approval = Some(make_approval(ToolApprovalStatus::Denied, 3));
+        assert!(!is_approved(&approval, 3));
+    }
+
+    #[test]
+    fn is_approved_rejects_revoked() {
+        let approval = Some(make_approval(ToolApprovalStatus::Revoked, 3));
+        assert!(!is_approved(&approval, 3));
+    }
+
+    #[test]
+    fn is_approved_rejects_none() {
+        assert!(!is_approved(&None, 1));
     }
 }
