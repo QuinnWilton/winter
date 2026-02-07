@@ -70,7 +70,7 @@ Derived predicates are **protected**—they reflect authoritative PDS state and 
 
 ### Working with Facts
 
-**Tools**: `create_fact`, `update_fact`, `delete_fact`, `query_facts`
+**Tools**: `create_fact`, `create_facts`, `update_fact`, `delete_fact`, `query_facts`, `query_and_enrich`, `list_predicates`, `list_validation_errors`
 
 Facts have a predicate and arguments. Each fact record also has optional metadata: `confidence` (0.0-1.0), `source` (provenance), `supersedes` (URI of previous fact), `tags` (list of strings), and `expires_at` (expiration timestamp).
 
@@ -130,7 +130,7 @@ This allows queries like "find all facts from source X" or "trace the history of
 
 ### Working with Rules
 
-**Tools**: `create_rule`, `update_rule`, `delete_rule`, `list_rules`
+**Tools**: `create_rule`, `create_rules`, `list_rules`, `toggle_rule`
 
 Rules define reusable derivations. They have a `head` (conclusion), `body` (conditions), optional `constraints`, and optional `args` (type annotations).
 
@@ -221,7 +221,7 @@ Fact declarations define predicate schemas before facts of that type exist. This
 - Planning for future behavior with undeclared predicates
 - Documentation of predicate semantics
 
-**Tools**: `create_fact_declaration`, `update_fact_declaration`, `delete_fact_declaration`, `list_fact_declarations`
+**Tools**: `create_fact_declaration`, `create_fact_declarations`, `update_fact_declaration`, `delete_fact_declaration`, `list_fact_declarations`
 
 Declarations specify:
 - `predicate`: Name of the predicate (max 64 chars)
@@ -349,6 +349,7 @@ These predicates are automatically generated from PDS records. They exist only i
 |-----------|-------|-----------|-------------|
 | `has_thought` | 5 | (uri, kind, trigger, created_at, rkey) | Your stream of consciousness |
 | `thought_tag` | 3 | (thought_uri, tag, rkey) | Tags on thoughts (one row per tag) |
+| `tool_call_duration` | 4 | (uri, tool_name, duration_ms, rkey) | Duration of tool calls in milliseconds |
 
 #### Blog Posts
 
@@ -425,7 +426,7 @@ Your identity is composed of **directives**—discrete ATProto records you can a
 | `aspiration` | What you want to become |
 | `self_concept` | Self-understanding prose |
 
-**Tools**: `create_directive`, `update_directive`, `deactivate_directive`, `list_directives`
+**Tools**: `create_directive`, `create_directives`, `update_directive`, `deactivate_directive`, `list_directives`
 
 The `supersedes` field links to previous directives when beliefs evolve, preserving history.
 
@@ -455,7 +456,7 @@ Thoughts have an optional `trigger` field indicating what prompted them (e.g., a
 
 Jobs are scheduled tasks that run autonomously. Use them for things you want to do later or recurring tasks you want to maintain.
 
-**Tools**: `create_job`, `update_job`, `delete_job`, `list_jobs`
+**Tools**: `schedule_job`, `schedule_recurring`, `list_jobs`, `cancel_job`, `get_job`
 
 | Schedule Type | Purpose |
 |---------------|---------|
@@ -534,6 +535,20 @@ Each unique result tuple fires at most once. When a tuple disappears from result
   "condition": "stale(R, P) :- _fact(R, P, _), _created_at(R, T), T < \"2025-01-01T00:00:00Z\", !_supersedes(_, R)."
 }
 ```
+
+---
+
+## Identity
+
+**Tools**: `get_identity`
+
+---
+
+## Secrets
+
+Secret management for custom tools. Secrets are stored locally and exposed to approved tools as environment variables.
+
+**Tools**: `request_secret`, `list_secrets`
 
 ---
 

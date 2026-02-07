@@ -44,7 +44,7 @@ Winter runs as a persistent Claude Code session orchestrated by a daemon. The da
 └──────────────────┼───────────────────────────────────┘
                    │ HTTP
             ┌──────▼──────┐
-            │ MCP Server  │──── Tools (75+)
+            │ MCP Server  │──── Tools (90+)
             └──────┬──────┘
                    │
             ┌──────▼──────┐
@@ -61,7 +61,7 @@ crates/
 ├── winter-atproto/     # ATProto client, firehose, Jetstream, CBOR/CAR
 ├── winter-datalog/     # Soufflé integration and query compilation
 ├── winter-agent/       # Agent prompt construction and session management
-├── winter-mcp/         # MCP server (HTTP + stdio) with 75+ tools
+├── winter-mcp/         # MCP server (HTTP + stdio) with 90+ tools
 ├── winter-claude/      # Rust SDK for Claude Code CLI
 ├── winter-scheduler/   # Durable job scheduler via ATProto records
 ├── winter-web/         # Read-only observation web UI
@@ -153,13 +153,13 @@ Winter uses custom ATProto lexicons under `diy.razorgirl.winter.*`:
 
 ## MCP Tools
 
-Winter exposes ~75 tools to the agent via MCP:
+Winter exposes ~90 tools to the agent via MCP:
 
 **Bluesky** — `post_to_bluesky`, `reply_to_bluesky`, `delete_post`, `like_post`, `follow_user`, `send_bluesky_dm`, `reply_to_dm`, `get_timeline`, `get_notifications`, `get_thread_context`, `search_posts`, `search_users`, `mute_user`, `unmute_user`, `block_user`, `unblock_user`, `mute_thread`, `unmute_thread`
 
 **Facts** — `create_fact`, `create_facts`, `update_fact`, `delete_fact`, `query_facts`, `query_and_enrich`, `list_predicates`, `list_validation_errors`
 
-**Rules** — `create_rule`, `create_rules`, `update_rule`, `delete_rule`, `list_rules`, `toggle_rule`
+**Rules** — `create_rule`, `create_rules`, `list_rules`, `toggle_rule`
 
 **Triggers** — `create_trigger`, `update_trigger`, `delete_trigger`, `list_triggers`, `test_trigger`
 
@@ -171,7 +171,7 @@ Winter exposes ~75 tools to the agent via MCP:
 
 **Thoughts** — `record_thought`, `list_thoughts`, `get_thought`
 
-**Jobs** — `schedule_job`, `schedule_recurring`, `update_job`, `list_jobs`, `cancel_job`, `get_job`
+**Jobs** — `schedule_job`, `schedule_recurring`, `list_jobs`, `cancel_job`, `get_job`
 
 **Blog** — `publish_blog_post`, `update_blog_post`, `list_blog_posts`, `get_blog_post`
 
@@ -180,6 +180,10 @@ Winter exposes ~75 tools to the agent via MCP:
 **Custom Tools** — `create_custom_tool`, `update_custom_tool`, `delete_custom_tool`, `list_custom_tools`, `get_custom_tool`, `run_custom_tool`
 
 **PDS Access** — `pds_list_records`, `pds_get_record`, `pds_get_records`, `pds_put_record`, `pds_delete_record`
+
+**Identity** — `get_identity`
+
+**Secrets** — `request_secret`, `list_secrets`
 
 **Session** — `check_inbox`, `acknowledge_inbox`, `check_interruption`, `set_active_context`, `session_stats`
 
