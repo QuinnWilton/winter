@@ -83,7 +83,10 @@ fn parse_images(arguments: &HashMap<String, Value>) -> Result<Vec<ImageInput>, S
         let has_data = img.get("data").and_then(|v| v.as_str()).is_some();
 
         let (data, mime_type) = if has_path {
-            let path_str = img.get("path").unwrap().as_str().unwrap();
+            let path_str = img
+                .get("path")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("images[{}]: 'path' must be a string", i))?;
 
             let workspace = workspace.as_ref().ok_or_else(|| {
                 format!(
@@ -112,7 +115,10 @@ fn parse_images(arguments: &HashMap<String, Value>) -> Result<Vec<ImageInput>, S
 
             (bytes, mime)
         } else if has_data {
-            let data_b64 = img.get("data").unwrap().as_str().unwrap();
+            let data_b64 = img
+                .get("data")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| format!("images[{}]: 'data' must be a string", i))?;
 
             let mime = img
                 .get("mime_type")
@@ -1236,5 +1242,116 @@ pub async fn delete_post(state: &ToolState, arguments: &HashMap<String, Value>) 
             .to_string(),
         ),
         Err(e) => CallToolResult::error(format!("Failed to delete post: {}", e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn mime_from_extension_known_types() {
+        assert_eq!(
+            mime_from_extension(Path::new("photo.jpg")),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            mime_from_extension(Path::new("photo.jpeg")),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            mime_from_extension(Path::new("image.png")),
+            Some("image/png")
+        );
+        assert_eq!(
+            mime_from_extension(Path::new("image.webp")),
+            Some("image/webp")
+        );
+        assert_eq!(
+            mime_from_extension(Path::new("anim.gif")),
+            Some("image/gif")
+        );
+    }
+
+    #[test]
+    fn mime_from_extension_unknown() {
+        assert_eq!(mime_from_extension(Path::new("file.txt")), None);
+        assert_eq!(mime_from_extension(Path::new("file")), None);
+        assert_eq!(mime_from_extension(Path::new("file.bmp")), None);
+    }
+
+    #[test]
+    fn resolve_workspace_relative_path() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+        fs::write(workspace.join("test.png"), b"fake").unwrap();
+
+        let resolved = resolve_workspace_path("test.png", &workspace).unwrap();
+        assert!(resolved.starts_with(&workspace));
+        assert!(resolved.ends_with("test.png"));
+    }
+
+    #[test]
+    fn resolve_workspace_rejects_traversal() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+
+        let result = resolve_workspace_path("../../../etc/passwd", &workspace);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_workspace_rejects_nonexistent() {
+        let dir = TempDir::new().unwrap();
+        let workspace = dir.path().canonicalize().unwrap();
+
+        let result = resolve_workspace_path("nonexistent.png", &workspace);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_images_empty_when_no_key() {
+        let args = HashMap::new();
+        let result = parse_images(&args).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_images_empty_when_not_array() {
+        let mut args = HashMap::new();
+        args.insert("images".to_string(), serde_json::json!("not an array"));
+        let result = parse_images(&args).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn parse_images_requires_alt() {
+        let mut args = HashMap::new();
+        args.insert(
+            "images".to_string(),
+            serde_json::json!([{"data": "aGVsbG8="}]),
+        );
+        let result = parse_images(&args);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing 'alt'"));
+    }
+
+    #[test]
+    fn parse_images_base64_with_alt() {
+        let mut args = HashMap::new();
+        args.insert(
+            "images".to_string(),
+            serde_json::json!([{
+                "alt": "a test image",
+                "data": "aGVsbG8=",
+                "mime_type": "image/png"
+            }]),
+        );
+        let result = parse_images(&args).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].alt, "a test image");
+        assert_eq!(result[0].mime_type, "image/png");
     }
 }
