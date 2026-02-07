@@ -132,7 +132,24 @@ This allows queries like "find all facts from source X" or "trace the history of
 
 **Tools**: `create_rule`, `update_rule`, `delete_rule`, `list_rules`
 
-Rules define reusable derivations. They have a `head` (conclusion), `body` (conditions), and optional `constraints`.
+Rules define reusable derivations. They have a `head` (conclusion), `body` (conditions), optional `constraints`, and optional `args` (type annotations).
+
+**Typed args**: By default, rule head predicates are declared with all-symbol types in Soufflé. This means numeric comparisons like `C >= 5` become lexicographic string comparisons (`"9" > "10"`). To enable proper numeric semantics, pass `args` with Soufflé types:
+
+```json
+{
+  "name": "high_engagement",
+  "head": "high_engagement(Post, Count)",
+  "body": ["post_replies(Post, Count, _)"],
+  "constraints": ["Count >= 5"],
+  "args": [
+    {"name": "post", "type": "symbol"},
+    {"name": "count", "type": "number"}
+  ]
+}
+```
+
+Valid Soufflé types: `symbol` (default), `number` (signed integer), `unsigned`, `float`.
 
 **Query examples:**
 ```datalog
@@ -472,6 +489,7 @@ Each trigger has:
 - `condition_rules`: Optional extra rules for the condition query
 - `action`: What to do for each new result tuple
 - `enabled`: Boolean (can be toggled without deleting)
+- `args`: Optional type annotations for the `_trigger_result` predicate (same format as rule args)
 
 ### Action Types
 
