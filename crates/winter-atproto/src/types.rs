@@ -690,6 +690,11 @@ pub struct Rule {
     /// Priority for rule ordering (flexible integer deserialization for CBOR).
     #[serde(default, deserialize_with = "deserialize_i32_or_default")]
     pub priority: i32,
+    /// Type annotations for the rule head predicate arguments.
+    /// When non-empty, these types are used in the generated Soufflé `.decl` statement
+    /// instead of the default all-symbol declaration. This enables numeric comparisons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<FactDeclArg>,
     /// When this rule was created.
     pub created_at: DateTime<Utc>,
 }
@@ -1241,6 +1246,11 @@ pub struct Trigger {
     /// Whether this trigger is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Type annotations for the `_trigger_result` predicate arguments.
+    /// When non-empty, these types are used in the generated Soufflé `.decl` statement
+    /// instead of the default all-symbol declaration. This enables numeric comparisons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<FactDeclArg>,
     /// When this trigger was created.
     pub created_at: DateTime<Utc>,
 }

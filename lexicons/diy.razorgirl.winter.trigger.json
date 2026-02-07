@@ -44,6 +44,15 @@
             "description": "Whether this trigger is enabled",
             "default": true
           },
+          "args": {
+            "type": "array",
+            "description": "Type annotations for the _trigger_result predicate arguments",
+            "items": {
+              "type": "ref",
+              "ref": "#arg"
+            },
+            "maxLength": 10
+          },
           "createdAt": {
             "type": "string",
             "format": "datetime",
@@ -101,6 +110,29 @@
         "rkey": {
           "type": "string",
           "maxLength": 64
+        }
+      }
+    },
+    "arg": {
+      "type": "object",
+      "description": "Argument definition for a predicate",
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Argument name",
+          "maxLength": 64
+        },
+        "type": {
+          "type": "string",
+          "description": "Argument type (default: symbol). Valid Soufflé types: symbol, number, unsigned, float",
+          "maxLength": 32,
+          "default": "symbol"
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of this argument",
+          "maxLength": 256
         }
       }
     }

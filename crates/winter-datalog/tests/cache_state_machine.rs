@@ -229,6 +229,7 @@ impl CacheTestHarness {
                         constraints: vec![],
                         enabled: true,
                         priority: 0,
+                        args: Vec::new(),
                         created_at: chrono::Utc::now(),
                     };
                     self.repo_cache
@@ -440,6 +441,7 @@ async fn test_generation_counters_increase() {
                 constraints: vec![],
                 enabled: true,
                 priority: 0,
+                args: Vec::new(),
                 created_at: chrono::Utc::now(),
             },
         })
@@ -505,6 +507,7 @@ proptest! {
                             constraints: vec![],
                             enabled: true,
                             priority: 0,
+                            args: Vec::new(),
                             created_at: chrono::Utc::now(),
                         },
                     })

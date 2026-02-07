@@ -159,6 +159,7 @@ proptest! {
             constraints: Vec::new(),
             enabled,
             priority,
+            args: Vec::new(),
             created_at: chrono::Utc::now(),
         };
 

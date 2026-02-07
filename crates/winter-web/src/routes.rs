@@ -1346,6 +1346,7 @@ async fn create_rule(
             .unwrap_or_default(),
         enabled: form.enabled.is_some(),
         priority: form.priority.unwrap_or(0),
+        args: Vec::new(),
         created_at: Utc::now(),
     };
 
@@ -1388,6 +1389,7 @@ async fn update_rule(
             .unwrap_or_default(),
         enabled: form.enabled.is_some(),
         priority: form.priority.unwrap_or(0),
+        args: existing.args,
         created_at: existing.created_at,
     };
 

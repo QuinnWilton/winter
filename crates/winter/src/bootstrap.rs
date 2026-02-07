@@ -202,6 +202,7 @@ async fn create_default_rules(client: &AtprotoClient) -> Result<()> {
             constraints: vec!["X < Y".to_string()], // Avoid duplicates
             enabled: true,
             priority: 0,
+            args: Vec::new(),
             created_at: Utc::now(),
         },
         Rule {
@@ -215,6 +216,7 @@ async fn create_default_rules(client: &AtprotoClient) -> Result<()> {
             constraints: vec!["X < Y".to_string()],
             enabled: true,
             priority: 0,
+            args: Vec::new(),
             created_at: Utc::now(),
         },
         Rule {
@@ -228,6 +230,7 @@ async fn create_default_rules(client: &AtprotoClient) -> Result<()> {
             constraints: vec![],
             enabled: true,
             priority: 10,
+            args: Vec::new(),
             created_at: Utc::now(),
         },
     ];

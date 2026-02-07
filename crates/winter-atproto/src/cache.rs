@@ -1854,6 +1854,7 @@ mod tests {
             constraints: vec![],
             enabled: true,
             priority: 0,
+            args: Vec::new(),
             created_at: Utc::now(),
         }
     }
