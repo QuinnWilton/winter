@@ -11,7 +11,7 @@ use chrono::Utc;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
-use winter_atproto::{AtprotoClient, Fact, RepoCache, Tid, TriggerAction};
+use winter_atproto::{AtprotoClient, Fact, FactDeclArg, RepoCache, Tid, TriggerAction};
 use winter_datalog::DatalogCache;
 
 /// Maximum actions per trigger per evaluation cycle.
@@ -76,12 +76,22 @@ impl TriggerEngine {
                 trigger.condition_rules.as_deref(),
             );
 
+            // Build typed declaration for _trigger_result if trigger has args
+            let extra_decls = Self::build_trigger_result_declaration(&trigger.args);
+            let extra_decls_option: Option<&[String]> = if extra_decls.is_empty() {
+                None
+            } else {
+                Some(&extra_decls)
+            };
+
             // Run the condition query
             let results = match self
                 .datalog
-                .execute_query(
+                .execute_query_with_facts_and_declarations(
                     &query,
                     rules.as_deref(),
+                    None,
+                    extra_decls_option,
                 )
                 .await
             {
@@ -227,8 +237,15 @@ impl TriggerEngine {
 
                 let url = format!("{}/inbox", self.mcp_base_url);
                 let body = serde_json::json!({
-                    "message": full_message,
-                    "priority": 50
+                    "id": Tid::now().to_string(),
+                    "kind": "system",
+                    "priority": 50,
+                    "created_at": Utc::now().to_rfc3339(),
+                    "context_tag": format!("trigger:{}", trigger_name),
+                    "payload": {
+                        "type": "system",
+                        "message": full_message
+                    }
                 });
 
                 let response = self.http.post(&url).json(&body).send().await?;
@@ -330,6 +347,20 @@ impl TriggerEngine {
         }
 
         vars
+    }
+
+    /// Build an extra_declarations entry for `_trigger_result` when the trigger has typed args.
+    ///
+    /// Returns an empty vec if args is empty (fall back to default all-symbol declaration).
+    fn build_trigger_result_declaration(args: &[FactDeclArg]) -> Vec<String> {
+        if args.is_empty() {
+            return Vec::new();
+        }
+        let params: Vec<String> = args
+            .iter()
+            .map(|a| format!("{}: {}", a.name, a.r#type))
+            .collect();
+        vec![format!("_trigger_result({})", params.join(", "))]
     }
 
     /// Replace `$0`, `$1`, etc. in a template with values from the tuple.
