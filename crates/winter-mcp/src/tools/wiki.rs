@@ -1,10 +1,14 @@
 //! Wiki tools for MCP — semantic wiki entries and typed links.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use chrono::Utc;
 use regex::Regex;
 use serde_json::{Value, json};
+
+static WIKI_REF_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[\[([^\]|]+?)(?:\|([^\]]+))?\]\]").unwrap());
 
 use crate::protocol::{CallToolResult, ToolDefinition};
 use winter_atproto::{Tid, WikiEntry, WikiLink, WIKI_ENTRY_COLLECTION, WIKI_LINK_COLLECTION};
@@ -50,10 +54,9 @@ pub enum WikiRef {
 
 /// Parse all `[[...]]` wiki references from markdown content.
 pub fn parse_wiki_refs(content: &str) -> Vec<(WikiRef, Option<String>)> {
-    let re = Regex::new(r"\[\[([^\]|]+?)(?:\|([^\]]+))?\]\]").unwrap();
     let mut refs = Vec::new();
 
-    for cap in re.captures_iter(content) {
+    for cap in WIKI_REF_RE.captures_iter(content) {
         let reference = cap[1].trim();
         let display_text = cap.get(2).map(|m| m.as_str().trim().to_string());
 
