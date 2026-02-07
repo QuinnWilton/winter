@@ -2,7 +2,7 @@
 //!
 //! The daemon uses a persistent session architecture:
 //! - Single persistent Claude Code session polling an inbox for work
-//! - Dedicated operator DM poller (pushes to inbox at priority 200)
+//! - Dedicated DM poller (pushes to inbox at priority 200 for operator, 150 for others)
 //! - Notification poller (pushes to inbox at priority 100)
 //! - Scheduler (pushes jobs to inbox at priority 50)
 //! - Watchdog for detecting stuck sessions
@@ -528,7 +528,7 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
         })
     };
 
-    // Spawn dedicated operator DM poller (pushes to inbox via HTTP)
+    // Spawn dedicated DM poller (pushes to inbox via HTTP)
     let dm_handle = {
         let operator_did = operator_did.clone();
         let state_manager = Arc::clone(&state_manager);
@@ -538,7 +538,7 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
         let interruption_state = Arc::clone(&interruption_state);
 
         tokio::spawn(async move {
-            info!("operator DM poller started");
+            info!("DM poller started");
             let mut interval = tokio::time::interval(dm_poll_interval);
 
             loop {
@@ -554,21 +554,18 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
                     _ = interval.tick() => {
                         match dm_bluesky.get_unread_dms().await {
                             Ok(dms) => {
-                                // Filter to only operator DMs
-                                let operator_dms: Vec<_> = dms.into_iter()
-                                    .filter(|dm| dm.sender_did == operator_did)
-                                    .collect();
-
-                                if operator_dms.is_empty() {
+                                if dms.is_empty() {
                                     continue;
                                 }
 
-                                for dm in operator_dms {
+                                for dm in dms {
+                                    let is_operator = dm.sender_did == operator_did;
                                     info!(
                                         sender = %dm.sender_did,
                                         convo_id = %dm.convo_id,
                                         text = %dm.text,
-                                        "pushing operator DM to inbox"
+                                        is_operator,
+                                        "pushing DM to inbox"
                                     );
 
                                     // Persist DM cursor BEFORE pushing to inbox
@@ -594,6 +591,7 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
                                         .collect();
 
                                     // Push to inbox via HTTP
+                                    let priority = if is_operator { 200 } else { 150 };
                                     let item = InboxItem::direct_message(
                                         dm.sender_did.clone(),
                                         sender_handle,
@@ -602,11 +600,14 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
                                         dm.text.clone(),
                                         dm.facets.clone(),
                                         inbox_history,
+                                        priority,
                                     );
                                     push_inbox_item(&http_client, &mcp_base_url, item).await;
 
-                                    // Signal interruption for urgent DM
-                                    interruption_state.set_interrupt("operator_dm").await;
+                                    // Signal interruption only for operator DMs
+                                    if is_operator {
+                                        interruption_state.set_interrupt("operator_dm").await;
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -617,7 +618,7 @@ pub async fn run_with_config(config: DaemonConfig) -> Result<()> {
                 }
             }
 
-            info!("operator DM poller stopped");
+            info!("DM poller stopped");
         })
     };
 

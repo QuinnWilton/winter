@@ -262,12 +262,13 @@ impl InboxItem {
         text: String,
         facets: Vec<Facet>,
         history: Vec<ConversationHistoryMessage>,
+        priority: u8,
     ) -> Self {
         let context_tag = format!("dm:{}:{}", convo_id, message_id);
         Self {
             id: Tid::now().to_string(),
             kind: InboxItemKind::DirectMessage,
-            priority: 200,
+            priority,
             created_at: Utc::now(),
             context_tag,
             payload: InboxPayload::DirectMessage {
