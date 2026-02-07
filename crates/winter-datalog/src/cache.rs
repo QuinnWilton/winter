@@ -1306,25 +1306,36 @@ impl DatalogCache {
             )
         };
 
-        if include_metadata {
-            // Write metadata files
-            self.write_metadata_files(&facts_snapshot, &cid_map_snapshot)?;
-        }
-
-        // Write predicate-specific files
-        for predicate in predicates {
-            if let Some(&arity) = arities_snapshot.get(predicate) {
-                self.regenerate_predicate_files(
-                    predicate,
-                    arity,
+        // Run sync file I/O on a blocking thread to avoid starving the async executor
+        let fact_dir = self.fact_dir.clone();
+        let predicates = predicates.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), DatalogError> {
+            if include_metadata {
+                DatalogCache::write_metadata_files_inner(
+                    &fact_dir,
                     &facts_snapshot,
-                    &decls_snapshot,
+                    &cid_map_snapshot,
                 )?;
-            } else {
-                // Predicate has no facts - create empty file
-                self.create_empty_predicate_file(predicate)?;
             }
-        }
+
+            for predicate in &predicates {
+                if let Some(&arity) = arities_snapshot.get(predicate) {
+                    DatalogCache::regenerate_predicate_files_inner(
+                        &fact_dir,
+                        predicate,
+                        arity,
+                        &facts_snapshot,
+                        &decls_snapshot,
+                    )?;
+                } else {
+                    DatalogCache::create_empty_predicate_file_inner(&fact_dir, predicate)?;
+                }
+            }
+
+            Ok(())
+        })
+        .await
+        .map_err(|e| DatalogError::Internal(format!("spawn_blocking panicked: {}", e)))??;
 
         // Mark metadata predicates as fresh
         if include_metadata {
@@ -1347,35 +1358,41 @@ impl DatalogCache {
             derived.clone_for_flush()
         };
 
-        derived_snapshot.write_predicates_subset(&self.fact_dir, predicates)?;
+        let fact_dir = self.fact_dir.clone();
+        let predicates = predicates.clone();
+        tokio::task::spawn_blocking(move || {
+            derived_snapshot.write_predicates_subset(&fact_dir, &predicates)
+        })
+        .await
+        .map_err(|e| DatalogError::Internal(format!("spawn_blocking panicked: {}", e)))??;
 
         Ok(())
     }
 
     /// Write all metadata files (_fact, _confidence, etc).
-    fn write_metadata_files(
-        &self,
+    fn write_metadata_files_inner(
+        fact_dir: &Path,
         facts: &HashMap<String, CachedFactData>,
         cid_map: &HashMap<String, String>,
     ) -> Result<(), DatalogError> {
         let mut fact_file =
-            BufWriter::new(std::fs::File::create(self.fact_dir.join("_fact.facts"))?);
+            BufWriter::new(std::fs::File::create(fact_dir.join("_fact.facts"))?);
         let mut confidence_file = BufWriter::new(std::fs::File::create(
-            self.fact_dir.join("_confidence.facts"),
+            fact_dir.join("_confidence.facts"),
         )?);
         let mut source_file =
-            BufWriter::new(std::fs::File::create(self.fact_dir.join("_source.facts"))?);
+            BufWriter::new(std::fs::File::create(fact_dir.join("_source.facts"))?);
         let mut supersedes_file = BufWriter::new(std::fs::File::create(
-            self.fact_dir.join("_supersedes.facts"),
+            fact_dir.join("_supersedes.facts"),
         )?);
         let mut created_at_file = BufWriter::new(std::fs::File::create(
-            self.fact_dir.join("_created_at.facts"),
+            fact_dir.join("_created_at.facts"),
         )?);
         let mut expires_at_file = BufWriter::new(std::fs::File::create(
-            self.fact_dir.join("_expires_at.facts"),
+            fact_dir.join("_expires_at.facts"),
         )?);
         // Create empty validation errors file - errors written per-predicate
-        std::fs::File::create(self.fact_dir.join("_validation_error.facts"))?;
+        std::fs::File::create(fact_dir.join("_validation_error.facts"))?;
 
         for (rkey, data) in facts.iter() {
             writeln!(fact_file, "{}\t{}\t{}", rkey, data.fact.predicate, data.cid)?;
@@ -1412,13 +1429,13 @@ impl DatalogCache {
     }
 
     /// Create an empty TSV file for a predicate.
-    fn create_empty_predicate_file(&self, predicate: &str) -> Result<(), DatalogError> {
-        let path = self.fact_dir.join(format!("{}.facts", predicate));
+    fn create_empty_predicate_file_inner(fact_dir: &Path, predicate: &str) -> Result<(), DatalogError> {
+        let path = fact_dir.join(format!("{}.facts", predicate));
         std::fs::File::create(&path)?;
 
         // Also create _all_ variant for user predicates
         if !predicate.starts_with('_') && !DerivedFactGenerator::is_derived(predicate) {
-            let all_path = self.fact_dir.join(format!("_all_{}.facts", predicate));
+            let all_path = fact_dir.join(format!("_all_{}.facts", predicate));
             std::fs::File::create(&all_path)?;
         }
 
@@ -1429,23 +1446,23 @@ impl DatalogCache {
     ///
     /// Facts are validated against declarations if one exists for the predicate.
     /// Invalid facts are skipped from TSV output and logged for investigation.
-    fn regenerate_predicate_files(
-        &self,
+    fn regenerate_predicate_files_inner(
+        fact_dir: &Path,
         predicate: &str,
         arity: usize,
         facts: &HashMap<String, CachedFactData>,
         declarations_by_predicate: &HashMap<String, FactDeclaration>,
     ) -> Result<(), DatalogError> {
         // Current facts file (non-superseded, non-expired only)
-        let current_path = self.fact_dir.join(format!("{}.facts", predicate));
+        let current_path = fact_dir.join(format!("{}.facts", predicate));
         let mut current_file = BufWriter::new(std::fs::File::create(&current_path)?);
 
         // All facts file (with rkey prefix)
-        let all_path = self.fact_dir.join(format!("_all_{}.facts", predicate));
+        let all_path = fact_dir.join(format!("_all_{}.facts", predicate));
         let mut all_file = BufWriter::new(std::fs::File::create(&all_path)?);
 
         // Validation errors file (append mode for incremental predicates)
-        let errors_path = self.fact_dir.join("_validation_error.facts");
+        let errors_path = fact_dir.join("_validation_error.facts");
         let mut errors_file = BufWriter::new(
             std::fs::OpenOptions::new()
                 .create(true)

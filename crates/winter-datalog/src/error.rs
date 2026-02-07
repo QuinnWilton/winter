@@ -32,4 +32,8 @@ pub enum DatalogError {
     /// Timeout.
     #[error("query timed out after {0}ms")]
     Timeout(u64),
+
+    /// Internal error.
+    #[error("internal error: {0}")]
+    Internal(String),
 }
