@@ -11,7 +11,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use winter_atproto::{CustomTool, ToolApproval};
+use winter_atproto::{CustomTool, ToolApproval, code_needs_network};
 
 /// MCP tools that are safe to call without operator approval.
 /// These are all read-only operations that don't modify state.
@@ -42,42 +42,6 @@ pub const SAFE_MCP_TOOLS: &[&str] = &[
     "pds_get_records",
     "search_users",
 ];
-
-/// Detect if tool code needs network access based on common patterns.
-/// Catches remote imports, fetch calls, and other network APIs that
-/// would fail without `--allow-net`.
-pub fn code_needs_network(code: &str) -> bool {
-    // Remote ES module imports — both static and dynamic
-    // Static:  import ... from "https://...", import "https://..."
-    // Dynamic: await import("https://..."), import("npm:...")
-    let remote_prefixes = [
-        "\"https://", "'https://",
-        "\"http://",  "'http://",
-        "\"npm:",     "'npm:",
-        "\"jsr:",     "'jsr:",
-    ];
-
-    for prefix in &remote_prefixes {
-        // Static: from "https://..." or import "https://..."
-        if code.contains(&format!("from {}", prefix))
-            || code.contains(&format!("import {}", prefix))
-        {
-            return true;
-        }
-        // Dynamic: import("https://...") — with optional whitespace
-        if code.contains(&format!("import({}", prefix))
-            || code.contains(&format!("import ({}", prefix))
-        {
-            return true;
-        }
-    }
-
-    // Explicit network APIs
-    code.contains("fetch(")
-        || code.contains("Deno.connect")
-        || code.contains("new WebSocket")
-        || code.contains("new EventSource")
-}
 
 /// A permission vector — one point in the product lattice.
 /// Comparison is component-wise across all dimensions.

@@ -13,6 +13,7 @@
 pub mod cache;
 pub mod car;
 mod client;
+pub mod deno_detect;
 pub mod dispatch;
 mod error;
 pub mod jetstream;
@@ -22,6 +23,7 @@ mod types;
 mod uri;
 
 pub use cache::{CacheUpdate, CachedRecord, RepoCache, ScopeFilter, SyncState};
+pub use deno_detect::code_needs_network;
 pub use car::{CarParseResult, parse_car};
 pub use dispatch::{dispatch_create_or_update_json, dispatch_delete, extract_record_to_result, is_tracked_collection};
 pub use client::{ApplyWritesResponse, AtprotoClient, CommitInfo, WriteOp, WriteResult};

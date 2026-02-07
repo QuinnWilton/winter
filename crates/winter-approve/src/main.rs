@@ -8,36 +8,7 @@ use std::collections::HashMap;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
-use winter_atproto::{CustomTool, ToolApproval, ToolApprovalStatus};
-
-// Re-use the same network detection logic as the MCP server.
-// This must stay in sync with winter_mcp::tools::permissions::code_needs_network.
-fn code_needs_network(code: &str) -> bool {
-    let remote_prefixes = [
-        "\"https://", "'https://",
-        "\"http://",  "'http://",
-        "\"npm:",     "'npm:",
-        "\"jsr:",     "'jsr:",
-    ];
-
-    for prefix in &remote_prefixes {
-        if code.contains(&format!("from {}", prefix))
-            || code.contains(&format!("import {}", prefix))
-        {
-            return true;
-        }
-        if code.contains(&format!("import({}", prefix))
-            || code.contains(&format!("import ({}", prefix))
-        {
-            return true;
-        }
-    }
-
-    code.contains("fetch(")
-        || code.contains("Deno.connect")
-        || code.contains("new WebSocket")
-        || code.contains("new EventSource")
-}
+use winter_atproto::{CustomTool, ToolApproval, ToolApprovalStatus, code_needs_network};
 
 const TOOL_COLLECTION: &str = "diy.razorgirl.winter.tool";
 const TOOL_APPROVAL_COLLECTION: &str = "diy.razorgirl.winter.toolApproval";
