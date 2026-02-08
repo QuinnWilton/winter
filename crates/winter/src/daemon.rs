@@ -25,13 +25,11 @@ use winter_atproto::{
     Rule, ScopeFilter, SyncCoordinator, SyncState, THOUGHT_COLLECTION, Thought,
 };
 use winter_datalog::DatalogCache;
-use winter_mcp::InterruptionState;
-use winter_mcp::bluesky::NotificationReason;
-use winter_mcp::tools::inbox::{
-    ConversationHistoryMessage as InboxConversationHistoryMessage, InboxItem,
-    PostRef as InboxPostRef,
+use winter_mcp::{
+    BlueskyClient, BlueskyError, InboxConversationHistoryMessage, InboxItem, InboxPostRef,
+    InterruptionState,
 };
-use winter_mcp::{BlueskyClient, BlueskyError};
+use winter_mcp::bluesky::NotificationReason;
 use winter_scheduler::Scheduler;
 
 /// Default DM poll interval in seconds.
@@ -1188,4 +1186,137 @@ async fn sync_followers(
         warn!(error = %e, "failed to flush is_followed_by after follower sync");
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use winter_atproto::{Thought, ThoughtKind};
+
+    fn make_thought(trigger: Option<&str>) -> Thought {
+        Thought {
+            kind: ThoughtKind::Insight,
+            content: "test".to_string(),
+            trigger: trigger.map(String::from),
+            tags: vec![],
+            duration_ms: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn global_thought_matches_all_scopes() {
+        let thought = make_thought(None);
+        assert!(thought_matches_scope_filter(
+            &thought,
+            &ScopeFilter::Thread {
+                root_uri: "at://did:plc:abc/post/123".to_string()
+            }
+        ));
+        assert!(thought_matches_scope_filter(
+            &thought,
+            &ScopeFilter::DirectMessage {
+                convo_id: "convo-1".to_string()
+            }
+        ));
+        assert!(thought_matches_scope_filter(
+            &thought,
+            &ScopeFilter::Job {
+                name: "awaken".to_string()
+            }
+        ));
+    }
+
+    #[test]
+    fn thread_scope_matches_notification_with_root() {
+        let root = "at://did:plc:abc/app.bsky.feed.post/123";
+        let thought = make_thought(Some(&format!(
+            "notification:at://did:plc:xyz/app.bsky.feed.post/456:root={}",
+            root
+        )));
+        assert!(thought_matches_scope_filter(
+            &thought,
+            &ScopeFilter::Thread {
+                root_uri: root.to_string()
+            }
+        ));
+    }
+
+    #[test]
+    fn thread_scope_rejects_wrong_root() {
+        let thought = make_thought(Some(
+            "notification:at://did:plc:xyz/post/456:root=at://did:plc:abc/post/123",
+        ));
+        assert!(!thought_matches_scope_filter(
+            &thought,
+            &ScopeFilter::Thread {
+                root_uri: "at://did:plc:abc/post/999".to_string()
+            }
+        ));
+    }
+
+    #[test]
+    fn thread_scope_rejects_non_notification_trigger() {
+        let thought = make_thought(Some("job:awaken"));
+        assert!(!thought_matches_scope_filter(
+            &thought,
+            &ScopeFilter::Thread {
+                root_uri: "at://did:plc:abc/post/123".to_string()
+            }
+        ));
+    }
+
+    #[test]
+    fn dm_scope_matches_dm_trigger() {
+        let thought = make_thought(Some("dm:convo-abc:msg-123"));
+        assert!(thought_matches_scope_filter(
+            &thought,
+            &ScopeFilter::DirectMessage {
+                convo_id: "convo-abc".to_string()
+            }
+        ));
+    }
+
+    #[test]
+    fn dm_scope_rejects_wrong_convo() {
+        let thought = make_thought(Some("dm:convo-abc:msg-123"));
+        assert!(!thought_matches_scope_filter(
+            &thought,
+            &ScopeFilter::DirectMessage {
+                convo_id: "convo-xyz".to_string()
+            }
+        ));
+    }
+
+    #[test]
+    fn job_scope_matches_job_trigger() {
+        let thought = make_thought(Some("job:awaken"));
+        assert!(thought_matches_scope_filter(
+            &thought,
+            &ScopeFilter::Job {
+                name: "awaken".to_string()
+            }
+        ));
+    }
+
+    #[test]
+    fn job_scope_rejects_wrong_job() {
+        let thought = make_thought(Some("job:awaken"));
+        assert!(!thought_matches_scope_filter(
+            &thought,
+            &ScopeFilter::Job {
+                name: "maintenance".to_string()
+            }
+        ));
+    }
+
+    #[test]
+    fn global_scope_rejects_triggered_thoughts() {
+        let thought = make_thought(Some("job:awaken"));
+        assert!(!thought_matches_scope_filter(
+            &thought,
+            &ScopeFilter::Global
+        ));
+    }
 }
