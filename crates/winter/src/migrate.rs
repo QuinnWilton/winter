@@ -1264,3 +1264,60 @@ pub async fn run(pds_url: &str, handle: &str, app_password: &str) -> Result<()> 
     )
     .await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::NotesToWikiEntries;
+
+    #[test]
+    fn slugify_basic() {
+        assert_eq!(NotesToWikiEntries::slugify("Hello World"), "hello-world");
+    }
+
+    #[test]
+    fn slugify_special_chars() {
+        assert_eq!(
+            NotesToWikiEntries::slugify("ATProto & Datalog: A Guide!"),
+            "atproto-datalog-a-guide"
+        );
+    }
+
+    #[test]
+    fn slugify_collapses_dashes() {
+        assert_eq!(
+            NotesToWikiEntries::slugify("foo---bar   baz"),
+            "foo-bar-baz"
+        );
+    }
+
+    #[test]
+    fn slugify_trims_dashes() {
+        assert_eq!(
+            NotesToWikiEntries::slugify("  leading and trailing  "),
+            "leading-and-trailing"
+        );
+    }
+
+    #[test]
+    fn slugify_unicode() {
+        assert_eq!(NotesToWikiEntries::slugify("café résumé"), "caf-r-sum");
+    }
+
+    #[test]
+    fn unique_slug_no_collision() {
+        let used: Vec<String> = vec![];
+        assert_eq!(NotesToWikiEntries::unique_slug("test", &used), "test");
+    }
+
+    #[test]
+    fn unique_slug_with_collision() {
+        let used = vec!["test".to_string()];
+        assert_eq!(NotesToWikiEntries::unique_slug("test", &used), "test-2");
+    }
+
+    #[test]
+    fn unique_slug_multiple_collisions() {
+        let used = vec!["test".to_string(), "test-2".to_string()];
+        assert_eq!(NotesToWikiEntries::unique_slug("test", &used), "test-3");
+    }
+}

@@ -115,3 +115,69 @@ impl AgentContext {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_identity() -> Identity {
+        Identity {
+            operator_did: "did:plc:test-operator".to_string(),
+            created_at: Utc::now(),
+            last_updated: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn job_trigger_string() {
+        let trigger = ContextTrigger::Job {
+            id: "tid123".to_string(),
+            name: "awaken".to_string(),
+        };
+        assert_eq!(trigger.trigger_string(), Some("job:awaken".to_string()));
+    }
+
+    #[test]
+    fn persistent_trigger_string() {
+        let trigger = ContextTrigger::PersistentSession;
+        assert_eq!(trigger.trigger_string(), Some("persistent".to_string()));
+    }
+
+    #[test]
+    fn trigger_description_job() {
+        let ctx = AgentContext::new(test_identity()).with_trigger(ContextTrigger::Job {
+            id: "tid123".to_string(),
+            name: "maintenance".to_string(),
+        });
+        assert_eq!(ctx.trigger_description(), "job:maintenance");
+    }
+
+    #[test]
+    fn trigger_description_persistent() {
+        let ctx =
+            AgentContext::new(test_identity()).with_trigger(ContextTrigger::PersistentSession);
+        assert_eq!(ctx.trigger_description(), "persistent");
+    }
+
+    #[test]
+    fn trigger_description_none() {
+        let ctx = AgentContext::new(test_identity());
+        assert_eq!(ctx.trigger_description(), "none");
+    }
+
+    #[test]
+    fn builder_chain() {
+        let ctx = AgentContext::new(test_identity())
+            .with_directives(vec![])
+            .with_thoughts(vec![])
+            .with_rule_heads(vec!["mutual(X)".to_string()])
+            .with_custom_tools(vec![CustomToolSummary {
+                name: "my_tool".to_string(),
+                description: "does stuff".to_string(),
+                approved: true,
+            }]);
+        assert_eq!(ctx.rule_heads.len(), 1);
+        assert_eq!(ctx.custom_tools.len(), 1);
+        assert!(ctx.trigger.is_none());
+    }
+}
